@@ -19,7 +19,9 @@
 #include "options/cf_options.h"
 #include "rocksdb/compaction_filter.h"
 
-namespace rocksdb {
+namespace ROCKSDB_NAMESPACE {
+
+class BlobFileBuilder;
 
 class CompactionIterator {
  public:
@@ -59,32 +61,36 @@ class CompactionIterator {
     const Compaction* compaction_;
   };
 
-  CompactionIterator(
-      InternalIterator* input, const Comparator* cmp, MergeHelper* merge_helper,
-      SequenceNumber last_sequence, std::vector<SequenceNumber>* snapshots,
-      SequenceNumber earliest_write_conflict_snapshot,
-      const SnapshotChecker* snapshot_checker, Env* env,
-      bool report_detailed_time, bool expect_valid_internal_key,
-      CompactionRangeDelAggregator* range_del_agg,
-      const Compaction* compaction = nullptr,
-      const CompactionFilter* compaction_filter = nullptr,
-      const std::atomic<bool>* shutting_down = nullptr,
-      const SequenceNumber preserve_deletes_seqnum = 0,
-      const std::atomic<bool>* manual_compaction_paused = nullptr);
+  CompactionIterator(InternalIterator* input, const Comparator* cmp,
+                     MergeHelper* merge_helper, SequenceNumber last_sequence,
+                     std::vector<SequenceNumber>* snapshots,
+                     SequenceNumber earliest_write_conflict_snapshot,
+                     const SnapshotChecker* snapshot_checker, Env* env,
+                     bool report_detailed_time, bool expect_valid_internal_key,
+                     CompactionRangeDelAggregator* range_del_agg,
+                     BlobFileBuilder* blob_file_builder,
+                     const Compaction* compaction = nullptr,
+                     const CompactionFilter* compaction_filter = nullptr,
+                     const std::atomic<bool>* shutting_down = nullptr,
+                     const SequenceNumber preserve_deletes_seqnum = 0,
+                     const std::atomic<int>* manual_compaction_paused = nullptr,
+                     const std::shared_ptr<Logger> info_log = nullptr);
 
   // Constructor with custom CompactionProxy, used for tests.
-  CompactionIterator(
-      InternalIterator* input, const Comparator* cmp, MergeHelper* merge_helper,
-      SequenceNumber last_sequence, std::vector<SequenceNumber>* snapshots,
-      SequenceNumber earliest_write_conflict_snapshot,
-      const SnapshotChecker* snapshot_checker, Env* env,
-      bool report_detailed_time, bool expect_valid_internal_key,
-      CompactionRangeDelAggregator* range_del_agg,
-      std::unique_ptr<CompactionProxy> compaction,
-      const CompactionFilter* compaction_filter = nullptr,
-      const std::atomic<bool>* shutting_down = nullptr,
-      const SequenceNumber preserve_deletes_seqnum = 0,
-      const std::atomic<bool>* manual_compaction_paused = nullptr);
+  CompactionIterator(InternalIterator* input, const Comparator* cmp,
+                     MergeHelper* merge_helper, SequenceNumber last_sequence,
+                     std::vector<SequenceNumber>* snapshots,
+                     SequenceNumber earliest_write_conflict_snapshot,
+                     const SnapshotChecker* snapshot_checker, Env* env,
+                     bool report_detailed_time, bool expect_valid_internal_key,
+                     CompactionRangeDelAggregator* range_del_agg,
+                     BlobFileBuilder* blob_file_builder,
+                     std::unique_ptr<CompactionProxy> compaction,
+                     const CompactionFilter* compaction_filter = nullptr,
+                     const std::atomic<bool>* shutting_down = nullptr,
+                     const SequenceNumber preserve_deletes_seqnum = 0,
+                     const std::atomic<int>* manual_compaction_paused = nullptr,
+                     const std::shared_ptr<Logger> info_log = nullptr);
 
   ~CompactionIterator();
 
@@ -119,7 +125,8 @@ class CompactionIterator {
   void PrepareOutput();
 
   // Invoke compaction filter if needed.
-  void InvokeFilterIfNeeded(bool* need_skip, Slice* skip_until);
+  // Return true on success, false on failures (e.g.: kIOError).
+  bool InvokeFilterIfNeeded(bool* need_skip, Slice* skip_until);
 
   // Given a sequence number, return the sequence number of the
   // earliest snapshot that this sequence number is visible in.
@@ -160,10 +167,11 @@ class CompactionIterator {
   bool report_detailed_time_;
   bool expect_valid_internal_key_;
   CompactionRangeDelAggregator* range_del_agg_;
+  BlobFileBuilder* blob_file_builder_;
   std::unique_ptr<CompactionProxy> compaction_;
   const CompactionFilter* compaction_filter_;
   const std::atomic<bool>* shutting_down_;
-  const std::atomic<bool>* manual_compaction_paused_;
+  const std::atomic<int>* manual_compaction_paused_;
   const SequenceNumber preserve_deletes_seqnum_;
   bool bottommost_level_;
   bool valid_ = false;
@@ -208,6 +216,7 @@ class CompactionIterator {
   // PinnedIteratorsManager used to pin input_ Iterator blocks while reading
   // merge operands and then releasing them after consuming them.
   PinnedIteratorsManager pinned_iters_mgr_;
+  std::string blob_index_;
   std::string compaction_filter_value_;
   InternalKey compaction_filter_skip_until_;
   // "level_ptrs" holds indices that remember which file of an associated
@@ -222,6 +231,7 @@ class CompactionIterator {
   // Used to avoid purging uncommitted values. The application can specify
   // uncommitted values by providing a SnapshotChecker object.
   bool current_key_committed_;
+  std::shared_ptr<Logger> info_log_;
 
   bool IsShuttingDown() {
     // This is a best-effort facility, so memory_order_relaxed is sufficient.
@@ -231,7 +241,7 @@ class CompactionIterator {
   bool IsPausingManualCompaction() {
     // This is a best-effort facility, so memory_order_relaxed is sufficient.
     return manual_compaction_paused_ &&
-           manual_compaction_paused_->load(std::memory_order_relaxed);
+           manual_compaction_paused_->load(std::memory_order_relaxed) > 0;
   }
 };
-}  // namespace rocksdb
+}  // namespace ROCKSDB_NAMESPACE

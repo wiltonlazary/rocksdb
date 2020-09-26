@@ -32,7 +32,7 @@
 #include "util/mutexlock.h"
 #include "util/string_util.h"
 
-namespace rocksdb {
+namespace ROCKSDB_NAMESPACE {
 
 #ifndef ROCKSDB_LITE
 
@@ -120,8 +120,8 @@ Status WalManager::GetUpdatesSince(
     return s;
   }
   iter->reset(new TransactionLogIteratorImpl(
-      db_options_.wal_dir, &db_options_, read_options, env_options_, seq,
-      std::move(wal_files), version_set, seq_per_batch_));
+      db_options_.wal_dir, &db_options_, read_options, file_options_, seq,
+      std::move(wal_files), version_set, seq_per_batch_, io_tracer_));
   return (*iter)->status();
 }
 
@@ -334,10 +334,8 @@ Status WalManager::GetSortedWalsOfType(const std::string& path,
   std::sort(
       log_files.begin(), log_files.end(),
       [](const std::unique_ptr<LogFile>& a, const std::unique_ptr<LogFile>& b) {
-        LogFileImpl* a_impl =
-            static_cast_with_check<LogFileImpl, LogFile>(a.get());
-        LogFileImpl* b_impl =
-            static_cast_with_check<LogFileImpl, LogFile>(b.get());
+        LogFileImpl* a_impl = static_cast_with_check<LogFileImpl>(a.get());
+        LogFileImpl* b_impl = static_cast_with_check<LogFileImpl>(b.get());
         return *a_impl < *b_impl;
       });
   return status;
@@ -464,11 +462,12 @@ Status WalManager::ReadFirstLine(const std::string& fname,
     }
   };
 
-  std::unique_ptr<SequentialFile> file;
-  Status status = env_->NewSequentialFile(
-      fname, &file, env_->OptimizeForLogRead(env_options_));
+  std::unique_ptr<FSSequentialFile> file;
+  Status status = fs_->NewSequentialFile(fname,
+                                         fs_->OptimizeForLogRead(file_options_),
+                                         &file, nullptr);
   std::unique_ptr<SequentialFileReader> file_reader(
-      new SequentialFileReader(std::move(file), fname));
+      new SequentialFileReader(std::move(file), fname, io_tracer_));
 
   if (!status.ok()) {
     return status;
@@ -506,4 +505,4 @@ Status WalManager::ReadFirstLine(const std::string& fname,
 }
 
 #endif  // ROCKSDB_LITE
-}  // namespace rocksdb
+}  // namespace ROCKSDB_NAMESPACE

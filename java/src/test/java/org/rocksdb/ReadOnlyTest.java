@@ -18,8 +18,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 public class ReadOnlyTest {
 
   @ClassRule
-  public static final RocksMemoryResource rocksMemoryResource =
-      new RocksMemoryResource();
+  public static final RocksNativeLibraryResource ROCKS_NATIVE_LIBRARY_RESOURCE =
+      new RocksNativeLibraryResource();
 
   @Rule
   public TemporaryFolder dbFolder = new TemporaryFolder();
@@ -194,7 +194,7 @@ public class ReadOnlyTest {
           dbFolder.getRoot().getAbsolutePath(), cfDescriptors,
           readOnlyColumnFamilyHandleList)) {
         try {
-          rDb.remove("key".getBytes());
+          rDb.delete("key".getBytes());
         } finally {
           for (final ColumnFamilyHandle columnFamilyHandle :
               readOnlyColumnFamilyHandleList) {
@@ -224,7 +224,7 @@ public class ReadOnlyTest {
           dbFolder.getRoot().getAbsolutePath(), cfDescriptors,
           readOnlyColumnFamilyHandleList)) {
         try {
-          rDb.remove(readOnlyColumnFamilyHandleList.get(0),
+          rDb.delete(readOnlyColumnFamilyHandleList.get(0),
               "key".getBytes());
         } finally {
           for (final ColumnFamilyHandle columnFamilyHandle :
@@ -296,6 +296,33 @@ public class ReadOnlyTest {
         } finally {
           for (final ColumnFamilyHandle columnFamilyHandle :
               readOnlyColumnFamilyHandleList) {
+            columnFamilyHandle.close();
+          }
+        }
+      }
+    }
+  }
+
+  @Test(expected = RocksDBException.class)
+  public void errorIfWalFileExists() throws RocksDBException {
+    try (final Options options = new Options().setCreateIfMissing(true);
+         final RocksDB db = RocksDB.open(options, dbFolder.getRoot().getAbsolutePath())) {
+      // no-op
+    }
+
+    try (final ColumnFamilyOptions cfOpts = new ColumnFamilyOptions()) {
+      final List<ColumnFamilyDescriptor> cfDescriptors =
+          Arrays.asList(new ColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY, cfOpts));
+
+      final List<ColumnFamilyHandle> readOnlyColumnFamilyHandleList = new ArrayList<>();
+      try (final DBOptions options = new DBOptions();
+           final RocksDB rDb = RocksDB.openReadOnly(options, dbFolder.getRoot().getAbsolutePath(),
+               cfDescriptors, readOnlyColumnFamilyHandleList, true);) {
+        try {
+          // no-op... should have raised an error as errorIfWalFileExists=true
+
+        } finally {
+          for (final ColumnFamilyHandle columnFamilyHandle : readOnlyColumnFamilyHandleList) {
             columnFamilyHandle.close();
           }
         }

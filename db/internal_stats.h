@@ -17,7 +17,7 @@
 
 class ColumnFamilyData;
 
-namespace rocksdb {
+namespace ROCKSDB_NAMESPACE {
 
 class DBImpl;
 class MemTableList;
@@ -392,6 +392,8 @@ class InternalStats {
   bool GetIntPropertyOutOfMutex(const DBPropertyInfo& property_info,
                                 Version* version, uint64_t* value);
 
+  const uint64_t* TEST_GetCFStatsValue() const { return cf_stats_value_; }
+
   const std::vector<CompactionStats>& TEST_GetCompactionStats() const {
     return comp_stats_;
   }
@@ -553,6 +555,8 @@ class InternalStats {
   bool HandleEstimateNumKeys(uint64_t* value, DBImpl* db, Version* version);
   bool HandleNumSnapshots(uint64_t* value, DBImpl* db, Version* version);
   bool HandleOldestSnapshotTime(uint64_t* value, DBImpl* db, Version* version);
+  bool HandleOldestSnapshotSequence(uint64_t* value, DBImpl* db,
+                                    Version* version);
   bool HandleNumLiveVersions(uint64_t* value, DBImpl* db, Version* version);
   bool HandleCurrentSuperVersionNumber(uint64_t* value, DBImpl* db,
                                        Version* version);
@@ -692,4 +696,4 @@ class InternalStats {
 };
 #endif  // !ROCKSDB_LITE
 
-}  // namespace rocksdb
+}  // namespace ROCKSDB_NAMESPACE

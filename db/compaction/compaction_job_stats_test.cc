@@ -52,6 +52,7 @@
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
+#include "util/cast_util.h"
 #include "util/compression.h"
 #include "util/hash.h"
 #include "util/mutexlock.h"
@@ -61,7 +62,7 @@
 
 #if !defined(IOS_CROSS_COMPILE)
 #ifndef ROCKSDB_LITE
-namespace rocksdb {
+namespace ROCKSDB_NAMESPACE {
 
 static std::string RandomString(Random* rnd, int len, double ratio) {
   std::string r;
@@ -110,9 +111,9 @@ class CompactionJobStatsTest : public testing::Test,
   }
 
   ~CompactionJobStatsTest() override {
-    rocksdb::SyncPoint::GetInstance()->DisableProcessing();
-    rocksdb::SyncPoint::GetInstance()->LoadDependency({});
-    rocksdb::SyncPoint::GetInstance()->ClearAllCallBacks();
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency({});
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
     Close();
     Options options;
     options.db_paths.emplace_back(dbname_, 0);
@@ -126,9 +127,7 @@ class CompactionJobStatsTest : public testing::Test,
   static void SetUpTestCase() {}
   static void TearDownTestCase() {}
 
-  DBImpl* dbfull() {
-    return reinterpret_cast<DBImpl*>(db_);
-  }
+  DBImpl* dbfull() { return static_cast_with_check<DBImpl>(db_); }
 
   void CreateColumnFamilies(const std::vector<std::string>& cfs,
                             const Options& options) {
@@ -797,11 +796,11 @@ TEST_P(CompactionJobStatsTest, CompactionJobStatsTest) {
     }
 
     ASSERT_OK(Flush(1));
-    reinterpret_cast<DBImpl*>(db_)->TEST_WaitForCompact();
+    ASSERT_OK(static_cast_with_check<DBImpl>(db_)->TEST_WaitForCompact());
 
     stats_checker->set_verify_next_comp_io_stats(true);
     std::atomic<bool> first_prepare_write(true);
-    rocksdb::SyncPoint::GetInstance()->SetCallBack(
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
         "WritableFileWriter::Append:BeforePrepareWrite", [&](void* /*arg*/) {
           if (first_prepare_write.load()) {
             options.env->SleepForMicroseconds(3);
@@ -810,7 +809,7 @@ TEST_P(CompactionJobStatsTest, CompactionJobStatsTest) {
         });
 
     std::atomic<bool> first_flush(true);
-    rocksdb::SyncPoint::GetInstance()->SetCallBack(
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
         "WritableFileWriter::Flush:BeforeAppend", [&](void* /*arg*/) {
           if (first_flush.load()) {
             options.env->SleepForMicroseconds(3);
@@ -819,7 +818,7 @@ TEST_P(CompactionJobStatsTest, CompactionJobStatsTest) {
         });
 
     std::atomic<bool> first_sync(true);
-    rocksdb::SyncPoint::GetInstance()->SetCallBack(
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
         "WritableFileWriter::SyncInternal:0", [&](void* /*arg*/) {
           if (first_sync.load()) {
             options.env->SleepForMicroseconds(3);
@@ -828,14 +827,14 @@ TEST_P(CompactionJobStatsTest, CompactionJobStatsTest) {
         });
 
     std::atomic<bool> first_range_sync(true);
-    rocksdb::SyncPoint::GetInstance()->SetCallBack(
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
         "WritableFileWriter::RangeSync:0", [&](void* /*arg*/) {
           if (first_range_sync.load()) {
             options.env->SleepForMicroseconds(3);
             first_range_sync.store(false);
           }
         });
-    rocksdb::SyncPoint::GetInstance()->EnableProcessing();
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
 
     Compact(1, smallest_key, largest_key);
 
@@ -844,7 +843,7 @@ TEST_P(CompactionJobStatsTest, CompactionJobStatsTest) {
     ASSERT_TRUE(!first_flush.load());
     ASSERT_TRUE(!first_sync.load());
     ASSERT_TRUE(!first_range_sync.load());
-    rocksdb::SyncPoint::GetInstance()->DisableProcessing();
+    ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
   }
   ASSERT_EQ(stats_checker->NumberOfUnverifiedStats(), 0U);
 }
@@ -895,7 +894,7 @@ TEST_P(CompactionJobStatsTest, DeletionStatsTest) {
   CompactRangeOptions cr_options;
   cr_options.change_level = true;
   cr_options.target_level = 2;
-  db_->CompactRange(cr_options, handles_[1], nullptr, nullptr);
+  ASSERT_OK(db_->CompactRange(cr_options, handles_[1], nullptr, nullptr));
   ASSERT_GT(NumTableFilesAtLevel(2, 1), 0);
 
   // Stage 2: Generate files including keys from the entire key range
@@ -1001,7 +1000,7 @@ TEST_P(CompactionJobStatsTest, UniversalCompactionTest) {
             num_input_units,
             num_keys_per_table * num_input_units,
             1.0, 0, false));
-    dbfull()->TEST_WaitForCompact();
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
   }
   ASSERT_EQ(stats_checker->NumberOfUnverifiedStats(), 3U);
 
@@ -1012,17 +1011,17 @@ TEST_P(CompactionJobStatsTest, UniversalCompactionTest) {
         &rnd, start_key, start_key + key_base - 1,
         kKeySize, kValueSize, key_interval,
         compression_ratio, 1);
-    reinterpret_cast<DBImpl*>(db_)->TEST_WaitForCompact();
+    ASSERT_OK(static_cast_with_check<DBImpl>(db_)->TEST_WaitForCompact());
   }
   ASSERT_EQ(stats_checker->NumberOfUnverifiedStats(), 0U);
 }
 
 INSTANTIATE_TEST_CASE_P(CompactionJobStatsTest, CompactionJobStatsTest,
                         ::testing::Values(1, 4));
-}  // namespace rocksdb
+}  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
-  rocksdb::port::InstallStackTraceHandler();
+  ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
