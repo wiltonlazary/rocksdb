@@ -22,6 +22,7 @@
 #include "table/scoped_arena_iterator.h"
 #include "table/sst_file_writer_collectors.h"
 #include "table/table_builder.h"
+#include "table/unique_id_impl.h"
 #include "test_util/sync_point.h"
 #include "util/stop_watch.h"
 
@@ -38,7 +39,8 @@ Status ExternalSstFileIngestionJob::Prepare(
   // Read the information of files we are ingesting
   for (const std::string& file_path : external_files_paths) {
     IngestedFileInfo file_to_ingest;
-    status = GetIngestedFileInfo(file_path, &file_to_ingest, sv);
+    status =
+        GetIngestedFileInfo(file_path, next_file_number++, &file_to_ingest, sv);
     if (!status.ok()) {
       return status;
     }
@@ -102,7 +104,6 @@ Status ExternalSstFileIngestionJob::Prepare(
   // Copy/Move external files into DB
   std::unordered_set<size_t> ingestion_path_ids;
   for (IngestedFileInfo& f : files_to_ingest_) {
-    f.fd = FileDescriptor(next_file_number++, 0, f.file_size);
     f.copy_file = false;
     const std::string path_outside_db = f.external_file_path;
     const std::string path_inside_db =
@@ -142,6 +143,9 @@ Status ExternalSstFileIngestionJob::Prepare(
                  ingestion_options_.failed_move_fall_back_to_copy) {
         // Original file is on a different FS, use copy instead of hard linking.
         f.copy_file = true;
+        ROCKS_LOG_INFO(db_options_.info_log,
+                       "Triy to link file %s but it's not supported : %s",
+                       path_outside_db.c_str(), status.ToString().c_str());
       }
     } else {
       f.copy_file = true;
@@ -151,8 +155,9 @@ Status ExternalSstFileIngestionJob::Prepare(
       TEST_SYNC_POINT_CALLBACK("ExternalSstFileIngestionJob::Prepare:CopyFile",
                                nullptr);
       // CopyFile also sync the new file.
-      status = CopyFile(fs_.get(), path_outside_db, path_inside_db, 0,
-                        db_options_.use_fsync, io_tracer_);
+      status =
+          CopyFile(fs_.get(), path_outside_db, path_inside_db, 0,
+                   db_options_.use_fsync, io_tracer_, Temperature::kUnknown);
     }
     TEST_SYNC_POINT("ExternalSstFileIngestionJob::Prepare:FileAdded");
     if (!status.ok()) {
@@ -168,7 +173,9 @@ Status ExternalSstFileIngestionJob::Prepare(
   TEST_SYNC_POINT("ExternalSstFileIngestionJob::BeforeSyncDir");
   if (status.ok()) {
     for (auto path_id : ingestion_path_ids) {
-      status = directories_->GetDataDir(path_id)->Fsync(IOOptions(), nullptr);
+      status = directories_->GetDataDir(path_id)->FsyncWithDirOptions(
+          IOOptions(), nullptr,
+          DirFsyncOptions(DirFsyncOptions::FsyncReason::kNewFileSynced));
       if (!status.ok()) {
         ROCKS_LOG_WARN(db_options_.info_log,
                        "Failed to sync directory %" ROCKSDB_PRIszt
@@ -210,6 +217,8 @@ Status ExternalSstFileIngestionJob::Prepare(
         std::string generated_checksum;
         std::string generated_checksum_func_name;
         std::string requested_checksum_func_name;
+        // TODO: rate limit file reads for checksum calculation during file
+        // ingestion.
         IOStatus io_s = GenerateOneFileChecksum(
             fs_.get(), files_to_ingest_[i].internal_file_path,
             db_options_.file_checksum_gen_factory.get(),
@@ -217,7 +226,8 @@ Status ExternalSstFileIngestionJob::Prepare(
             &generated_checksum_func_name,
             ingestion_options_.verify_checksums_readahead_size,
             db_options_.allow_mmap_reads, io_tracer_,
-            db_options_.rate_limiter.get());
+            db_options_.rate_limiter.get(),
+            Env::IO_TOTAL /* rate_limiter_priority */);
         if (!io_s.ok()) {
           status = io_s;
           ROCKS_LOG_WARN(db_options_.info_log,
@@ -329,9 +339,30 @@ Status ExternalSstFileIngestionJob::Prepare(
 Status ExternalSstFileIngestionJob::NeedsFlush(bool* flush_needed,
                                                SuperVersion* super_version) {
   autovector<Range> ranges;
-  for (const IngestedFileInfo& file_to_ingest : files_to_ingest_) {
-    ranges.emplace_back(file_to_ingest.smallest_internal_key.user_key(),
-                        file_to_ingest.largest_internal_key.user_key());
+  autovector<std::string> keys;
+  size_t ts_sz = cfd_->user_comparator()->timestamp_size();
+  if (ts_sz) {
+    // Check all ranges [begin, end] inclusively. Add maximum
+    // timestamp to include all `begin` keys, and add minimal timestamp to
+    // include all `end` keys.
+    for (const IngestedFileInfo& file_to_ingest : files_to_ingest_) {
+      std::string begin_str;
+      std::string end_str;
+      AppendUserKeyWithMaxTimestamp(
+          &begin_str, file_to_ingest.smallest_internal_key.user_key(), ts_sz);
+      AppendKeyWithMinTimestamp(
+          &end_str, file_to_ingest.largest_internal_key.user_key(), ts_sz);
+      keys.emplace_back(std::move(begin_str));
+      keys.emplace_back(std::move(end_str));
+    }
+    for (size_t i = 0; i < files_to_ingest_.size(); ++i) {
+      ranges.emplace_back(keys[2 * i], keys[2 * i + 1]);
+    }
+  } else {
+    for (const IngestedFileInfo& file_to_ingest : files_to_ingest_) {
+      ranges.emplace_back(file_to_ingest.smallest_internal_key.user_key(),
+                          file_to_ingest.largest_internal_key.user_key());
+    }
   }
   Status status = cfd_->RangesOverlapWithMemtables(
       ranges, super_version, db_options_.allow_data_in_errors, flush_needed);
@@ -438,8 +469,9 @@ Status ExternalSstFileIngestionJob::Run() {
     FileMetaData f_metadata(
         f.fd.GetNumber(), f.fd.GetPathId(), f.fd.GetFileSize(),
         f.smallest_internal_key, f.largest_internal_key, f.assigned_seqno,
-        f.assigned_seqno, false, kInvalidBlobFileNumber, oldest_ancester_time,
-        current_time, f.file_checksum, f.file_checksum_func_name);
+        f.assigned_seqno, false, f.file_temperature, kInvalidBlobFileNumber,
+        oldest_ancester_time, current_time, f.file_checksum,
+        f.file_checksum_func_name, f.unique_id);
     f_metadata.temperature = f.file_temperature;
     edit_.AddFile(f.picked_level, f_metadata);
   }
@@ -539,8 +571,8 @@ void ExternalSstFileIngestionJob::Cleanup(const Status& status) {
 }
 
 Status ExternalSstFileIngestionJob::GetIngestedFileInfo(
-    const std::string& external_file, IngestedFileInfo* file_to_ingest,
-    SuperVersion* sv) {
+    const std::string& external_file, uint64_t new_file_number,
+    IngestedFileInfo* file_to_ingest, SuperVersion* sv) {
   file_to_ingest->external_file_path = external_file;
 
   // Get external file size
@@ -549,6 +581,10 @@ Status ExternalSstFileIngestionJob::GetIngestedFileInfo(
   if (!status.ok()) {
     return status;
   }
+
+  // Assign FD with number
+  file_to_ingest->fd =
+      FileDescriptor(new_file_number, 0, file_to_ingest->file_size);
 
   // Create TableReader for external file
   std::unique_ptr<TableReader> table_reader;
@@ -564,9 +600,14 @@ Status ExternalSstFileIngestionJob::GetIngestedFileInfo(
       std::move(sst_file), external_file, nullptr /*Env*/, io_tracer_));
 
   status = cfd_->ioptions()->table_factory->NewTableReader(
-      TableReaderOptions(*cfd_->ioptions(),
-                         sv->mutable_cf_options.prefix_extractor.get(),
-                         env_options_, cfd_->internal_comparator()),
+      TableReaderOptions(
+          *cfd_->ioptions(), sv->mutable_cf_options.prefix_extractor,
+          env_options_, cfd_->internal_comparator(),
+          /*skip_filters*/ false, /*immortal*/ false,
+          /*force_direct_prefetch*/ false, /*level*/ -1,
+          /*block_cache_tracer*/ nullptr,
+          /*max_file_size_for_l0_meta_pin*/ 0, versions_->DbSessionId(),
+          /*cur_file_num*/ new_file_number),
       std::move(sst_file_reader), file_to_ingest->file_size, &table_reader);
   if (!status.ok()) {
     return status;
@@ -606,14 +647,12 @@ Status ExternalSstFileIngestionJob::GetIngestedFileInfo(
 
     // Set the global sequence number
     file_to_ingest->original_seqno = DecodeFixed64(seqno_iter->second.c_str());
-    auto offsets_iter = props->properties_offsets.find(
-        ExternalSstFilePropertyNames::kGlobalSeqno);
-    if (offsets_iter == props->properties_offsets.end() ||
-        offsets_iter->second == 0) {
+    if (props->external_sst_file_global_seqno_offset == 0) {
       file_to_ingest->global_seqno_offset = 0;
       return Status::Corruption("Was not able to find file global seqno field");
     }
-    file_to_ingest->global_seqno_offset = static_cast<size_t>(offsets_iter->second);
+    file_to_ingest->global_seqno_offset =
+        static_cast<size_t>(props->external_sst_file_global_seqno_offset);
   } else if (file_to_ingest->version == 1) {
     // SST file V1 should not have global seqno field
     assert(seqno_iter == uprops.end());
@@ -712,6 +751,16 @@ Status ExternalSstFileIngestionJob::GetIngestedFileInfo(
 
   file_to_ingest->table_properties = *props;
 
+  auto s = GetSstInternalUniqueId(props->db_id, props->db_session_id,
+                                  props->orig_file_number,
+                                  &(file_to_ingest->unique_id));
+  if (!s.ok()) {
+    ROCKS_LOG_WARN(db_options_.info_log,
+                   "Failed to get SST unique id for file %s",
+                   file_to_ingest->internal_file_path.c_str());
+    file_to_ingest->unique_id = kNullUniqueId64x2;
+  }
+
   return status;
 }
 
@@ -724,6 +773,12 @@ Status ExternalSstFileIngestionJob::AssignLevelAndSeqnoForIngestedFile(
   if (force_global_seqno) {
     *assigned_seqno = last_seqno + 1;
     if (compaction_style == kCompactionStyleUniversal || files_overlap_) {
+      if (ingestion_options_.fail_if_not_bottommost_level) {
+        status = Status::TryAgain(
+            "Files cannot be ingested to Lmax. Please make sure key range of "
+            "Lmax does not overlap with files to ingest.");
+        return status;
+      }
       file_to_ingest->picked_level = 0;
       return status;
     }
@@ -762,10 +817,11 @@ Status ExternalSstFileIngestionJob::AssignLevelAndSeqnoForIngestedFile(
         const std::vector<FileMetaData*>& level_files =
             vstorage->LevelFiles(lvl);
         const SequenceNumber level_largest_seqno =
-            (*max_element(level_files.begin(), level_files.end(),
-                          [](FileMetaData* f1, FileMetaData* f2) {
-                            return f1->fd.largest_seqno < f2->fd.largest_seqno;
-                          }))
+            (*std::max_element(level_files.begin(), level_files.end(),
+                               [](FileMetaData* f1, FileMetaData* f2) {
+                                 return f1->fd.largest_seqno <
+                                        f2->fd.largest_seqno;
+                               }))
                 ->fd.largest_seqno;
         // should only assign seqno to current level's largest seqno when
         // the file fits
@@ -792,6 +848,15 @@ Status ExternalSstFileIngestionJob::AssignLevelAndSeqnoForIngestedFile(
     target_level = 0;
     *assigned_seqno = last_seqno + 1;
   }
+
+  if (ingestion_options_.fail_if_not_bottommost_level &&
+      target_level < cfd_->NumberLevels() - 1) {
+    status = Status::TryAgain(
+        "Files cannot be ingested to Lmax. Please make sure key range of Lmax "
+        "does not overlap with files to ingest.");
+    return status;
+  }
+
  TEST_SYNC_POINT_CALLBACK(
       "ExternalSstFileIngestionJob::AssignLevelAndSeqnoForIngestedFile",
       &overlap_with_db);
@@ -896,12 +961,14 @@ IOStatus ExternalSstFileIngestionJob::GenerateChecksumForIngestedFile(
   std::string file_checksum;
   std::string file_checksum_func_name;
   std::string requested_checksum_func_name;
+  // TODO: rate limit file reads for checksum calculation during file ingestion.
   IOStatus io_s = GenerateOneFileChecksum(
       fs_.get(), file_to_ingest->internal_file_path,
       db_options_.file_checksum_gen_factory.get(), requested_checksum_func_name,
       &file_checksum, &file_checksum_func_name,
       ingestion_options_.verify_checksums_readahead_size,
-      db_options_.allow_mmap_reads, io_tracer_, db_options_.rate_limiter.get());
+      db_options_.allow_mmap_reads, io_tracer_, db_options_.rate_limiter.get(),
+      Env::IO_TOTAL /* rate_limiter_priority */);
   if (!io_s.ok()) {
     return io_s;
   }

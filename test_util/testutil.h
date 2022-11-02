@@ -25,6 +25,14 @@
 #include "table/internal_iterator.h"
 #include "util/mutexlock.h"
 
+#ifdef ROCKSDB_UNITTESTS_WITH_CUSTOM_OBJECTS_FROM_STATIC_LIBS
+extern "C" {
+void RegisterCustomObjects(int argc, char** argv);
+}
+#else
+void RegisterCustomObjects(int argc, char** argv);
+#endif  // !ROCKSDB_UNITTESTS_WITH_CUSTOM_OBJECTS_FROM_STATIC_LIBS
+
 namespace ROCKSDB_NAMESPACE {
 class FileSystem;
 class MemTableRepFactory;
@@ -36,7 +44,7 @@ class SequentialFileReader;
 namespace test {
 
 extern const uint32_t kDefaultFormatVersion;
-extern const uint32_t kLatestFormatVersion;
+extern const std::set<uint32_t> kFooterFormatVersionsToTest;
 
 // Return a random key with the specified length that may contain interesting
 // characters (e.g. \x00, \xff, etc.).
@@ -49,29 +57,6 @@ extern std::string RandomKey(Random* rnd, int len,
 // the generated data.
 extern Slice CompressibleString(Random* rnd, double compressed_fraction,
                                 int len, std::string* dst);
-
-// A wrapper that allows injection of errors.
-class ErrorEnv : public EnvWrapper {
- public:
-  bool writable_file_error_;
-  int num_writable_file_errors_;
-
-  ErrorEnv(Env* _target)
-      : EnvWrapper(_target),
-        writable_file_error_(false),
-        num_writable_file_errors_(0) {}
-
-  virtual Status NewWritableFile(const std::string& fname,
-                                 std::unique_ptr<WritableFile>* result,
-                                 const EnvOptions& soptions) override {
-    result->reset();
-    if (writable_file_error_) {
-      ++num_writable_file_errors_;
-      return Status::IOError(fname, "fake error");
-    }
-    return target()->NewWritableFile(fname, result, soptions);
-  }
-};
 
 #ifndef NDEBUG
 // An internal comparator that just forward comparing results from the
@@ -128,6 +113,9 @@ class SimpleSuffixReverseComparator : public Comparator {
 // endian machines.
 extern const Comparator* Uint64Comparator();
 
+// A wrapper api for getting the ComparatorWithU64Ts<BytewiseComparator>
+extern const Comparator* BytewiseComparatorWithU64TsWrapper();
+
 class StringSink : public FSWritableFile {
  public:
   std::string contents_;
@@ -156,9 +144,8 @@ class StringSink : public FSWritableFile {
     if (reader_contents_ != nullptr) {
       assert(reader_contents_->size() <= last_flush_);
       size_t offset = last_flush_ - reader_contents_->size();
-      *reader_contents_ = Slice(
-          contents_.data() + offset,
-          contents_.size() - offset);
+      *reader_contents_ =
+          Slice(contents_.data() + offset, contents_.size() - offset);
       last_flush_ = contents_.size();
     }
 
@@ -177,8 +164,8 @@ class StringSink : public FSWritableFile {
   void Drop(size_t bytes) {
     if (reader_contents_ != nullptr) {
       contents_.resize(contents_.size() - bytes);
-      *reader_contents_ = Slice(
-          reader_contents_->data(), reader_contents_->size() - bytes);
+      *reader_contents_ =
+          Slice(reader_contents_->data(), reader_contents_->size() - bytes);
       last_flush_ = contents_.size();
     }
   }
@@ -294,7 +281,7 @@ class StringSource : public FSRandomAccessFile {
         mmap_(mmap),
         total_reads_(0) {}
 
-  virtual ~StringSource() { }
+  virtual ~StringSource() {}
 
   uint64_t Size() const { return contents_.size(); }
 
@@ -336,7 +323,7 @@ class StringSource : public FSRandomAccessFile {
     char* rid = id;
     rid = EncodeVarint64(rid, uniq_id_);
     rid = EncodeVarint64(rid, 0);
-    return static_cast<size_t>(rid-id);
+    return static_cast<size_t>(rid - id);
   }
 
   int total_reads() const { return total_reads_; }
@@ -555,6 +542,9 @@ class StringFS : public FileSystemWrapper {
       : FileSystemWrapper(t) {}
   ~StringFS() override {}
 
+  static const char* kClassName() { return "StringFS"; }
+  const char* Name() const override { return kClassName(); }
+
   const std::string& GetContent(const std::string& f) { return files_[f]; }
 
   const IOStatus WriteToNewFile(const std::string& file_name,
@@ -723,7 +713,9 @@ class ChanglingMergeOperator : public MergeOperator {
     return false;
   }
   static const char* kClassName() { return "ChanglingMergeOperator"; }
-  virtual bool IsInstanceOf(const std::string& id) const override {
+  const char* NickName() const override { return kNickName(); }
+  static const char* kNickName() { return "Changling"; }
+  bool IsInstanceOf(const std::string& id) const override {
     if (id == kClassName()) {
       return true;
     } else {
@@ -756,7 +748,10 @@ class ChanglingCompactionFilter : public CompactionFilter {
   }
 
   static const char* kClassName() { return "ChanglingCompactionFilter"; }
-  virtual bool IsInstanceOf(const std::string& id) const override {
+  const char* NickName() const override { return kNickName(); }
+  static const char* kNickName() { return "Changling"; }
+
+  bool IsInstanceOf(const std::string& id) const override {
     if (id == kClassName()) {
       return true;
     } else {
@@ -790,7 +785,10 @@ class ChanglingCompactionFilterFactory : public CompactionFilterFactory {
   // Returns a name that identifies this compaction filter factory.
   const char* Name() const override { return name_.c_str(); }
   static const char* kClassName() { return "ChanglingCompactionFilterFactory"; }
-  virtual bool IsInstanceOf(const std::string& id) const override {
+  const char* NickName() const override { return kNickName(); }
+  static const char* kNickName() { return "Changling"; }
+
+  bool IsInstanceOf(const std::string& id) const override {
     if (id == kClassName()) {
       return true;
     } else {
@@ -805,8 +803,6 @@ class ChanglingCompactionFilterFactory : public CompactionFilterFactory {
 // The factory for the hacky skip list mem table that triggers flush after
 // number of entries exceeds a threshold.
 extern MemTableRepFactory* NewSpecialSkipListFactory(int num_entries_per_flush);
-
-extern const Comparator* ComparatorWithU64Ts();
 
 CompressionType RandomCompressionType(Random* rnd);
 
@@ -829,11 +825,6 @@ bool IsPrefetchSupported(const std::shared_ptr<FileSystem>& fs,
 
 // Return the number of lines where a given pattern was found in a file.
 size_t GetLinesCount(const std::string& fname, const std::string& pattern);
-
-// TEST_TMPDIR may be set to /dev/shm in Makefile,
-// but /dev/shm does not support direct IO.
-// Tries to set TEST_TMPDIR to a directory supporting direct IO.
-void ResetTmpDirForDirectIO();
 
 Status CorruptFile(Env* env, const std::string& fname, int offset,
                    int bytes_to_corrupt, bool verify_checksum = true);

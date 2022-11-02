@@ -176,7 +176,7 @@ class RegularKeysStartWithAInternal : public IntTblPropCollector {
     return Status::OK();
   }
 
-  void BlockAdd(uint64_t /* block_raw_bytes */,
+  void BlockAdd(uint64_t /* block_uncomp_bytes */,
                 uint64_t /* block_compressed_bytes_fast */,
                 uint64_t /* block_compressed_bytes_slow */) override {
     // Nothing to do.
@@ -281,7 +281,7 @@ void TestCustomizedTablePropertiesCollector(
     builder->Add(ikey.Encode(), kv.second);
   }
   ASSERT_OK(builder->Finish());
-  writer->Flush();
+  ASSERT_OK(writer->Flush());
 
   // -- Step 2: Read properties
   test::StringSink* fwf =
@@ -291,11 +291,9 @@ void TestCustomizedTablePropertiesCollector(
   std::unique_ptr<RandomAccessFileReader> fake_file_reader(
       new RandomAccessFileReader(std::move(source), "test"));
 
-  TableProperties* props;
+  std::unique_ptr<TableProperties> props;
   Status s = ReadTableProperties(fake_file_reader.get(), fwf->contents().size(),
-                                 magic_number, ioptions, &props,
-                                 true /* compression_type_missing */);
-  std::unique_ptr<TableProperties> props_guard(props);
+                                 magic_number, ioptions, &props);
   ASSERT_OK(s);
 
   auto user_collected = props->user_collected_properties;
@@ -423,7 +421,7 @@ void TestInternalKeyPropertiesCollector(
     }
 
     ASSERT_OK(builder->Finish());
-    writable->Flush();
+    ASSERT_OK(writable->Flush());
 
     test::StringSink* fwf =
         static_cast<test::StringSink*>(writable->writable_file());
@@ -432,13 +430,11 @@ void TestInternalKeyPropertiesCollector(
     std::unique_ptr<RandomAccessFileReader> reader(
         new RandomAccessFileReader(std::move(source), "test"));
 
-    TableProperties* props;
-    Status s =
-        ReadTableProperties(reader.get(), fwf->contents().size(), magic_number,
-                            ioptions, &props, true /* compression_type_missing */);
+    std::unique_ptr<TableProperties> props;
+    Status s = ReadTableProperties(reader.get(), fwf->contents().size(),
+                                   magic_number, ioptions, &props);
     ASSERT_OK(s);
 
-    std::unique_ptr<TableProperties> props_guard(props);
     auto user_collected = props->user_collected_properties;
     uint64_t deleted = GetDeletedKeys(user_collected);
     ASSERT_EQ(5u, deleted);  // deletes + single-deletes
@@ -511,6 +507,7 @@ INSTANTIATE_TEST_CASE_P(CustomizedTablePropertiesCollector, TablePropertiesTest,
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
+  ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
