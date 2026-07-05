@@ -85,11 +85,35 @@ class DBBenchTest : public testing::Test {
     ASSERT_EQ(0, db_bench_tool(argc(), argv()));
   }
 
+  // Every flag is passed explicitly because gflags state persists across
+  // db_bench_tool() calls within the same test process.
+  void RunIngestBench(int batch_size, int num_batches, int file_opening_threads,
+                      bool use_file_info, bool fill_cache) {
+    ResetArgs();
+    AppendArgs(
+        {"./db_bench", "--benchmarks=ingestexternalfile", "--use_existing_db=0",
+         "--num=2000", "--compression_type=none", "--db=" + db_path_,
+         "--wal_dir=" + wal_path_,
+         "--ingest_external_file_batch_size=" + std::to_string(batch_size),
+         "--ingest_external_file_num_batches=" + std::to_string(num_batches),
+         "--ingest_external_file_file_opening_threads=" +
+             std::to_string(file_opening_threads),
+         "--ingest_external_file_use_file_info=" +
+             std::string(use_file_info ? "true" : "false"),
+         "--ingest_external_file_fill_cache=" +
+             std::string(fill_cache ? "true" : "false")});
+    ASSERT_EQ(0, db_bench_tool(argc(), argv()));
+  }
+
   void VerifyOptions(const Options& opt) {
     DBOptions loaded_db_opts;
+    ConfigOptions config_opts;
+    config_opts.ignore_unknown_options = false;
+    config_opts.input_strings_escaped = true;
+    config_opts.env = Env::Default();
     std::vector<ColumnFamilyDescriptor> cf_descs;
-    ASSERT_OK(LoadLatestOptions(db_path_, Env::Default(), &loaded_db_opts,
-                                &cf_descs));
+    ASSERT_OK(
+        LoadLatestOptions(config_opts, db_path_, &loaded_db_opts, &cf_descs));
 
     ConfigOptions exact;
     exact.input_strings_escaped = false;
@@ -126,7 +150,7 @@ namespace {}  // namespace
 TEST_F(DBBenchTest, OptionsFile) {
   const std::string kOptionsFileName = test_path_ + "/OPTIONS_test";
   Options opt = GetDefaultOptions();
-  ASSERT_OK(PersistRocksDBOptions(DBOptions(opt), {"default"},
+  ASSERT_OK(PersistRocksDBOptions(WriteOptions(), DBOptions(opt), {"default"},
                                   {ColumnFamilyOptions(opt)}, kOptionsFileName,
                                   opt.env->GetFileSystem().get()));
 
@@ -140,12 +164,33 @@ TEST_F(DBBenchTest, OptionsFile) {
   VerifyOptions(opt);
 }
 
+TEST_F(DBBenchTest, IngestExternalFile) {
+  // Exercise the ingestexternalfile benchmark with both serial and parallel
+  // (file_opening_threads > 1) commit-time table-reader opening.
+  for (int file_opening_threads : {1, 4}) {
+    RunIngestBench(/*batch_size=*/3, /*num_batches=*/2, file_opening_threads,
+                   /*use_file_info=*/false, /*fill_cache=*/true);
+  }
+}
+
+TEST_F(DBBenchTest, IngestExternalFileWithFileInfo) {
+  RunIngestBench(/*batch_size=*/3, /*num_batches=*/2,
+                 /*file_opening_threads=*/4,
+                 /*use_file_info=*/true, /*fill_cache=*/true);
+}
+
+TEST_F(DBBenchTest, IngestExternalFileWithoutFillCache) {
+  RunIngestBench(/*batch_size=*/3, /*num_batches=*/2,
+                 /*file_opening_threads=*/1,
+                 /*use_file_info=*/false, /*fill_cache=*/false);
+}
+
 TEST_F(DBBenchTest, OptionsFileUniversal) {
   const std::string kOptionsFileName = test_path_ + "/OPTIONS_test";
 
   Options opt = GetDefaultOptions(kCompactionStyleUniversal, 1);
 
-  ASSERT_OK(PersistRocksDBOptions(DBOptions(opt), {"default"},
+  ASSERT_OK(PersistRocksDBOptions(WriteOptions(), DBOptions(opt), {"default"},
                                   {ColumnFamilyOptions(opt)}, kOptionsFileName,
                                   opt.env->GetFileSystem().get()));
 
@@ -162,7 +207,7 @@ TEST_F(DBBenchTest, OptionsFileMultiLevelUniversal) {
 
   Options opt = GetDefaultOptions(kCompactionStyleUniversal, 12);
 
-  ASSERT_OK(PersistRocksDBOptions(DBOptions(opt), {"default"},
+  ASSERT_OK(PersistRocksDBOptions(WriteOptions(), DBOptions(opt), {"default"},
                                   {ColumnFamilyOptions(opt)}, kOptionsFileName,
                                   opt.env->GetFileSystem().get()));
 
@@ -218,7 +263,6 @@ const std::string options_file_content = R"OPTIONS_FILE(
   stats_dump_period_sec=600
   allow_fallocate=true
   max_log_file_size=83886080
-  random_access_max_buffer_size=1048576
   advise_random_on_open=true
   dump_malloc_stats=true
 
@@ -250,7 +294,6 @@ const std::string options_file_content = R"OPTIONS_FILE(
   level0_slowdown_writes_trigger=50
   level0_file_num_compaction_trigger=10
   expanded_compaction_factor=25
-  max_write_buffer_number_to_maintain=0
   max_write_buffer_size_to_maintain=0
   verify_checksums_in_compaction=true
   merge_operator=nullptr
@@ -302,9 +345,13 @@ TEST_F(DBBenchTest, OptionsFileFromFile) {
   ASSERT_OK(writable->Close());
 
   DBOptions db_opt;
+  ConfigOptions config_opt;
+  config_opt.ignore_unknown_options = false;
+  config_opt.input_strings_escaped = true;
+  config_opt.env = Env::Default();
   std::vector<ColumnFamilyDescriptor> cf_descs;
-  ASSERT_OK(LoadOptionsFromFile(kOptionsFileName, Env::Default(), &db_opt,
-                                &cf_descs));
+  ASSERT_OK(
+      LoadOptionsFromFile(config_opt, kOptionsFileName, &db_opt, &cf_descs));
   Options opt(db_opt, cf_descs[0].options);
   opt.create_if_missing = true;
 

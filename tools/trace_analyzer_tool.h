@@ -4,7 +4,6 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #pragma once
-#ifndef ROCKSDB_LITE
 
 #include <list>
 #include <map>
@@ -35,7 +34,8 @@ enum TraceOperationType : int {
   kIteratorSeek = 6,
   kIteratorSeekForPrev = 7,
   kMultiGet = 8,
-  kTaTypeNum = 9
+  kPutEntity = 9,
+  kTaTypeNum = 10
 };
 
 struct TraceUnit {
@@ -201,6 +201,14 @@ class TraceAnalyzer : private TraceRecord::Handler,
   Status PutCF(uint32_t column_family_id, const Slice& key,
                const Slice& value) override;
 
+  using WriteBatch::Handler::TimedPutCF;
+  Status TimedPutCF(uint32_t column_family_id, const Slice& key,
+                    const Slice& value, uint64_t write_unix_time) override;
+
+  using WriteBatch::Handler::PutEntityCF;
+  Status PutEntityCF(uint32_t column_family_id, const Slice& key,
+                     const Slice& value) override;
+
   using WriteBatch::Handler::DeleteCF;
   Status DeleteCF(uint32_t column_family_id, const Slice& key) override;
 
@@ -313,6 +321,9 @@ class TraceAnalyzer : private TraceRecord::Handler,
   Status WriteTraceSequence(const uint32_t& type, const uint32_t& cf_id,
                             const Slice& key, const size_t value_size,
                             const uint64_t ts);
+  Status WriteRangeDeleteTraceSequence(const uint32_t& cf_id,
+                                       const Slice& begin_key,
+                                       const Slice& end_key, const uint64_t ts);
   Status MakeStatisticKeyStatsOrPrefix(TraceStats& stats);
   Status MakeStatisticCorrelation(TraceStats& stats, StatsUnit& unit);
   Status MakeStatisticQPS();
@@ -322,5 +333,3 @@ class TraceAnalyzer : private TraceRecord::Handler,
 int trace_analyzer_tool(int argc, char** argv);
 
 }  // namespace ROCKSDB_NAMESPACE
-
-#endif  // ROCKSDB_LITE

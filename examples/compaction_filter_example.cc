@@ -10,8 +10,8 @@
 
 class MyMerge : public ROCKSDB_NAMESPACE::MergeOperator {
  public:
-  virtual bool FullMergeV2(const MergeOperationInput& merge_in,
-                           MergeOperationOutput* merge_out) const override {
+  bool FullMergeV2(const MergeOperationInput& merge_in,
+                   MergeOperationOutput* merge_out) const override {
     merge_out->new_value.clear();
     if (merge_in.existing_value != nullptr) {
       merge_out->new_value.assign(merge_in.existing_value->data(),
@@ -63,7 +63,7 @@ std::string kRemoveDirCommand = "rm -rf ";
 #endif
 
 int main() {
-  ROCKSDB_NAMESPACE::DB* raw_db;
+  std::unique_ptr<ROCKSDB_NAMESPACE::DB> db;
   ROCKSDB_NAMESPACE::Status status;
 
   MyFilter filter;
@@ -77,9 +77,8 @@ int main() {
   options.create_if_missing = true;
   options.merge_operator.reset(new MyMerge);
   options.compaction_filter = &filter;
-  status = ROCKSDB_NAMESPACE::DB::Open(options, kDBPath, &raw_db);
+  status = ROCKSDB_NAMESPACE::DB::Open(options, kDBPath, &db);
   assert(status.ok());
-  std::unique_ptr<ROCKSDB_NAMESPACE::DB> db(raw_db);
 
   ROCKSDB_NAMESPACE::WriteOptions wopts;
   db->Merge(wopts, "0", "bad");  // This is filtered out

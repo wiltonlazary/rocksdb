@@ -9,6 +9,7 @@
 
 #pragma once
 #include <atomic>
+#include <functional>
 #include <sstream>
 #include <string>
 
@@ -25,7 +26,16 @@ class Statistics;
 class HistogramImpl;
 class SystemClock;
 
-using AlignedBuf = std::unique_ptr<char[]>;
+using AlignedBuf = FSAllocationPtr;
+
+struct AlignedBufferAllocationContext {
+  // `allocator` is intentionally not owned. RandomAccessFileReader invokes it
+  // only while allocating `buffer`, before Read/ReadAsync/MultiRead returns.
+  // For ReadAsync, `buffer` is still referenced by the completion callback and
+  // must outlive the async operation.
+  AlignedBuffer* buffer = nullptr;
+  const AlignedBuffer::Allocator* allocator = nullptr;
+};
 
 // Align the request r according to alignment and return the aligned result.
 FSReadRequest Align(const FSReadRequest& r, size_t alignment);
@@ -46,7 +56,6 @@ bool TryMerge(FSReadRequest* dest, const FSReadRequest& src);
 // - Updating IO stats.
 class RandomAccessFileReader {
  private:
-#ifndef ROCKSDB_LITE
   void NotifyOnFileReadFinish(
       uint64_t offset, size_t length,
       const FileOperationInfo::StartTimePoint& start_ts,
@@ -77,8 +86,6 @@ class RandomAccessFileReader {
     io_status.PermitUncheckedError();
   }
 
-#endif  // ROCKSDB_LITE
-
   bool ShouldNotifyListeners() const { return !listeners_.empty(); }
 
   FSRandomAccessFilePtr file_;
@@ -93,26 +100,29 @@ class RandomAccessFileReader {
   const bool is_last_level_;
 
   struct ReadAsyncInfo {
-    ReadAsyncInfo(std::function<void(const FSReadRequest&, void*)> cb,
-                  void* cb_arg, uint64_t start_time)
+    ReadAsyncInfo(std::function<void(FSReadRequest&, void*)> cb, void* cb_arg,
+                  uint64_t start_time)
         : cb_(cb),
           cb_arg_(cb_arg),
           start_time_(start_time),
           user_scratch_(nullptr),
           user_aligned_buf_(nullptr),
+          direct_io_buffer_(nullptr),
           user_offset_(0),
           user_len_(0),
           is_aligned_(false) {}
 
-    std::function<void(const FSReadRequest&, void*)> cb_;
+    std::function<void(FSReadRequest&, void*)> cb_;
     void* cb_arg_;
     uint64_t start_time_;
-#ifndef ROCKSDB_LITE
     FileOperationInfo::StartTimePoint fs_start_ts_;
-#endif
     // Below fields stores the parameters passed by caller in case of direct_io.
     char* user_scratch_;
     AlignedBuf* user_aligned_buf_;
+    // Raw pointer to caller-owned direct-I/O storage used when forming the
+    // user-visible result in ReadAsyncCallback. The caller must keep it alive
+    // until the async operation completes or is cancelled.
+    AlignedBuffer* direct_io_buffer_;
     uint64_t user_offset_;
     size_t user_len_;
     Slice user_result_;
@@ -126,7 +136,8 @@ class RandomAccessFileReader {
       std::unique_ptr<FSRandomAccessFile>&& raf, const std::string& _file_name,
       SystemClock* clock = nullptr,
       const std::shared_ptr<IOTracer>& io_tracer = nullptr,
-      Statistics* stats = nullptr, uint32_t hist_type = 0,
+      Statistics* stats = nullptr,
+      uint32_t hist_type = Histograms::HISTOGRAM_ENUM_MAX,
       HistogramImpl* file_read_hist = nullptr,
       RateLimiter* rate_limiter = nullptr,
       const std::vector<std::shared_ptr<EventListener>>& listeners = {},
@@ -142,16 +153,12 @@ class RandomAccessFileReader {
         listeners_(),
         file_temperature_(file_temperature),
         is_last_level_(is_last_level) {
-#ifndef ROCKSDB_LITE
     std::for_each(listeners.begin(), listeners.end(),
                   [this](const std::shared_ptr<EventListener>& e) {
                     if (e->ShouldBeNotifiedOnFileIO()) {
                       listeners_.emplace_back(e);
                     }
                   });
-#else  // !ROCKSDB_LITE
-    (void)listeners;
-#endif
   }
 
   static IOStatus Create(const std::shared_ptr<FileSystem>& fs,
@@ -165,38 +172,33 @@ class RandomAccessFileReader {
   // 1. if using mmap, result is stored in a buffer other than scratch;
   // 2. if not using mmap, result is stored in the buffer starting from scratch.
   //
-  // In direct IO mode, an aligned buffer is allocated internally.
-  // 1. If aligned_buf is null, then results are copied to the buffer
-  // starting from scratch;
-  // 2. Otherwise, scratch is not used and can be null, the aligned_buf owns
-  // the internally allocated buffer on return, and the result refers to a
-  // region in aligned_buf.
-  //
-  // `rate_limiter_priority` is used to charge the internal rate limiter when
-  // enabled. The special value `Env::IO_TOTAL` makes this operation bypass the
-  // rate limiter.
-  IOStatus Read(const IOOptions& opts, uint64_t offset, size_t n, Slice* result,
-                char* scratch, AlignedBuf* aligned_buf,
-                Env::IOPriority rate_limiter_priority) const;
+  // In direct IO mode, if direct_io_buffer_context is provided then it
+  // allocates the aligned buffer and the result refers to a region in
+  // direct_io_buffer_context->buffer. Otherwise, results are returned in
+  // scratch; unaligned reads use an internal aligned buffer and copy the
+  // requested subrange to scratch.
+  IOStatus Read(
+      const IOOptions& opts, uint64_t offset, size_t n, Slice* result,
+      char* scratch,
+      AlignedBufferAllocationContext* direct_io_buffer_context = nullptr,
+      IODebugContext* dbg = nullptr) const;
 
   // REQUIRES:
   // num_reqs > 0, reqs do not overlap, and offsets in reqs are increasing.
-  // In non-direct IO mode, aligned_buf should be null;
-  // In direct IO mode, aligned_buf stores the aligned buffer allocated inside
-  // MultiRead, the result Slices in reqs refer to aligned_buf.
-  //
-  // `rate_limiter_priority` will be used to charge the internal rate limiter.
-  // It is not yet supported so the client must provide the special value
-  // `Env::IO_TOTAL` to bypass the rate limiter.
+  // MultiRead uses direct_io_buffer_context to allocate the aligned buffer in
+  // direct IO mode. The result Slices in reqs refer to
+  // direct_io_buffer_context->buffer, so callers must keep it alive while those
+  // Slices are used. Callers should pass a default-constructed AlignedBuffer
+  // when default heap-backed allocation is sufficient. direct_io_buffer_context
+  // is ignored in non-direct IO mode.
   IOStatus MultiRead(const IOOptions& opts, FSReadRequest* reqs,
-                     size_t num_reqs, AlignedBuf* aligned_buf,
-                     Env::IOPriority rate_limiter_priority) const;
+                     size_t num_reqs,
+                     AlignedBufferAllocationContext* direct_io_buffer_context,
+                     IODebugContext* dbg = nullptr) const;
 
-  IOStatus Prefetch(uint64_t offset, size_t n,
-                    const Env::IOPriority rate_limiter_priority) const {
-    IOOptions opts;
-    opts.rate_limiter_priority = rate_limiter_priority;
-    return file_->Prefetch(offset, n, opts, nullptr);
+  IOStatus Prefetch(const IOOptions& opts, uint64_t offset, size_t n,
+                    IODebugContext* dbg = nullptr) const {
+    return file_->Prefetch(offset, n, opts, dbg);
   }
 
   FSRandomAccessFile* file() { return file_.get(); }
@@ -205,13 +207,16 @@ class RandomAccessFileReader {
 
   bool use_direct_io() const { return file_->use_direct_io(); }
 
-  IOStatus PrepareIOOptions(const ReadOptions& ro, IOOptions& opts);
+  IOStatus PrepareIOOptions(const ReadOptions& ro, IOOptions& opts,
+                            IODebugContext* dbg = nullptr) const;
 
-  IOStatus ReadAsync(FSReadRequest& req, const IOOptions& opts,
-                     std::function<void(const FSReadRequest&, void*)> cb,
-                     void* cb_arg, void** io_handle, IOHandleDeleter* del_fn,
-                     AlignedBuf* aligned_buf);
+  IOStatus ReadAsync(
+      FSReadRequest& req, const IOOptions& opts,
+      std::function<void(FSReadRequest&, void*)> cb, void* cb_arg,
+      void** io_handle, IOHandleDeleter* del_fn, AlignedBuf* aligned_buf,
+      IODebugContext* dbg = nullptr,
+      AlignedBufferAllocationContext* direct_io_buffer_context = nullptr);
 
-  void ReadAsyncCallback(const FSReadRequest& req, void* cb_arg);
+  void ReadAsyncCallback(FSReadRequest& req, void* cb_arg);
 };
 }  // namespace ROCKSDB_NAMESPACE

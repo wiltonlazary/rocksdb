@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -64,7 +65,7 @@ const std::vector<std::string>& GetColumnFamilyNames() {
 
 inline bool IsLittleEndian() {
   uint32_t x = 1;
-  return *reinterpret_cast<char*>(&x) != 0;
+  return *static_cast<char*>(&x) != 0;
 }
 
 static std::atomic<int>& ShouldSecondaryWait() {
@@ -75,7 +76,7 @@ static std::atomic<int>& ShouldSecondaryWait() {
 static std::string Key(uint64_t k) {
   std::string ret;
   if (IsLittleEndian()) {
-    ret.append(reinterpret_cast<char*>(&k), sizeof(k));
+    ret.append(static_cast<char*>(&k), sizeof(k));
   } else {
     char buf[sizeof(k)];
     buf[0] = k & 0xff;
@@ -147,7 +148,7 @@ void CreateDB() {
     assert(false);
   }
   options.create_if_missing = true;
-  DB* db = nullptr;
+  std::unique_ptr<DB> db;
   s = DB::Open(options, kDBPath, &db);
   if (!s.ok()) {
     fprintf(stderr, "[process %ld] Failed to open DB: %s\n", my_pid,
@@ -173,7 +174,7 @@ void CreateDB() {
     delete h;
   }
   handles.clear();
-  delete db;
+  db.reset();
 }
 
 void RunPrimary() {
@@ -181,7 +182,7 @@ void RunPrimary() {
   fprintf(stdout, "[process %ld] Primary instance starts\n", my_pid);
   CreateDB();
   std::srand(time(nullptr));
-  DB* db = nullptr;
+  std::unique_ptr<DB> db;
   Options options;
   options.create_if_missing = false;
   std::vector<ColumnFamilyDescriptor> column_families;
@@ -227,8 +228,7 @@ void RunPrimary() {
         delete h;
       }
       handles.clear();
-      delete db;
-      db = nullptr;
+      db.reset();
     }
   }
   if (nullptr != db) {
@@ -236,8 +236,7 @@ void RunPrimary() {
       delete h;
     }
     handles.clear();
-    delete db;
-    db = nullptr;
+    db.reset();
   }
   fprintf(stdout, "[process %ld] Finished adding keys\n", my_pid);
 }
@@ -262,7 +261,7 @@ void RunSecondary() {
       exit(0);
     }
   }
-  DB* db = nullptr;
+  std::unique_ptr<DB> db;
   Options options;
   options.create_if_missing = false;
   options.max_open_files = -1;
@@ -344,7 +343,7 @@ void RunSecondary() {
     column_families.push_back(ColumnFamilyDescriptor(cf_name, options));
   }
   std::vector<ColumnFamilyHandle*> handles;
-  DB* verification_db = nullptr;
+  std::unique_ptr<DB> verification_db;
   s = DB::OpenForReadOnly(options, kDBPath, column_families, &handles,
                           &verification_db);
   assert(s.ok());
@@ -369,8 +368,8 @@ void RunSecondary() {
   }
   delete iter;
   delete iter1;
-  delete db;
-  delete verification_db;
+  db.reset();
+  verification_db.reset();
 }
 
 int main(int argc, char** argv) {

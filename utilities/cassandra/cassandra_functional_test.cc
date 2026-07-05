@@ -18,15 +18,14 @@
 #include "utilities/cassandra/test_utils.h"
 #include "utilities/merge_operators.h"
 
-namespace ROCKSDB_NAMESPACE {
-namespace cassandra {
+namespace ROCKSDB_NAMESPACE::cassandra {
 
 // Path to the database on file system
 const std::string kDbName = test::PerThreadDBPath("cassandra_functional_test");
 
 class CassandraStore {
  public:
-  explicit CassandraStore(std::shared_ptr<DB> db)
+  explicit CassandraStore(UnownedPtr<DB> db)
       : db_(db), write_option_(), get_option_() {
     assert(db);
   }
@@ -88,7 +87,7 @@ class CassandraStore {
   }
 
  private:
-  std::shared_ptr<DB> db_;
+  UnownedPtr<DB> db_;
   WriteOptions write_option_;
   ReadOptions get_option_;
 
@@ -123,8 +122,7 @@ class CassandraFunctionalTest : public testing::Test {
         DestroyDB(kDbName, Options()));  // Start each test with a fresh DB
   }
 
-  std::shared_ptr<DB> OpenDb() {
-    DB* db;
+  std::unique_ptr<DB> OpenDb() {
     Options options;
     options.create_if_missing = true;
     options.merge_operator.reset(
@@ -132,8 +130,9 @@ class CassandraFunctionalTest : public testing::Test {
     auto* cf_factory = new TestCompactionFilterFactory(
         purge_ttl_on_expiration_, gc_grace_period_in_seconds_);
     options.compaction_filter_factory.reset(cf_factory);
+    std::unique_ptr<DB> db;
     EXPECT_OK(DB::Open(options, kDbName, &db));
-    return std::shared_ptr<DB>(db);
+    return db;
   }
 
   bool purge_ttl_on_expiration_ = false;
@@ -143,7 +142,8 @@ class CassandraFunctionalTest : public testing::Test {
 // THE TEST CASES BEGIN HERE
 
 TEST_F(CassandraFunctionalTest, SimpleMergeTest) {
-  CassandraStore store(OpenDb());
+  auto db = OpenDb();
+  CassandraStore store(db.get());
   int64_t now = time(nullptr);
 
   store.Append(
@@ -191,7 +191,8 @@ constexpr int64_t kTestTimeoutSecs = 600;
 
 TEST_F(CassandraFunctionalTest,
        CompactionShouldConvertExpiredColumnsToTombstone) {
-  CassandraStore store(OpenDb());
+  auto db = OpenDb();
+  CassandraStore store(db.get());
   int64_t now = time(nullptr);
 
   store.Append(
@@ -233,7 +234,8 @@ TEST_F(CassandraFunctionalTest,
 TEST_F(CassandraFunctionalTest,
        CompactionShouldPurgeExpiredColumnsIfPurgeTtlIsOn) {
   purge_ttl_on_expiration_ = true;
-  CassandraStore store(OpenDb());
+  auto db = OpenDb();
+  CassandraStore store(db.get());
   int64_t now = time(nullptr);
 
   store.Append(
@@ -272,7 +274,8 @@ TEST_F(CassandraFunctionalTest,
 TEST_F(CassandraFunctionalTest,
        CompactionShouldRemoveRowWhenAllColumnsExpiredIfPurgeTtlIsOn) {
   purge_ttl_on_expiration_ = true;
-  CassandraStore store(OpenDb());
+  auto db = OpenDb();
+  CassandraStore store(db.get());
   int64_t now = time(nullptr);
 
   store.Append("k1", CreateTestRowValue({
@@ -297,7 +300,8 @@ TEST_F(CassandraFunctionalTest,
 TEST_F(CassandraFunctionalTest,
        CompactionShouldRemoveTombstoneExceedingGCGracePeriod) {
   purge_ttl_on_expiration_ = true;
-  CassandraStore store(OpenDb());
+  auto db = OpenDb();
+  CassandraStore store(db.get());
   int64_t now = time(nullptr);
 
   store.Append("k1",
@@ -328,7 +332,8 @@ TEST_F(CassandraFunctionalTest,
 
 TEST_F(CassandraFunctionalTest, CompactionShouldRemoveTombstoneFromPut) {
   purge_ttl_on_expiration_ = true;
-  CassandraStore store(OpenDb());
+  auto db = OpenDb();
+  CassandraStore store(db.get());
   int64_t now = time(nullptr);
 
   store.Put("k1",
@@ -343,7 +348,6 @@ TEST_F(CassandraFunctionalTest, CompactionShouldRemoveTombstoneFromPut) {
   ASSERT_FALSE(std::get<0>(store.Get("k1")));
 }
 
-#ifndef ROCKSDB_LITE
 TEST_F(CassandraFunctionalTest, LoadMergeOperator) {
   ConfigOptions config_options;
   std::shared_ptr<MergeOperator> mo;
@@ -434,10 +438,8 @@ TEST_F(CassandraFunctionalTest, LoadCompactionFilterFactory) {
   ASSERT_EQ(opts->gc_grace_period_in_seconds, 42);
   ASSERT_TRUE(opts->purge_ttl_on_expiration);
 }
-#endif  // ROCKSDB_LITE
 
-}  // namespace cassandra
-}  // namespace ROCKSDB_NAMESPACE
+}  // namespace ROCKSDB_NAMESPACE::cassandra
 
 int main(int argc, char** argv) {
   ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();

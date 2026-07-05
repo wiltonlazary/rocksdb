@@ -7,7 +7,7 @@ package org.rocksdb;
 
 /**
  * Advanced Column Family Options which are mutable
- *
+ * <p>
  * Taken from include/rocksdb/advanced_options.h
  * and MutableCFOptions in util/cf_options.h
  */
@@ -58,8 +58,8 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    * if prefix_extractor is set and memtable_prefix_bloom_size_ratio is not 0,
    * create prefix bloom for memtable with the size of
    * write_buffer_size * memtable_prefix_bloom_size_ratio.
-   * If it is larger than 0.25, it is santinized to 0.25.
-   *
+   * If it is larger than 0.25, it is sanitized to 0.25.
+   * <p>
    * Default: 0 (disabled)
    *
    * @param memtablePrefixBloomSizeRatio the ratio of memtable used by the
@@ -73,8 +73,8 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    * if prefix_extractor is set and memtable_prefix_bloom_size_ratio is not 0,
    * create prefix bloom for memtable with the size of
    * write_buffer_size * memtable_prefix_bloom_size_ratio.
-   * If it is larger than 0.25, it is santinized to 0.25.
-   *
+   * If it is larger than 0.25, it is sanitized to 0.25.
+   * <p>
    * Default: 0 (disabled)
    *
    * @return the ratio of memtable used by the bloom filter
@@ -85,7 +85,7 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    * Threshold used in the MemPurge (memtable garbage collection)
    * feature. A value of 0.0 corresponds to no MemPurge,
    * a value of 1.0 will trigger a MemPurge as often as possible.
-   *
+   * <p>
    * Default: 0.0 (disabled)
    *
    * @param experimentalMempurgeThreshold the threshold used by
@@ -98,7 +98,7 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    * Threshold used in the MemPurge (memtable garbage collection)
    * feature. A value of 0.0 corresponds to no MemPurge,
    * a value of 1.0 will trigger a MemPurge as often as possible.
-   *
+   * <p>
    * Default: 0 (disabled)
    *
    * @return the threshold used by the MemPurge decider
@@ -106,10 +106,33 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
   double experimentalMempurgeThreshold();
 
   /**
+   * During forward or reverse iteration, when this many or more
+   * strictly contiguous point tombstones are encountered with no live
+   * keys between them, a range tombstone is inserted into the current
+   * mutable memtable.
+   *
+   * Set to 0 to disable.
+   * Default: 0 (disabled)
+   *
+   * @param minTombstonesForRangeConversion the minimum number of contiguous
+   *     point tombstones to trigger range conversion
+   * @return the reference to the current options.
+   */
+  T setMinTombstonesForRangeConversion(int minTombstonesForRangeConversion);
+
+  /**
+   * Gets the current setting for minimum tombstones for range conversion.
+   * 0 (default) indicates that the feature is disabled.
+   *
+   * @return current value of min_tombstones_for_range_conversion
+   */
+  int minTombstonesForRangeConversion();
+
+  /**
    * Enable whole key bloom filter in memtable. Note this will only take effect
    * if memtable_prefix_bloom_size_ratio is not 0. Enabling whole key filtering
    * can potentially reduce CPU usage for point-look-ups.
-   *
+   * <p>
    * Default: false (disabled)
    *
    * @param memtableWholeKeyFiltering true if whole key bloom filter is enabled
@@ -154,12 +177,12 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    * The size of one block in arena memory allocation.
    * If &le; 0, a proper value is automatically calculated (usually 1/10 of
    * writer_buffer_size).
-   *
+   * <p>
    * There are two additional restriction of the specified size:
    * (1) size should be in the range of [4096, 2 &lt;&lt; 30] and
    * (2) be the multiple of the CPU word (which helps with the memory
    * alignment).
-   *
+   * <p>
    * We'll automatically check and adjust the size number to make sure it
    * conforms to the restrictions.
    * Default: 0
@@ -175,12 +198,12 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    * The size of one block in arena memory allocation.
    * If &le; 0, a proper value is automatically calculated (usually 1/10 of
    * writer_buffer_size).
-   *
+   * <p>
    * There are two additional restriction of the specified size:
    * (1) size should be in the range of [4096, 2 &lt;&lt; 30] and
    * (2) be the multiple of the CPU word (which helps with the memory
    * alignment).
-   *
+   * <p>
    * We'll automatically check and adjust the size number to make sure it
    * conforms to the restrictions.
    * Default: 0
@@ -294,7 +317,7 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    * @param multiplier the ratio between the total size of level-(L+1)
    *     files and the total size of level-L files for all L.
    * @return the reference to the current options.
-   *
+   * <p>
    * See {@link MutableColumnFamilyOptionsInterface#setMaxBytesForLevelBase(long)}
    */
   T setMaxBytesForLevelMultiplier(double multiplier);
@@ -306,7 +329,7 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    *
    * @return the ratio between the total size of level-(L+1) files and
    *     the total size of level-L files for all L.
-   *
+   * <p>
    * See {@link MutableColumnFamilyOptionsInterface#maxBytesForLevelBase()}
    */
   double maxBytesForLevelMultiplier();
@@ -315,7 +338,7 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    * Different max-size multipliers for different levels.
    * These are multiplied by max_bytes_for_level_multiplier to arrive
    * at the max-size of each level.
-   *
+   * <p>
    * Default: 1
    *
    * @param maxBytesForLevelMultiplierAdditional The max-size multipliers
@@ -329,7 +352,7 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    * Different max-size multipliers for different levels.
    * These are multiplied by max_bytes_for_level_multiplier to arrive
    * at the max-size of each level.
-   *
+   * <p>
    * Default: 1
    *
    * @return The max-size multipliers for each level
@@ -339,7 +362,7 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
   /**
    * All writes will be slowed down to at least delayed_write_rate if estimated
    * bytes needed to be compaction exceed this threshold.
-   *
+   * <p>
    * Default: 64GB
    *
    * @param softPendingCompactionBytesLimit The soft limit to impose on
@@ -352,7 +375,7 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
   /**
    * All writes will be slowed down to at least delayed_write_rate if estimated
    * bytes needed to be compaction exceed this threshold.
-   *
+   * <p>
    * Default: 64GB
    *
    * @return The soft limit to impose on compaction
@@ -362,7 +385,7 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
   /**
    * All writes are stopped if estimated bytes needed to be compaction exceed
    * this threshold.
-   *
+   * <p>
    * Default: 256GB
    *
    * @param hardPendingCompactionBytesLimit The hard limit to impose on
@@ -375,7 +398,7 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
   /**
    * All writes are stopped if estimated bytes needed to be compaction exceed
    * this threshold.
-   *
+   * <p>
    * Default: 256GB
    *
    * @return The hard limit to impose on compaction
@@ -390,7 +413,7 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    * Default: 8
    *
    * @param maxSequentialSkipInIterations the number of keys could
-   *     be skipped in a iteration.
+   *     be skipped in an iteration.
    * @return the reference to the current options.
    */
   T setMaxSequentialSkipInIterations(
@@ -403,19 +426,19 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    * skipped before a reseek is issued.
    * Default: 8
    *
-   * @return the number of keys could be skipped in a iteration.
+   * @return the number of keys could be skipped in an iteration.
    */
   long maxSequentialSkipInIterations();
 
   /**
    * Maximum number of successive merge operations on a key in the memtable.
-   *
+   * <p>
    * When a merge operation is added to the memtable and the maximum number of
    * successive merges is reached, the value of the key will be calculated and
    * inserted into the memtable instead of the merge operation. This will
    * ensure that there are never more than max_successive_merges merge
    * operations in the memtable.
-   *
+   * <p>
    * Default: 0 (disabled)
    *
    * @param maxSuccessiveMerges the maximum number of successive merges.
@@ -428,13 +451,13 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
 
   /**
    * Maximum number of successive merge operations on a key in the memtable.
-   *
+   * <p>
    * When a merge operation is added to the memtable and the maximum number of
    * successive merges is reached, the value of the key will be calculated and
    * inserted into the memtable instead of the merge operation. This will
    * ensure that there are never more than max_successive_merges merge
    * operations in the memtable.
-   *
+   * <p>
    * Default: 0 (disabled)
    *
    * @return the maximum number of successive merges.
@@ -443,7 +466,7 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
 
   /**
    * After writing every SST file, reopen it and read all the keys.
-   *
+   * <p>
    * Default: false
    *
    * @param paranoidFileChecks true to enable paranoid file checks
@@ -454,7 +477,7 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
 
   /**
    * After writing every SST file, reopen it and read all the keys.
-   *
+   * <p>
    * Default: false
    *
    * @return true if paranoid file checks are enabled
@@ -463,7 +486,7 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
 
   /**
    * Measure IO stats in compactions and flushes, if true.
-   *
+   * <p>
    * Default: false
    *
    * @param reportBgIoStats true to enable reporting
@@ -483,11 +506,11 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    * Non-bottom-level files older than TTL will go through the compaction
    * process. This needs {@link MutableDBOptionsInterface#maxOpenFiles()} to be
    * set to -1.
-   *
+   * <p>
    * Enabled only for level compaction for now.
-   *
+   * <p>
    * Default: 0 (disabled)
-   *
+   * <p>
    * Dynamically changeable through
    * {@link RocksDB#setOptions(ColumnFamilyHandle, MutableColumnFamilyOptions)}.
    *
@@ -500,7 +523,7 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
   /**
    * Get the TTL for Non-bottom-level files that will go through the compaction
    * process.
-   *
+   * <p>
    * See {@link #setTtl(long)}.
    *
    * @return the time-to-live.
@@ -513,18 +536,18 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    * One main use of the feature is to make sure a file goes through compaction
    * filters periodically. Users can also use the feature to clear up SST
    * files using old format.
-   *
+   * <p>
    * A file's age is computed by looking at file_creation_time or creation_time
    * table properties in order, if they have valid non-zero values; if not, the
    * age is based on the file's last modified time (given by the underlying
    * Env).
-   *
+   * <p>
    * Supported in Level and FIFO compaction.
    * In FIFO compaction, this option has the same meaning as TTL and whichever
    * stricter will be used.
    * Pre-req: max_open_file == -1.
    * unit: seconds. Ex: 7 days = 7 * 24 * 60 * 60
-   *
+   * <p>
    * Values:
    * 0: Turn off Periodic compactions.
    * UINT64_MAX - 1 (i.e 0xfffffffffffffffe): Let RocksDB control this feature
@@ -534,9 +557,9 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    *     In FIFO compaction, since the option has the same meaning as ttl,
    *     when this value is left default, and ttl is left to 0, 30 days will be
    *     used. Otherwise, min(ttl, periodic_compaction_seconds) will be used.
-   *
+   * <p>
    * Default: 0xfffffffffffffffe (allow RocksDB to auto-tune)
-   *
+   * <p>
    * Dynamically changeable through
    * {@link RocksDB#setOptions(ColumnFamilyHandle, MutableColumnFamilyOptions)}.
    *
@@ -548,7 +571,7 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
 
   /**
    * Get the periodicCompactionSeconds.
-   *
+   * <p>
    * See {@link #setPeriodicCompactionSeconds(long)}.
    *
    * @return the periodic compaction in seconds.
@@ -566,9 +589,9 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    * for reads. See also the options min_blob_size, blob_file_size,
    * blob_compression_type, enable_blob_garbage_collection, and
    * blob_garbage_collection_age_cutoff below.
-   *
+   * <p>
    * Default: false
-   *
+   * <p>
    * Dynamically changeable through
    * {@link RocksDB#setOptions(ColumnFamilyHandle, MutableColumnFamilyOptions)}.
    *
@@ -585,9 +608,9 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    * for reads. See also the options min_blob_size, blob_file_size,
    * blob_compression_type, enable_blob_garbage_collection, and
    * blob_garbage_collection_age_cutoff below.
-   *
+   * <p>
    * Default: false
-   *
+   * <p>
    * Dynamically changeable through
    * {@link RocksDB#setOptions(ColumnFamilyHandle, MutableColumnFamilyOptions)}.
    *
@@ -601,9 +624,9 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    * alongside the keys in SST files in the usual fashion. A value of zero for
    * this option means that all values are stored in blob files. Note that
    * enable_blob_files has to be set in order for this option to have any effect.
-   *
+   * <p>
    * Default: 0
-   *
+   * <p>
    * Dynamically changeable through
    * {@link RocksDB#setOptions(ColumnFamilyHandle, MutableColumnFamilyOptions)}.
    *
@@ -618,9 +641,9 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    * alongside the keys in SST files in the usual fashion. A value of zero for
    * this option means that all values are stored in blob files. Note that
    * enable_blob_files has to be set in order for this option to have any effect.
-   *
+   * <p>
    * Default: 0
-   *
+   * <p>
    * Dynamically changeable through
    * {@link RocksDB#setOptions(ColumnFamilyHandle, MutableColumnFamilyOptions)}.
    *
@@ -632,9 +655,9 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    * Set the size limit for blob files. When writing blob files, a new file is opened
    * once this limit is reached. Note that enable_blob_files has to be set in
    * order for this option to have any effect.
-   *
+   * <p>
    * Default: 256 MB
-   *
+   * <p>
    * Dynamically changeable through
    * {@link RocksDB#setOptions(ColumnFamilyHandle, MutableColumnFamilyOptions)}.
    *
@@ -656,9 +679,9 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    * Set the compression algorithm to use for large values stored in blob files. Note
    * that enable_blob_files has to be set in order for this option to have any
    * effect.
-   *
+   * <p>
    * Default: no compression
-   *
+   * <p>
    * Dynamically changeable through
    * {@link RocksDB#setOptions(ColumnFamilyHandle, MutableColumnFamilyOptions)}.
    *
@@ -683,7 +706,7 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    * relocated to new files as they are encountered during compaction, which makes
    * it possible to clean up blob files once they contain nothing but
    * obsolete/garbage blobs. See also blob_garbage_collection_age_cutoff below.
-   *
+   * <p>
    * Default: false
    *
    * @param enableBlobGarbageCollection the new enabled/disabled state of blob garbage collection
@@ -698,7 +721,7 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    * relocated to new files as they are encountered during compaction, which makes
    * it possible to clean up blob files once they contain nothing but
    * obsolete/garbage blobs. See also blob_garbage_collection_age_cutoff below.
-   *
+   * <p>
    * Default: false
    *
    * @return true if blob garbage collection is currently enabled.
@@ -711,7 +734,7 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    * where N = garbage_collection_cutoff * number_of_blob_files. Note that
    * enable_blob_garbage_collection has to be set in order for this option to have
    * any effect.
-   *
+   * <p>
    * Default: 0.25
    *
    * @param blobGarbageCollectionAgeCutoff the new age cutoff
@@ -725,7 +748,7 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
    * where N = garbage_collection_cutoff * number_of_blob_files. Note that
    * enable_blob_garbage_collection has to be set in order for this option to have
    * any effect.
-   *
+   * <p>
    * Default: 0.25
    *
    * @return the current age cutoff for garbage collection
@@ -733,17 +756,16 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
   double blobGarbageCollectionAgeCutoff();
 
   /**
-   *  If the ratio of garbage in the oldest blob files exceeds this threshold,
-   *  targeted compactions are scheduled in order to force garbage collecting
-   *  the blob files in question, assuming they are all eligible based on the
-   *  value of {@link #blobGarbageCollectionAgeCutoff} above. This option is
-   *  currently only supported with leveled compactions.
-   *
+   * If the ratio of garbage in the blob files currently eligible for garbage
+   * collection exceeds this threshold, targeted compactions are scheduled in
+   * order to force garbage collecting the oldest blob files. This option is
+   * currently only supported with leveled compactions.
+   * <p>
    *  Note that {@link #enableBlobGarbageCollection} has to be set in order for this
    *  option to have any effect.
-   *
+   * <p>
    *  Default: 1.0
-   *
+   * <p>
    * Dynamically changeable through the SetOptions() API
    *
    * @param blobGarbageCollectionForceThreshold new value for the threshold
@@ -752,16 +774,33 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
   T setBlobGarbageCollectionForceThreshold(double blobGarbageCollectionForceThreshold);
 
   /**
-   * Get the current value for the {@link #blobGarbageCollectionForceThreshold}
+   * Get the current value for the {@code #blobGarbageCollectionForceThreshold}
    * @return the current threshold at which garbage collection of blobs is forced
    */
   double blobGarbageCollectionForceThreshold();
 
   /**
+   * Set threshold for read-triggered compaction. An SST file is marked for
+   * compaction when its sampled read frequency (sampled_reads / file_size)
+   * exceeds this value. Use 0.0 to disable.
+   *
+   * @param readTriggeredCompactionThreshold the threshold value
+   * @return the reference to the current options
+   */
+  T setReadTriggeredCompactionThreshold(double readTriggeredCompactionThreshold);
+
+  /**
+   * Get the current value for read-triggered compaction threshold.
+   *
+   * @return the current threshold
+   */
+  double readTriggeredCompactionThreshold();
+
+  /**
    * Set compaction readahead for blob files.
-   *
+   * <p>
    * Default: 0
-   *
+   * <p>
    * Dynamically changeable through
    * {@link RocksDB#setOptions(ColumnFamilyHandle, MutableColumnFamilyOptions)}.
    *
@@ -780,9 +819,9 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
 
   /**
    * Set a certain LSM tree level to enable blob files.
-   *
+   * <p>
    * Default: 0
-   *
+   * <p>
    * Dynamically changeable through
    * {@link RocksDB#setOptions(ColumnFamilyHandle, MutableColumnFamilyOptions)}.
    *
@@ -794,7 +833,7 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
 
   /**
    * Get the starting LSM tree level to enable blob files.
-   *
+   * <p>
    * Default: 0
    *
    * @return the current LSM tree level to enable blob files.
@@ -803,13 +842,13 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
 
   /**
    * Set a certain prepopulate blob cache option.
-   *
+   * <p>
    * Default: 0
-   *
+   * <p>
    * Dynamically changeable through
    * {@link RocksDB#setOptions(ColumnFamilyHandle, MutableColumnFamilyOptions)}.
    *
-   * @param prepopulateBlobCache the prepopulate blob cache option
+   * @param prepopulateBlobCache prepopulate the blob cache option
    *
    * @return the reference to the current options.
    */
@@ -817,7 +856,7 @@ public interface AdvancedMutableColumnFamilyOptionsInterface<
 
   /**
    * Get the prepopulate blob cache option.
-   *
+   * <p>
    * Default: 0
    *
    * @return the current prepopulate blob cache option.

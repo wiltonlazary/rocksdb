@@ -8,9 +8,8 @@
 //
 // Class for specifying user-defined functions which perform a
 // transformation on a slice.  It is not required that every slice
-// belong to the domain and/or range of a function.  Subclasses should
-// define InDomain and InRange to determine which slices are in either
-// of these sets respectively.
+// belong to the domain of a function.  Subclasses should
+// define InDomain to determine which slices are in this set.
 
 #pragma once
 
@@ -34,10 +33,10 @@ struct ConfigOptions;
 // including data loss, unreported corruption, deadlocks, and more.
 class SliceTransform : public Customizable {
  public:
-  virtual ~SliceTransform(){};
+  virtual ~SliceTransform() {}
 
   // Return the name of this transformation.
-  virtual const char* Name() const override = 0;
+  const char* Name() const override = 0;
   static const char* Type() { return "SliceTransform"; }
 
   // Creates and configures a new SliceTransform from the input options and id.
@@ -69,10 +68,6 @@ class SliceTransform : public Customizable {
   // https://github.com/facebook/rocksdb/wiki/Prefix-Seek
   //
   virtual bool InDomain(const Slice& key) const = 0;
-
-  // DEPRECATED: This is currently not used and remains here for backward
-  // compatibility.
-  virtual bool InRange(const Slice& /*dst*/) const { return false; }
 
   // Returns information on maximum prefix length, if there is one.
   // If Transform(x).size() == n for some keys and otherwise < n,
@@ -123,13 +118,13 @@ class SliceTransform : public Customizable {
 
 // The prefix is the first `prefix_len` bytes of the key, and keys shorter
 // then `prefix_len` are not InDomain.
-extern const SliceTransform* NewFixedPrefixTransform(size_t prefix_len);
+const SliceTransform* NewFixedPrefixTransform(size_t prefix_len);
 
 // The prefix is the first min(length(key),`cap_len`) bytes of the key, and
 // all keys are InDomain.
-extern const SliceTransform* NewCappedPrefixTransform(size_t cap_len);
+const SliceTransform* NewCappedPrefixTransform(size_t cap_len);
 
 // Prefix is equal to key. All keys are InDomain.
-extern const SliceTransform* NewNoopTransform();
+const SliceTransform* NewNoopTransform();
 
 }  // namespace ROCKSDB_NAMESPACE

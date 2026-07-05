@@ -47,7 +47,7 @@ class ColumnFamilyHandle;
 
 // The structure that keeps constant information about a column family.
 struct ConstantColumnFamilyInfo {
-#ifdef ROCKSDB_USING_THREAD_STATUS
+#ifndef NROCKSDB_THREAD_STATUS
  public:
   ConstantColumnFamilyInfo(const void* _db_key, const std::string& _db_name,
                            const std::string& _cf_name)
@@ -55,14 +55,15 @@ struct ConstantColumnFamilyInfo {
   const void* db_key;
   const std::string db_name;
   const std::string cf_name;
-#endif  // ROCKSDB_USING_THREAD_STATUS
+#endif  // !NROCKSDB_THREAD_STATUS
 };
 
 // the internal data-structure that is used to reflect the current
 // status of a thread using a set of atomic pointers.
 struct ThreadStatusData {
-#ifdef ROCKSDB_USING_THREAD_STATUS
-  explicit ThreadStatusData() : enable_tracking(false) {
+#ifndef NROCKSDB_THREAD_STATUS
+  explicit ThreadStatusData() {
+    enable_tracking.store(false);
     thread_id.store(0);
     thread_type.store(ThreadStatus::USER);
     cf_key.store(nullptr);
@@ -72,13 +73,10 @@ struct ThreadStatusData {
   }
 
   // A flag to indicate whether the thread tracking is enabled
-  // in the current thread.  This value will be updated based on whether
-  // the associated Options::enable_thread_tracking is set to true
-  // in ThreadStatusUtil::SetColumnFamily().
-  //
+  // in the current thread.
   // If set to false, then SetThreadOperation and SetThreadState
   // will be no-op.
-  bool enable_tracking;
+  std::atomic<bool> enable_tracking;
 
   std::atomic<uint64_t> thread_id;
   std::atomic<ThreadStatus::ThreadType> thread_type;
@@ -88,7 +86,7 @@ struct ThreadStatusData {
   std::atomic<ThreadStatus::OperationStage> operation_stage;
   std::atomic<uint64_t> op_properties[ThreadStatus::kNumOperationProperties];
   std::atomic<ThreadStatus::StateType> state_type;
-#endif  // ROCKSDB_USING_THREAD_STATUS
+#endif  // !NROCKSDB_THREAD_STATUS
 };
 
 // The class that stores and updates the status of the current thread
@@ -119,8 +117,10 @@ class ThreadStatusUpdater {
   // Register the current thread for tracking.
   void RegisterThread(ThreadStatus::ThreadType ttype, uint64_t thread_id);
 
+  void SetEnableTracking(bool enable_tracking);
+
   // Update the column-family info of the current thread by setting
-  // its thread-local pointer of ThreadStateInfo to the correct entry.
+  // its thread-local pointer of ThreadStatusData to the correct entry.
   void SetColumnFamilyInfoKey(const void* cf_key);
 
   // returns the column family info key.
@@ -128,6 +128,9 @@ class ThreadStatusUpdater {
 
   // Update the thread operation of the current thread.
   void SetThreadOperation(const ThreadStatus::OperationType type);
+
+  // Return the thread operation of the current thread.
+  ThreadStatus::OperationType GetThreadOperation();
 
   // The start time of the current thread operation.  It is in the format
   // of micro-seconds since some fixed point in time.
@@ -187,7 +190,7 @@ class ThreadStatusUpdater {
       const std::vector<ColumnFamilyHandle*>& handles, bool check_exist);
 
  protected:
-#ifdef ROCKSDB_USING_THREAD_STATUS
+#ifndef NROCKSDB_THREAD_STATUS
   // The thread-local variable for storing thread status.
   static thread_local ThreadStatusData* thread_status_data_;
 
@@ -217,7 +220,7 @@ class ThreadStatusUpdater {
 
 #else
   static ThreadStatusData* thread_status_data_;
-#endif  // ROCKSDB_USING_THREAD_STATUS
+#endif  // !NROCKSDB_THREAD_STATUS
 };
 
 }  // namespace ROCKSDB_NAMESPACE

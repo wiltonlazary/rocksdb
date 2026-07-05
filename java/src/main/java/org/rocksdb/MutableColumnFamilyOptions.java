@@ -7,15 +7,13 @@ package org.rocksdb;
 
 import java.util.*;
 
-public class MutableColumnFamilyOptions
-    extends AbstractMutableOptions {
-
+public class MutableColumnFamilyOptions extends AbstractMutableOptions {
   /**
    * User must use builder pattern, or parser.
    *
    * @param keys the keys
    * @param values the values
-   *
+   * <p>
    * See {@link #builder()} and {@link #parse(String)}.
    */
   private MutableColumnFamilyOptions(final String[] keys,
@@ -36,11 +34,11 @@ public class MutableColumnFamilyOptions
 
   /**
    * Parses a String representation of MutableColumnFamilyOptions
-   *
+   * <p>
    * The format is: key1=value1;key2=value2;key3=value3 etc
-   *
+   * <p>
    * For int[] values, each int should be separated by a colon, e.g.
-   *
+   * <p>
    * key1=value1;intArrayKey1=1:2:3
    *
    * @param str The string representation of the mutable column family options
@@ -74,7 +72,8 @@ public class MutableColumnFamilyOptions
     @Deprecated filter_deletes(ValueType.BOOLEAN),
     max_write_buffer_number(ValueType.INT),
     inplace_update_num_locks(ValueType.LONG),
-    experimental_mempurge_threshold(ValueType.DOUBLE);
+    experimental_mempurge_threshold(ValueType.DOUBLE),
+    min_tombstones_for_range_conversion(ValueType.INT);
 
     private final ValueType valueType;
     MemtableOption(final ValueType valueType) {
@@ -101,7 +100,8 @@ public class MutableColumnFamilyOptions
     max_bytes_for_level_multiplier(ValueType.INT),
     max_bytes_for_level_multiplier_additional(ValueType.INT_ARRAY),
     ttl(ValueType.LONG),
-    periodic_compaction_seconds(ValueType.LONG);
+    periodic_compaction_seconds(ValueType.LONG),
+    read_triggered_compaction_threshold(ValueType.DOUBLE);
 
     private final ValueType valueType;
     CompactionOption(final ValueType valueType) {
@@ -157,8 +157,8 @@ public class MutableColumnFamilyOptions
   public static class MutableColumnFamilyOptionsBuilder
       extends AbstractMutableOptionsBuilder<MutableColumnFamilyOptions, MutableColumnFamilyOptionsBuilder, MutableColumnFamilyOptionKey>
       implements MutableColumnFamilyOptionsInterface<MutableColumnFamilyOptionsBuilder> {
-
-    private final static Map<String, MutableColumnFamilyOptionKey> ALL_KEYS_LOOKUP = new HashMap<>();
+    private static final Map<String, MutableColumnFamilyOptionKey> ALL_KEYS_LOOKUP =
+        new HashMap<>();
     static {
       for(final MutableColumnFamilyOptionKey key : MemtableOption.values()) {
         ALL_KEYS_LOOKUP.put(key.name(), key);
@@ -299,6 +299,18 @@ public class MutableColumnFamilyOptions
     @Override
     public double experimentalMempurgeThreshold() {
       return getDouble(MemtableOption.experimental_mempurge_threshold);
+    }
+
+    @Override
+    public MutableColumnFamilyOptionsBuilder setMinTombstonesForRangeConversion(
+        final int minTombstonesForRangeConversion) {
+      return setInt(
+          MemtableOption.min_tombstones_for_range_conversion, minTombstonesForRangeConversion);
+    }
+
+    @Override
+    public int minTombstonesForRangeConversion() {
+      return getInt(MemtableOption.min_tombstones_for_range_conversion);
     }
 
     @Override
@@ -476,7 +488,7 @@ public class MutableColumnFamilyOptions
 
     @Override
     public CompressionType compressionType() {
-      return (CompressionType) getEnum(MiscOption.compression);
+      return getEnum(MiscOption.compression);
     }
 
     @Override
@@ -549,7 +561,7 @@ public class MutableColumnFamilyOptions
 
     @Override
     public CompressionType blobCompressionType() {
-      return (CompressionType) getEnum(BlobOption.blob_compression_type);
+      return getEnum(BlobOption.blob_compression_type);
     }
 
     @Override
@@ -588,6 +600,18 @@ public class MutableColumnFamilyOptions
     }
 
     @Override
+    public MutableColumnFamilyOptionsBuilder setReadTriggeredCompactionThreshold(
+        final double readTriggeredCompactionThreshold) {
+      return setDouble(
+          CompactionOption.read_triggered_compaction_threshold, readTriggeredCompactionThreshold);
+    }
+
+    @Override
+    public double readTriggeredCompactionThreshold() {
+      return getDouble(CompactionOption.read_triggered_compaction_threshold);
+    }
+
+    @Override
     public MutableColumnFamilyOptionsBuilder setBlobCompactionReadaheadSize(
         final long blobCompactionReadaheadSize) {
       return setLong(BlobOption.blob_compaction_readahead_size, blobCompactionReadaheadSize);
@@ -617,7 +641,7 @@ public class MutableColumnFamilyOptions
 
     @Override
     public PrepopulateBlobCache prepopulateBlobCache() {
-      return (PrepopulateBlobCache) getEnum(BlobOption.prepopulate_blob_cache);
+      return getEnum(BlobOption.prepopulate_blob_cache);
     }
   }
 }

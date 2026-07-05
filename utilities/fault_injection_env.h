@@ -59,6 +59,8 @@ class TestRandomAccessFile : public RandomAccessFile {
 
   Status MultiRead(ReadRequest* reqs, size_t num_reqs) override;
 
+  Status GetFileSize(uint64_t* file_size) override;
+
  private:
   std::unique_ptr<RandomAccessFile> target_;
   FaultInjectionTestEnv* env_;
@@ -72,30 +74,26 @@ class TestWritableFile : public WritableFile {
                             std::unique_ptr<WritableFile>&& f,
                             FaultInjectionTestEnv* env);
   virtual ~TestWritableFile();
-  virtual Status Append(const Slice& data) override;
-  virtual Status Append(
-      const Slice& data,
-      const DataVerificationInfo& /*verification_info*/) override {
+  Status Append(const Slice& data) override;
+  Status Append(const Slice& data,
+                const DataVerificationInfo& /*verification_info*/) override {
     return Append(data);
   }
-  virtual Status Truncate(uint64_t size) override {
-    return target_->Truncate(size);
-  }
-  virtual Status Close() override;
-  virtual Status Flush() override;
-  virtual Status Sync() override;
-  virtual bool IsSyncThreadSafe() const override { return true; }
-  virtual Status PositionedAppend(const Slice& data, uint64_t offset) override {
+  Status Truncate(uint64_t size) override { return target_->Truncate(size); }
+  Status Close() override;
+  Status Flush() override;
+  Status Sync() override;
+  bool IsSyncThreadSafe() const override { return true; }
+  Status PositionedAppend(const Slice& data, uint64_t offset) override {
     return target_->PositionedAppend(data, offset);
   }
-  virtual Status PositionedAppend(
+  Status PositionedAppend(
       const Slice& data, uint64_t offset,
       const DataVerificationInfo& /*verification_info*/) override {
     return PositionedAppend(data, offset);
   }
-  virtual bool use_direct_io() const override {
-    return target_->use_direct_io();
-  };
+  bool use_direct_io() const override { return target_->use_direct_io(); }
+  uint64_t GetFileSize() final { return target_->GetFileSize(); }
 
  private:
   FileState state_;
@@ -121,7 +119,7 @@ class TestRandomRWFile : public RandomRWFile {
   size_t GetRequiredBufferAlignment() const override {
     return target_->GetRequiredBufferAlignment();
   }
-  bool use_direct_io() const override { return target_->use_direct_io(); };
+  bool use_direct_io() const override { return target_->use_direct_io(); }
 
  private:
   std::unique_ptr<RandomRWFile> target_;
@@ -136,8 +134,8 @@ class TestDirectory : public Directory {
       : env_(env), dirname_(dirname), dir_(dir) {}
   ~TestDirectory() {}
 
-  virtual Status Fsync() override;
-  virtual Status Close() override;
+  Status Fsync() override;
+  Status Close() override;
 
  private:
   FaultInjectionTestEnv* env_;
@@ -165,6 +163,9 @@ class FaultInjectionTestEnv : public EnvWrapper {
                             std::unique_ptr<WritableFile>* result,
                             const EnvOptions& soptions) override;
 
+  Status SyncFile(const std::string& fname, const EnvOptions& options,
+                  bool use_fsync) override;
+
   Status NewRandomRWFile(const std::string& fname,
                          std::unique_ptr<RandomRWFile>* result,
                          const EnvOptions& soptions) override;
@@ -173,19 +174,22 @@ class FaultInjectionTestEnv : public EnvWrapper {
                              std::unique_ptr<RandomAccessFile>* result,
                              const EnvOptions& soptions) override;
 
-  virtual Status DeleteFile(const std::string& f) override;
+  Status DeleteFile(const std::string& f) override;
 
-  virtual Status RenameFile(const std::string& s,
-                            const std::string& t) override;
+  Status RenameFile(const std::string& s, const std::string& t) override;
 
-  virtual Status LinkFile(const std::string& s, const std::string& t) override;
+  Status LinkFile(const std::string& s, const std::string& t) override;
 
 // Undef to eliminate clash on Windows
 #undef GetFreeSpace
-  virtual Status GetFreeSpace(const std::string& path,
-                              uint64_t* disk_free) override {
-    if (!IsFilesystemActive() &&
-        error_.subcode() == IOStatus::SubCode::kNoSpace) {
+  Status GetFreeSpace(const std::string& path, uint64_t* disk_free) override {
+    bool inactive_no_space = false;
+    {
+      MutexLock l(&mutex_);
+      inactive_no_space = !filesystem_active_ &&
+                          error_.subcode() == IOStatus::SubCode::kNoSpace;
+    }
+    if (inactive_no_space) {
       *disk_free = 0;
       return Status::OK();
     } else {
@@ -243,7 +247,10 @@ class FaultInjectionTestEnv : public EnvWrapper {
     error.PermitUncheckedError();
   }
   void AssertNoOpenFile() { assert(open_managed_files_.empty()); }
-  Status GetError() { return error_; }
+  Status GetError() {
+    MutexLock l(&mutex_);
+    return error_;
+  }
 
  private:
   port::Mutex mutex_;

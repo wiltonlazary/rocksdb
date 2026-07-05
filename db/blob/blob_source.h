@@ -8,8 +8,9 @@
 #include <cinttypes>
 #include <memory>
 
-#include "cache/cache_helpers.h"
 #include "cache/cache_key.h"
+#include "cache/typed_cache.h"
+#include "db/blob/blob_contents.h"
 #include "db/blob/blob_file_cache.h"
 #include "db/blob/blob_read_request.h"
 #include "rocksdb/cache.h"
@@ -20,10 +21,12 @@
 namespace ROCKSDB_NAMESPACE {
 
 struct ImmutableOptions;
+struct MutableCFOptions;
 class Status;
 class FilePrefetchBuffer;
 class Slice;
-class BlobContents;
+class RandomAccessFileReader;
+enum ChecksumType : char;
 
 // BlobSource is a class that provides universal access to blobs, regardless of
 // whether they are in the blob cache, secondary cache, or (remote) storage.
@@ -31,7 +34,10 @@ class BlobContents;
 // storage with minimal cost.
 class BlobSource {
  public:
-  BlobSource(const ImmutableOptions* immutable_options,
+  // NOTE: db_id, db_session_id, and blob_file_cache are saved by reference or
+  // pointer.
+  BlobSource(const ImmutableOptions& immutable_options,
+             const MutableCFOptions& mutable_cf_options,
              const std::string& db_id, const std::string& db_session_id,
              BlobFileCache* blob_file_cache);
 
@@ -54,6 +60,41 @@ class BlobSource {
                  uint64_t value_size, CompressionType compression_type,
                  FilePrefetchBuffer* prefetch_buffer, PinnableSlice* value,
                  uint64_t* bytes_read);
+
+  // Reads a SimpleGen2Blob payload (see db/blob/blob_gen2_format.h) through the
+  // blob value cache and BLOB_DB_* statistics. This is the counterpart to
+  // GetBlob() for the second-generation blob record format, which is read
+  // directly from a RandomAccessFileReader rather than from a traditional blob
+  // file.
+  //
+  // The cache key is derived from the SimpleGen2Blob format itself, not chosen
+  // by the caller: it is GetSimpleGen2BlobCacheKey(base_cache_key,
+  // record_offset), the same offset scheme block-based SST blocks use. The
+  // caller supplies only its file's `base_cache_key` (db_id / db_session_id /
+  // file_number). This keeps blob records collision-free with the file's data
+  // blocks even when the blob cache and block cache are the same cache.
+  //
+  // `file`, `record_offset`, `payload_size`, `checksum_type`,
+  // `base_context_checksum`, and `expected_compression` are the inputs to the
+  // SimpleGen2Blob reader used on a cache miss (see
+  // ReadAndVerifySimpleGen2BlobRecord). The on-disk record size (payload +
+  // trailer) is reported via `*bytes_read` (when non-null) and the
+  // BLOB_DB_BLOB_FILE_BYTES_READ / blob_read_byte counters, consistently on
+  // both cache hits and misses.
+  //
+  // On a cache hit, pins the cached value into `*value` (no copy). On a miss,
+  // reads + verifies the record into a cache-allocator buffer, records the
+  // per-read stats, inserts it into the cache (when configured and fill_cache
+  // is set), and pins it into `*value`. If blob_cache_ is not configured, the
+  // record is still read and read stats recorded, just without a cache
+  // lookup/insert.
+  Status GetSimpleGen2Blob(const ReadOptions& read_options,
+                           const OffsetableCacheKey& base_cache_key,
+                           RandomAccessFileReader* file, uint64_t record_offset,
+                           uint64_t payload_size, ChecksumType checksum_type,
+                           uint32_t base_context_checksum,
+                           CompressionType expected_compression,
+                           PinnableSlice* value, uint64_t* bytes_read);
 
   // Read multiple blobs from the underlying cache or blob file(s).
   //
@@ -95,9 +136,9 @@ class BlobSource {
                                uint64_t* bytes_read);
 
   inline Status GetBlobFileReader(
-      uint64_t blob_file_number,
+      const ReadOptions& read_options, uint64_t blob_file_number,
       CacheHandleGuard<BlobFileReader>* blob_file_reader) {
-    return blob_file_cache_->GetBlobFileReader(blob_file_number,
+    return blob_file_cache_->GetBlobFileReader(read_options, blob_file_number,
                                                blob_file_reader);
   }
 
@@ -105,6 +146,14 @@ class BlobSource {
 
   bool TEST_BlobInCache(uint64_t file_number, uint64_t file_size,
                         uint64_t offset, size_t* charge = nullptr) const;
+
+  // For TypedSharedCacheInterface
+  void Create(BlobContents** out, const char* buf, size_t size,
+              MemoryAllocator* alloc);
+
+  using SharedCacheInterface =
+      FullTypedSharedCacheInterface<BlobContents, BlobContentsCreator>;
+  using TypedHandle = SharedCacheInterface::TypedHandle;
 
  private:
   Status GetBlobFromCache(const Slice& cache_key,
@@ -120,10 +169,10 @@ class BlobSource {
   static void PinOwnedBlob(std::unique_ptr<BlobContents>* owned_blob,
                            PinnableSlice* value);
 
-  Cache::Handle* GetEntryFromCache(const Slice& key) const;
+  TypedHandle* GetEntryFromCache(const Slice& key) const;
 
   Status InsertEntryIntoCache(const Slice& key, BlobContents* value,
-                              size_t charge, Cache::Handle** cache_handle,
+                              TypedHandle** cache_handle,
                               Cache::Priority priority) const;
 
   inline CacheKey GetCacheKey(uint64_t file_number, uint64_t /*file_size*/,
@@ -141,7 +190,7 @@ class BlobSource {
   BlobFileCache* blob_file_cache_;
 
   // A cache to store uncompressed blobs.
-  std::shared_ptr<Cache> blob_cache_;
+  mutable SharedCacheInterface blob_cache_;
 
   // The control option of how the cache tiers will be used. Currently rocksdb
   // support block/blob cache (volatile tier) and secondary cache (this tier

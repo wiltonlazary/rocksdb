@@ -8,105 +8,493 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
 
+#include <cstdlib>
+#include <iomanip>
 #include <ios>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <thread>
+#include <unordered_set>
 
+#include "db_stress_tool/db_stress_compression_manager.h"
+#include "db_stress_tool/db_stress_listener.h"
+#include "rocksdb/io_status.h"
+#include "rocksdb/options.h"
+#include "rocksdb/slice_transform.h"
 #include "util/compression.h"
 #ifdef GFLAGS
-#include "cache/fast_lru_cache.h"
 #include "db_stress_tool/db_stress_common.h"
 #include "db_stress_tool/db_stress_compaction_filter.h"
+#include "db_stress_tool/db_stress_compaction_service.h"
 #include "db_stress_tool/db_stress_driver.h"
+#include "db_stress_tool/db_stress_filters.h"
 #include "db_stress_tool/db_stress_table_properties_collector.h"
+#include "db_stress_tool/db_stress_wide_merge_operator.h"
+#include "file/file_util.h"
+#include "options/options_parser.h"
+#include "port/port.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/filter_policy.h"
+#include "rocksdb/io_dispatcher.h"
 #include "rocksdb/secondary_cache.h"
 #include "rocksdb/sst_file_manager.h"
+#include "rocksdb/table.h"
+#include "rocksdb/table_properties.h"
 #include "rocksdb/types.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/write_batch_with_index.h"
 #include "test_util/testutil.h"
+#include "util/aligned_buffer.h"
 #include "util/cast_util.h"
+#include "util/simple_mixed_compressor.h"
 #include "utilities/backup/backup_engine_impl.h"
 #include "utilities/fault_injection_fs.h"
 #include "utilities/fault_injection_secondary_cache.h"
+#include "utilities/trie_index/trie_index_factory.h"
 
 namespace ROCKSDB_NAMESPACE {
 
 namespace {
+
+class StressReadScopedBlockBufferProvider
+    : public ReadScopedBlockBufferProvider {
+ public:
+  StressReadScopedBlockBufferProvider() : state_(std::make_shared<State>()) {}
+  StressReadScopedBlockBufferProvider(
+      const StressReadScopedBlockBufferProvider&) = delete;
+  StressReadScopedBlockBufferProvider& operator=(
+      const StressReadScopedBlockBufferProvider&) = delete;
+  StressReadScopedBlockBufferProvider(StressReadScopedBlockBufferProvider&&) =
+      delete;
+  StressReadScopedBlockBufferProvider& operator=(
+      StressReadScopedBlockBufferProvider&&) = delete;
+
+  ~StressReadScopedBlockBufferProvider() override {
+    state_->ValidateNoLiveAllocations();
+  }
+
+  Status Allocate(size_t size, size_t alignment, Lease* out) override {
+    Check(out != nullptr, "lease output is nullptr");
+    Check(size > 0, "allocation size is zero");
+    Check(alignment > 0 && (alignment & (alignment - 1)) == 0,
+          "alignment must be a power of two");
+
+    auto* allocation = new Allocation();
+    allocation->state = state_;
+    allocation->requested_size = size;
+    allocation->requested_alignment = alignment;
+    allocation->storage.Alignment(alignment);
+    allocation->storage.AllocateNewBuffer(size);
+    allocation->data = allocation->storage.BufferStart();
+    allocation->size = allocation->storage.Capacity();
+
+    Check(allocation->data != nullptr, "provider returned null data");
+    Check(allocation->size >= size, "provider returned short allocation");
+    Check(AlignedBuffer::isAligned(allocation->data, alignment),
+          "provider returned misaligned data");
+    Check(
+        alignment == 1 || AlignedBuffer::isAligned(allocation->size, alignment),
+        "provider returned misaligned direct-I/O size");
+
+    {
+      std::lock_guard<std::mutex> lock(state_->mutex);
+      Check(state_->live_allocations.insert(allocation).second,
+            "duplicate allocation registration");
+      state_->live_bytes += allocation->size;
+      ++state_->total_allocations;
+    }
+
+    out->data = allocation->data;
+    out->size = allocation->size;
+    out->cleanup.Allocate();
+    out->cleanup->RegisterCleanup(&ReleaseAllocation, allocation, nullptr);
+    return Status::OK();
+  }
+
+ private:
+  struct Allocation;
+
+  struct State {
+    std::mutex mutex;
+    std::unordered_set<Allocation*> live_allocations;
+    size_t live_bytes = 0;
+    uint64_t total_allocations = 0;
+
+    void ValidateNoLiveAllocations() {
+      std::lock_guard<std::mutex> lock(mutex);
+      Check(live_allocations.empty(),
+            "provider destroyed with live allocations");
+      Check(live_bytes == 0, "provider destroyed with live bytes");
+    }
+  };
+
+  struct Allocation {
+    std::shared_ptr<State> state;
+    size_t requested_size = 0;
+    size_t requested_alignment = 1;
+    char* data = nullptr;
+    size_t size = 0;
+    AlignedBuffer storage;
+  };
+
+  static void Check(bool condition, const char* message) {
+    if (!condition) {
+      fprintf(stderr, "ReadScopedBlockBufferProvider invariant failed: %s\n",
+              message);
+      std::abort();
+    }
+  }
+
+  static void ReleaseAllocation(void* arg1, void* /*arg2*/) {
+    auto* allocation = static_cast<Allocation*>(arg1);
+    Check(allocation != nullptr, "cleanup received null allocation");
+    Check(allocation->state != nullptr, "cleanup received null state");
+    Check(allocation->data != nullptr, "cleanup received null data");
+    Check(allocation->size >= allocation->requested_size,
+          "cleanup received short allocation");
+    Check(AlignedBuffer::isAligned(allocation->data,
+                                   allocation->requested_alignment),
+          "cleanup received misaligned data");
+
+    {
+      std::lock_guard<std::mutex> lock(allocation->state->mutex);
+      Check(allocation->state->live_allocations.erase(allocation) == 1,
+            "cleanup for unknown or duplicate allocation");
+      Check(allocation->state->live_bytes >= allocation->size,
+            "cleanup underflowed live bytes");
+      allocation->state->live_bytes -= allocation->size;
+    }
+    delete allocation;
+  }
+
+  std::shared_ptr<State> state_;
+};
 
 std::shared_ptr<const FilterPolicy> CreateFilterPolicy() {
   if (FLAGS_bloom_bits < 0) {
     return BlockBasedTableOptions().filter_policy;
   }
   const FilterPolicy* new_policy;
-  if (FLAGS_ribbon_starting_level >= 999) {
+  if (FLAGS_bloom_before_level == INT_MAX) {
     // Use Bloom API
     new_policy = NewBloomFilterPolicy(FLAGS_bloom_bits, false);
   } else {
-    new_policy = NewRibbonFilterPolicy(
-        FLAGS_bloom_bits, /* bloom_before_level */ FLAGS_ribbon_starting_level);
+    new_policy =
+        NewRibbonFilterPolicy(FLAGS_bloom_bits, FLAGS_bloom_before_level);
   }
   return std::shared_ptr<const FilterPolicy>(new_policy);
 }
 
+struct OpenFaultInjectionConfig {
+  bool sync_fault = false;
+  int metadata_read_one_in = 0;
+  int metadata_write_one_in = 0;
+  int read_one_in = 0;
+  int write_one_in = 0;
+
+  bool Enabled() const {
+    return sync_fault || metadata_read_one_in > 0 ||
+           metadata_write_one_in > 0 || read_one_in > 0 || write_one_in > 0;
+  }
+
+  void Disable() {
+    sync_fault = false;
+    metadata_read_one_in = 0;
+    metadata_write_one_in = 0;
+    read_one_in = 0;
+    write_one_in = 0;
+  }
+};
+
+void EnableThreadLocalOpenFault(
+    const std::shared_ptr<FaultInjectionTestFS>& fault_injection_fs,
+    FaultInjectionIOType io_type, int one_in) {
+  assert(fault_injection_fs);
+  fault_injection_fs->SetThreadLocalErrorContext(
+      io_type, static_cast<uint32_t>(FLAGS_seed), one_in, false /* retryable */,
+      false /* has_data_loss */);
+  fault_injection_fs->EnableThreadLocalErrorInjection(io_type);
+}
+
+bool MaybeEnableOpenFaultInjection(
+    const std::shared_ptr<FaultInjectionTestFS>& fault_injection_fs,
+    const std::string& db_path,
+    const OpenFaultInjectionConfig& open_fault_injection) {
+  // Returns whether open-fault handling is active for this attempt. The caller
+  // uses this to run post-open cleanup/retry handling even if CURRENT did not
+  // exist and no fault was actually enabled.
+  if (!open_fault_injection.Enabled()) {
+    return false;
+  }
+  assert(fault_injection_fs);
+  if (!fault_injection_fs
+           ->FileExists(db_path + "/CURRENT", IOOptions(), nullptr)
+           .ok()) {
+    return true;
+  }
+
+  if (open_fault_injection.sync_fault ||
+      open_fault_injection.write_one_in > 0) {
+    fault_injection_fs->SetFilesystemDirectWritable(false);
+    fault_injection_fs->SetInjectUnsyncedDataLoss(
+        open_fault_injection.sync_fault);
+  }
+  EnableThreadLocalOpenFault(fault_injection_fs,
+                             FaultInjectionIOType::kMetadataRead,
+                             open_fault_injection.metadata_read_one_in);
+  EnableThreadLocalOpenFault(fault_injection_fs,
+                             FaultInjectionIOType::kMetadataWrite,
+                             open_fault_injection.metadata_write_one_in);
+  EnableThreadLocalOpenFault(fault_injection_fs, FaultInjectionIOType::kRead,
+                             open_fault_injection.read_one_in);
+  EnableThreadLocalOpenFault(fault_injection_fs, FaultInjectionIOType::kWrite,
+                             open_fault_injection.write_one_in);
+  return true;
+}
+
+bool NeedsFaultInjection() {
+  return FLAGS_open_metadata_read_fault_one_in ||
+         FLAGS_open_metadata_write_fault_one_in ||
+         FLAGS_open_read_fault_one_in || FLAGS_open_write_fault_one_in ||
+         FLAGS_metadata_read_fault_one_in ||
+         FLAGS_metadata_write_fault_one_in || FLAGS_read_fault_one_in ||
+         FLAGS_write_fault_one_in || FLAGS_sync_fault_injection;
+}
+
+std::string GetFaultInjectionLogBaseDir() {
+  if (!FLAGS_env_uri.empty() || !FLAGS_fs_uri.empty()) {
+    return "/tmp";
+  }
+  // db_stress reads environment variables during single-threaded startup,
+  // before worker threads are created.
+  // NOLINTNEXTLINE(concurrency-mt-unsafe)
+  const char* test_tmpdir = std::getenv("TEST_TMPDIR");
+  return test_tmpdir != nullptr && test_tmpdir[0] != '\0' ? test_tmpdir
+                                                          : "/tmp";
+}
+
+std::string GetFaultInjectionLogPath(const std::string& db_label) {
+  const std::string log_dir =
+      GetFaultInjectionLogBaseDir() + "/fault_injection_logs";
+  Status s = Env::Default()->CreateDirIfMissing(log_dir);
+  if (!s.ok()) {
+    fprintf(stderr, "Failed to create directory %s: %s\n", log_dir.c_str(),
+            s.ToString().c_str());
+    exit(1);
+  }
+  return log_dir + "/fault_injection_" + std::to_string(port::GetProcessID()) +
+         "_" + std::to_string(Env::Default()->NowMicros()) + "_" + db_label +
+         ".bin";
+}
+
+Slice ExpectedValueSlice(const ExpectedValue& expected_value, char* scratch) {
+  const size_t size =
+      GenerateValue(expected_value.GetValueBase(), scratch, kValueMaxLen);
+  return Slice(scratch, size);
+}
+
+struct DataCorruption {
+  // "lost" | "resurrected" | "wrong-value" | "detected-corruption"
+  const char* kind;
+  Slice value_from_db;
+  Slice value_from_expected;
+  std::string op_status;
+};
+
+std::optional<DataCorruption> ClassifyReadBack(
+    const Status& read_status, const std::string& db_value,
+    const ExpectedValue& expected_value, char* scratch) {
+  if (read_status.IsCorruption()) {
+    return DataCorruption{"detected-corruption", db_value, Slice(),
+                          "Get: " + read_status.ToString()};
+  }
+  // Fault injection is off (enforced at startup), so the read-back can only be
+  // OK or NotFound here. Anything else is outside this tool's contract -- stop
+  // now rather than guess a classification. ImmediateExit (not exit/abort): the
+  // DB is open with live background threads, so a normal exit would race their
+  // static teardown (see port::ImmediateExit).
+  if (!read_status.ok() && !read_status.IsNotFound()) {
+    fprintf(stderr, "verify_cpu_corruption: unexpected read-back status: %s\n",
+            read_status.ToString().c_str());
+    port::ImmediateExit(1);
+  }
+  const bool present_in_db = read_status.ok();
+  // Exists() asserts the key is not mid-write -- which holds under --threads=1:
+  // the just-run op committed before this read-back.
+  const bool expected_to_exist = expected_value.Exists();
+
+  if (!expected_to_exist && !present_in_db) {
+    return std::nullopt;  // Agree: key absent.
+  }
+  if (expected_to_exist && !present_in_db) {
+    return DataCorruption{"lost", Slice(),
+                          ExpectedValueSlice(expected_value, scratch),
+                          "Get: NotFound"};
+  }
+  if (!expected_to_exist && present_in_db) {
+    return DataCorruption{"resurrected", db_value, Slice(), "Get: OK"};
+  }
+  // Present in both: compare the values.
+  const Slice expected = ExpectedValueSlice(expected_value, scratch);
+  if (Slice(db_value) == expected) {
+    return std::nullopt;  // Agree: same value.
+  }
+  return DataCorruption{"wrong-value", db_value, expected, "Get: OK"};
+}
+
+void WriteDataCorruption(uint32_t thread_id, int cf, int64_t key,
+                         const DataCorruption& corruption) {
+  std::ostringstream oss;
+  oss << "{\n"
+      << "  \"kind\": \"" << corruption.kind << "\",\n"
+      << "  \"cf\": " << cf << ",\n"
+      << "  \"key\": " << key << ",\n"
+      << "  \"value_from_db\": \""
+      << corruption.value_from_db.ToString(/* hex */ true) << "\",\n"
+      << "  \"value_from_expected\": \""
+      << corruption.value_from_expected.ToString(/* hex */ true) << "\",\n"
+      << "  \"op_status\": " << std::quoted(corruption.op_status) << "\n"
+      << "}\n";
+  const std::string path = FLAGS_verify_cpu_corruption_dir +
+                           "/data_corruption." + std::to_string(thread_id) +
+                           ".json";
+  FILE* f = fopen(path.c_str(), "w");
+  if (f == nullptr) {
+    fprintf(stderr, "Failed to open CPU corruption result file: %s\n",
+            path.c_str());
+    port::ImmediateExit(1);
+  }
+  if (fputs(oss.str().c_str(), f) == EOF) {
+    fprintf(stderr, "Failed to write CPU corruption result file: %s\n",
+            path.c_str());
+    port::ImmediateExit(1);
+  }
+  if (fclose(f) != 0) {
+    fprintf(stderr, "Failed to close CPU corruption result file: %s\n",
+            path.c_str());
+    port::ImmediateExit(1);
+  }
+}
+
 }  // namespace
 
-StressTest::StressTest()
-    : cache_(NewCache(FLAGS_cache_size, FLAGS_cache_numshardbits)),
-      compressed_cache_(NewLRUCache(FLAGS_compressed_cache_size,
-                                    FLAGS_compressed_cache_numshardbits)),
+const std::string& StressTest::GetDbLabel() const { return db_label_; }
+
+const std::string& StressTest::GetDbPath() const { return db_path_; }
+
+const std::string& StressTest::GetExpectedValuesDir() const {
+  return expected_values_path_;
+}
+
+const std::string& StressTest::GetSecondariesBase() const {
+  return secondaries_path_;
+}
+
+Env* StressTest::GetDbEnv() const { return db_env_.get(); }
+
+StressTest::StressTest(int db_index, const std::string& db_path,
+                       const std::string& ev_path, const std::string& sec_path)
+    : db_index_(db_index),
+      db_label_("db_" + std::to_string(db_index)),
+      db_path_(db_path),
+      expected_values_path_(ev_path),
+      secondaries_path_(sec_path),
+      db_stress_fs_(
+          std::make_shared<DbStressFSWrapper>(raw_env->GetFileSystem())),
+      db_fault_injection_fs_(
+          NeedsFaultInjection()
+              ? std::make_shared<FaultInjectionTestFS>(
+                    db_stress_fs_, GetFaultInjectionLogPath(db_label_))
+              : nullptr),
+      db_env_(std::make_unique<CompositeEnvWrapper>(
+          raw_env, db_fault_injection_fs_
+                       ? std::shared_ptr<FileSystem>(db_fault_injection_fs_)
+                       : std::shared_ptr<FileSystem>(db_stress_fs_))),
       filter_policy_(CreateFilterPolicy()),
       db_(nullptr),
-#ifndef ROCKSDB_LITE
       txn_db_(nullptr),
-#endif
+      optimistic_txn_db_(nullptr),
       db_aptr_(nullptr),
-      clock_(db_stress_env->GetSystemClock().get()),
+      clock_(raw_env->GetSystemClock().get()),
       new_column_family_name_(1),
       num_times_reopened_(0),
       db_preload_finished_(false),
-      cmp_db_(nullptr),
-      is_db_stopped_(false) {
+      is_db_stopped_(false),
+      manifest_verify_mode_(MANIFEST_VERIFY_NONE),
+      manifest_file_number_before_reopen_(0),
+      manifest_file_size_before_reopen_(0) {
+  if (db_fault_injection_fs_) {
+    // Info logs are debugging artifacts, so exclude them from fault injection
+    // and keep error accounting focused on DB data and metadata.
+    db_fault_injection_fs_->SetFileTypesExcludedFromFaultInjection(
+        {FileType::kInfoLogFile});
+    // Set it to direct writable here to initially bypass any fault injection
+    // during DB open. This will correspondingly be overwritten in
+    // StressTest::Open() for open fault injection and in RunStressTestImpl()
+    // for proper fault injection setup.
+    db_fault_injection_fs_->SetFilesystemDirectWritable(true);
+  }
+
   if (FLAGS_destroy_db_initially) {
-    std::vector<std::string> files;
-    db_stress_env->GetChildren(FLAGS_db, &files);
-    for (unsigned int i = 0; i < files.size(); i++) {
-      if (Slice(files[i]).starts_with("heap-")) {
-        db_stress_env->DeleteFile(FLAGS_db + "/" + files[i]);
-      }
-    }
-
-    Options options;
-    options.env = db_stress_env;
-    // Remove files without preserving manfiest files
-#ifndef ROCKSDB_LITE
-    const Status s = !FLAGS_use_blob_db
-                         ? DestroyDB(FLAGS_db, options)
-                         : blob_db::DestroyBlobDB(FLAGS_db, options,
-                                                  blob_db::BlobDBOptions());
-#else
-    const Status s = DestroyDB(FLAGS_db, options);
-#endif  // !ROCKSDB_LITE
-
+    const Status s = DbStressDestroyDb(GetDbPath());
     if (!s.ok()) {
       fprintf(stderr, "Cannot destroy original db: %s\n", s.ToString().c_str());
       exit(1);
     }
   }
+
+  Status s = DbStressSqfcManager().MakeSharedFactory(
+      FLAGS_sqfc_name, FLAGS_sqfc_version, &sqfc_factory_);
+  if (!s.ok()) {
+    fprintf(stderr, "Error initializing SstQueryFilterConfig: %s\n",
+            s.ToString().c_str());
+    exit(1);
+  }
 }
 
-StressTest::~StressTest() {
+void StressTest::CleanUp() {
+  CleanUpColumnFamilies();
+  if (db_) {
+    db_->Close();
+  }
+  db_owner_.reset();
+  db_ = nullptr;
+
+  secondary_db_.reset();
+}
+
+void StressTest::InitializeListenersForOpen(
+    SharedState* shared,
+    const std::vector<ColumnFamilyDescriptor>& cf_descriptors) {
+  options_.listeners.clear();
+  options_.listeners.emplace_back(new DbStressListener(
+      GetDbPath(), options_.db_paths, cf_descriptors, shared));
+  RegisterAdditionalListeners();
+
+  if (!FLAGS_listener_uri.empty()) {
+    std::shared_ptr<EventListener> listener;
+    Status listener_status =
+        ObjectRegistry::Default()->NewSharedObject<EventListener>(
+            FLAGS_listener_uri, &listener);
+    if (!listener_status.ok()) {
+      fprintf(stderr, "Failed to create listener from URI '%s': %s\n",
+              FLAGS_listener_uri.c_str(), listener_status.ToString().c_str());
+      exit(1);
+    }
+    options_.listeners.emplace_back(std::move(listener));
+  }
+}
+
+void StressTest::CleanUpColumnFamilies() {
   for (auto cf : column_families_) {
     delete cf;
   }
   column_families_.clear();
-  delete db_;
-
-  for (auto* cf : cmp_cfhs_) {
+  for (auto* cf : secondary_cfhs_) {
     delete cf;
   }
-  cmp_cfhs_.clear();
-  delete cmp_db_;
+  secondary_cfhs_.clear();
 }
 
 std::shared_ptr<Cache> StressTest::NewCache(size_t capacity,
@@ -116,46 +504,128 @@ std::shared_ptr<Cache> StressTest::NewCache(size_t capacity,
     return nullptr;
   }
 
-  if (FLAGS_cache_type == "clock_cache") {
+  std::shared_ptr<SecondaryCache> secondary_cache;
+  if (!FLAGS_secondary_cache_uri.empty()) {
+    assert(!strstr(FLAGS_secondary_cache_uri.c_str(),
+                   "compressed_secondary_cache") ||
+           (FLAGS_compressed_secondary_cache_size == 0 &&
+            FLAGS_compressed_secondary_cache_ratio == 0.0 &&
+            !StartsWith(FLAGS_cache_type, "tiered_")));
+    Status s = SecondaryCache::CreateFromString(
+        config_options, FLAGS_secondary_cache_uri, &secondary_cache);
+    if (secondary_cache == nullptr) {
+      fprintf(stderr,
+              "No secondary cache registered matching string: %s status=%s\n",
+              FLAGS_secondary_cache_uri.c_str(), s.ToString().c_str());
+      exit(1);
+    }
+    if (FLAGS_secondary_cache_fault_one_in > 0) {
+      secondary_cache = std::make_shared<FaultInjectionSecondaryCache>(
+          secondary_cache, static_cast<uint32_t>(FLAGS_seed),
+          FLAGS_secondary_cache_fault_one_in);
+    }
+  } else if (FLAGS_compressed_secondary_cache_size > 0) {
+    if (StartsWith(FLAGS_cache_type, "tiered_")) {
+      fprintf(stderr,
+              "Cannot specify both compressed_secondary_cache_size and %s\n",
+              FLAGS_cache_type.c_str());
+      exit(1);
+    }
+    CompressedSecondaryCacheOptions opts;
+    opts.capacity = FLAGS_compressed_secondary_cache_size;
+    if (FLAGS_enable_do_not_compress_roles) {
+      opts.do_not_compress_roles = {CacheEntryRoleSet::All()};
+    }
+    opts.enable_custom_split_merge = FLAGS_enable_custom_split_merge;
+    secondary_cache = NewCompressedSecondaryCache(opts);
+    if (secondary_cache == nullptr) {
+      fprintf(stderr, "Failed to allocate compressed secondary cache\n");
+      exit(1);
+    }
+    compressed_secondary_cache = secondary_cache;
+  }
+
+  std::string cache_type = FLAGS_cache_type;
+  size_t cache_size = FLAGS_cache_size;
+  bool tiered = false;
+  if (StartsWith(cache_type, "tiered_")) {
+    tiered = true;
+    cache_type.erase(0, strlen("tiered_"));
+  }
+  if (FLAGS_use_write_buffer_manager) {
+    cache_size += FLAGS_db_write_buffer_size;
+  }
+  if (cache_type == "clock_cache") {
     fprintf(stderr, "Old clock cache implementation has been removed.\n");
     exit(1);
-  } else if (FLAGS_cache_type == "hyper_clock_cache") {
-    return HyperClockCacheOptions(static_cast<size_t>(capacity),
-                                  FLAGS_block_size /*estimated_entry_charge*/,
-                                  num_shard_bits)
-        .MakeSharedCache();
-  } else if (FLAGS_cache_type == "fast_lru_cache") {
-    return NewFastLRUCache(static_cast<size_t>(capacity), FLAGS_block_size,
-                           num_shard_bits, false /*strict_capacity_limit*/,
-                           kDefaultCacheMetadataChargePolicy);
-  } else if (FLAGS_cache_type == "lru_cache") {
+  } else if (EndsWith(cache_type, "hyper_clock_cache")) {
+    size_t estimated_entry_charge;
+    if (cache_type == "fixed_hyper_clock_cache") {
+      estimated_entry_charge = FLAGS_block_size;
+    } else if (cache_type == "auto_hyper_clock_cache" ||
+               cache_type == "hyper_clock_cache") {
+      estimated_entry_charge = 0;
+    } else {
+      fprintf(stderr, "Cache type not supported.");
+      exit(1);
+    }
+    HyperClockCacheOptions opts(cache_size, estimated_entry_charge,
+                                num_shard_bits);
+    opts.hash_seed = BitwiseAnd(FLAGS_seed, INT32_MAX);
+    if (tiered) {
+      TieredCacheOptions tiered_opts;
+      tiered_opts.cache_opts = &opts;
+      tiered_opts.cache_type = PrimaryCacheType::kCacheTypeHCC;
+      tiered_opts.total_capacity = cache_size;
+      tiered_opts.compressed_secondary_ratio = 0.5;
+      tiered_opts.adm_policy =
+          static_cast<TieredAdmissionPolicy>(FLAGS_adm_policy);
+      if (tiered_opts.adm_policy ==
+          TieredAdmissionPolicy::kAdmPolicyThreeQueue) {
+        CompressedSecondaryCacheOptions nvm_sec_cache_opts;
+        nvm_sec_cache_opts.capacity = cache_size;
+        tiered_opts.nvm_sec_cache =
+            NewCompressedSecondaryCache(nvm_sec_cache_opts);
+      }
+      block_cache = NewTieredCache(tiered_opts);
+    } else {
+      opts.secondary_cache = std::move(secondary_cache);
+      block_cache = opts.MakeSharedCache();
+    }
+  } else if (EndsWith(cache_type, "lru_cache")) {
     LRUCacheOptions opts;
     opts.capacity = capacity;
     opts.num_shard_bits = num_shard_bits;
-#ifndef ROCKSDB_LITE
-    std::shared_ptr<SecondaryCache> secondary_cache;
-    if (!FLAGS_secondary_cache_uri.empty()) {
-      Status s = SecondaryCache::CreateFromString(
-          config_options, FLAGS_secondary_cache_uri, &secondary_cache);
-      if (secondary_cache == nullptr) {
-        fprintf(stderr,
-                "No secondary cache registered matching string: %s status=%s\n",
-                FLAGS_secondary_cache_uri.c_str(), s.ToString().c_str());
-        exit(1);
+    opts.metadata_charge_policy =
+        static_cast<CacheMetadataChargePolicy>(FLAGS_metadata_charge_policy);
+    opts.use_adaptive_mutex = FLAGS_use_adaptive_mutex_lru;
+    opts.high_pri_pool_ratio = FLAGS_high_pri_pool_ratio;
+    opts.low_pri_pool_ratio = FLAGS_low_pri_pool_ratio;
+    if (tiered) {
+      TieredCacheOptions tiered_opts;
+      tiered_opts.cache_opts = &opts;
+      tiered_opts.cache_type = PrimaryCacheType::kCacheTypeLRU;
+      tiered_opts.total_capacity = cache_size;
+      tiered_opts.compressed_secondary_ratio = 0.5;
+      tiered_opts.adm_policy =
+          static_cast<TieredAdmissionPolicy>(FLAGS_adm_policy);
+      if (tiered_opts.adm_policy ==
+          TieredAdmissionPolicy::kAdmPolicyThreeQueue) {
+        CompressedSecondaryCacheOptions nvm_sec_cache_opts;
+        nvm_sec_cache_opts.capacity = cache_size;
+        tiered_opts.nvm_sec_cache =
+            NewCompressedSecondaryCache(nvm_sec_cache_opts);
       }
-      if (FLAGS_secondary_cache_fault_one_in > 0) {
-        secondary_cache = std::make_shared<FaultInjectionSecondaryCache>(
-            secondary_cache, static_cast<uint32_t>(FLAGS_seed),
-            FLAGS_secondary_cache_fault_one_in);
-      }
-      opts.secondary_cache = secondary_cache;
+      block_cache = NewTieredCache(tiered_opts);
+    } else {
+      opts.secondary_cache = std::move(secondary_cache);
+      block_cache = NewLRUCache(opts);
     }
-#endif
-    return NewLRUCache(opts);
   } else {
     fprintf(stderr, "Cache type not supported.");
     exit(1);
   }
+  return block_cache;
 }
 
 std::vector<std::string> StressTest::GetBlobCompressionTags() {
@@ -179,6 +649,8 @@ bool StressTest::BuildOptionsTable() {
     return true;
   }
 
+  bool keepRibbonFilterPolicyOnly = FLAGS_bloom_before_level != INT_MAX;
+
   std::unordered_map<std::string, std::vector<std::string>> options_tbl = {
       {"write_buffer_size",
        {std::to_string(options_.write_buffer_size),
@@ -195,18 +667,12 @@ bool StressTest::BuildOptionsTable() {
            std::to_string(options_.write_buffer_size / 8),
        }},
       {"memtable_huge_page_size", {"0", std::to_string(2 * 1024 * 1024)}},
-      {"max_successive_merges", {"0", "2", "4"}},
+      {"strict_max_successive_merges", {"false", "true"}},
       {"inplace_update_num_locks", {"100", "200", "300"}},
       // TODO: re-enable once internal task T124324915 is fixed.
       // {"experimental_mempurge_threshold", {"0.0", "1.0"}},
       // TODO(ljin): enable test for this option
       // {"disable_auto_compactions", {"100", "200", "300"}},
-      {"level0_file_num_compaction_trigger",
-       {
-           std::to_string(options_.level0_file_num_compaction_trigger),
-           std::to_string(options_.level0_file_num_compaction_trigger + 2),
-           std::to_string(options_.level0_file_num_compaction_trigger + 4),
-       }},
       {"level0_slowdown_writes_trigger",
        {
            std::to_string(options_.level0_slowdown_writes_trigger),
@@ -249,8 +715,54 @@ bool StressTest::BuildOptionsTable() {
            "1",
            "2",
        }},
-      {"max_sequential_skip_in_iterations", {"4", "8", "12"}},
+      {"block_based_table_factory",
+       {
+           keepRibbonFilterPolicyOnly ? "{filter_policy=ribbonfilter:2.35}"
+                                      : "{filter_policy=bloomfilter:2.34}",
+           "{filter_policy=ribbonfilter:5.67:-1}",
+           keepRibbonFilterPolicyOnly ? "{filter_policy=ribbonfilter:8.9:3}"
+                                      : "{filter_policy=nullptr}",
+           "{block_size=" + std::to_string(FLAGS_block_size) + "}",
+           "{block_size=" +
+               std::to_string(FLAGS_block_size + (FLAGS_seed & 0xFFFU)) + "}",
+       }},
   };
+  if (FLAGS_use_multiscan == 0) {
+    // TODO: this can fail MultiScan when consecutive data blocks share the
+    // same user at boundary. MultiScan uses user key to locate the block to
+    // reach which can move the scan earlier than its current block.
+    options_tbl.emplace("max_sequential_skip_in_iterations",
+                        std::vector<std::string>{"4", "8", "12"});
+  }
+  if (FLAGS_compaction_style == kCompactionStyleUniversal &&
+      FLAGS_universal_max_read_amp > 0) {
+    // level0_file_num_compaction_trigger needs to be at most max_read_amp
+    options_tbl.emplace(
+        "level0_file_num_compaction_trigger",
+        std::vector<std::string>{
+            std::to_string(options_.level0_file_num_compaction_trigger),
+            std::to_string(
+                std::min(options_.level0_file_num_compaction_trigger + 2,
+                         FLAGS_universal_max_read_amp)),
+            std::to_string(
+                std::min(options_.level0_file_num_compaction_trigger + 4,
+                         FLAGS_universal_max_read_amp)),
+        });
+  } else {
+    options_tbl.emplace(
+        "level0_file_num_compaction_trigger",
+        std::vector<std::string>{
+            std::to_string(options_.level0_file_num_compaction_trigger),
+            std::to_string(options_.level0_file_num_compaction_trigger + 2),
+            std::to_string(options_.level0_file_num_compaction_trigger + 4),
+        });
+  }
+  if (FLAGS_unordered_write) {
+    options_tbl.emplace("max_successive_merges", std::vector<std::string>{"0"});
+  } else {
+    options_tbl.emplace("max_successive_merges",
+                        std::vector<std::string>{"0", "2", "4"});
+  }
 
   if (FLAGS_allow_setting_blob_options_dynamically) {
     options_tbl.emplace("enable_blob_files",
@@ -274,6 +786,40 @@ bool StressTest::BuildOptionsTable() {
     options_tbl.emplace("prepopulate_blob_cache",
                         std::vector<std::string>{"kDisable", "kFlushOnly"});
   }
+
+  if (keepRibbonFilterPolicyOnly) {
+    // Can modify RibbonFilterPolicy field
+    options_tbl.emplace("table_factory.filter_policy.bloom_before_level",
+                        std::vector<std::string>{"-1", "0", "1", "2",
+                                                 "2147483646", "2147483647"});
+  }
+
+  if (!FLAGS_file_temperature_age_thresholds.empty()) {
+    // Modify file_temperature_age_thresholds only if it is set initially
+    // (FIFO tiered storage setup)
+    options_tbl.emplace(
+        "file_temperature_age_thresholds",
+        std::vector<std::string>{
+            "{{temperature=kWarm;age=10}:{temperature=kCool;age=30}:{"
+            "temperature=kCold;age=100}:{"
+            "temperature=kIce;age=300}}",
+            "{{temperature=kWarm;age=30}:{temperature=kCold;age=300}}",
+            "{{temperature=kCold;age=100}}", "{}"});
+    options_tbl.emplace(
+        "allow_trivial_copy_when_change_temperature",
+        std::vector<std::string>{
+            FLAGS_allow_trivial_copy_when_change_temperature ? "true"
+                                                             : "false"});
+  }
+
+  // NOTE: allow -1 to mean starting disabled but dynamically changing
+  // But 0 means tiering is disabled for the entire run.
+  if (FLAGS_preclude_last_level_data_seconds != 0) {
+    options_tbl.emplace("preclude_last_level_data_seconds",
+                        std::vector<std::string>{"0", "5", "30", "5000"});
+  }
+  options_tbl.emplace("preserve_internal_time_seconds",
+                      std::vector<std::string>{"0", "5", "30", "5000"});
 
   options_table_ = std::move(options_tbl);
 
@@ -309,21 +855,20 @@ void StressTest::FinishInitDb(SharedState* shared) {
     if (!s.ok()) {
       fprintf(stderr, "Error restoring historical expected values: %s\n",
               s.ToString().c_str());
-      exit(1);
+      port::ImmediateExit(1);
     }
   }
-#ifndef ROCKSDB_LITE
-  if (FLAGS_use_txn) {
+  if (FLAGS_use_txn && !FLAGS_use_optimistic_txn) {
     // It's OK here without sync because unsynced data cannot be lost at this
     // point
     // - even with sync_fault_injection=1 as the
     // file is still directly writable until after FinishInitDb()
     ProcessRecoveredPreparedTxns(shared);
   }
-#endif
+
   if (FLAGS_enable_compaction_filter) {
     auto* compaction_filter_factory =
-        reinterpret_cast<DbStressCompactionFilterFactory*>(
+        static_cast<DbStressCompactionFilterFactory*>(
             options_.compaction_filter_factory.get());
     assert(compaction_filter_factory);
     // This must be called only after any potential `SharedState::Restore()` has
@@ -336,19 +881,14 @@ void StressTest::FinishInitDb(SharedState* shared) {
 }
 
 void StressTest::TrackExpectedState(SharedState* shared) {
-  // For `FLAGS_manual_wal_flush_one_inWAL`
-  // data can be lost when `manual_wal_flush_one_in > 0` and `FlushWAL()` is not
-  // explictly called by users of RocksDB (in our case, db stress).
-  // Therefore recovery from such potential WAL data loss is a prefix recovery
-  // that requires tracing
-  if ((FLAGS_sync_fault_injection || FLAGS_disable_wal ||
-       FLAGS_manual_wal_flush_one_in > 0) &&
-      IsStateTracked()) {
+  // When data loss is simulated, recovery from potential data loss is a prefix
+  // recovery that requires tracing
+  if (MightHaveUnsyncedDataLoss() && IsStateTracked()) {
     Status s = shared->SaveAtAndAfter(db_);
     if (!s.ok()) {
       fprintf(stderr, "Error enabling history tracing: %s\n",
               s.ToString().c_str());
-      exit(1);
+      port::ImmediateExit(1);
     }
   }
 }
@@ -363,6 +903,8 @@ Status StressTest::AssertSame(DB* db, ColumnFamilyHandle* cf,
   // `FLAGS_rate_limit_user_ops` to avoid slowing any validation.
   ReadOptions ropt;
   ropt.snapshot = snap_state.snapshot;
+  ropt.auto_refresh_iterator_with_snapshot =
+      FLAGS_auto_refresh_iterator_with_snapshot;
   Slice ts;
   if (!snap_state.timestamp.empty()) {
     ts = snap_state.timestamp;
@@ -373,6 +915,13 @@ Status StressTest::AssertSame(DB* db, ColumnFamilyHandle* cf,
   PinnableSlice v;
   s = db->Get(ropt, cf, snap_state.key, &v);
   if (!s.ok() && !s.IsNotFound()) {
+    // When `persist_user_defined_timestamps` is false, a repeated read with
+    // both a read timestamp and an explicitly taken snapshot cannot guarantee
+    // consistent result all the time. When it cannot return consistent result,
+    // it will return an `InvalidArgument` status.
+    if (s.IsInvalidArgument() && !FLAGS_persist_user_defined_timestamps) {
+      return Status::OK();
+    }
     return s;
   }
   if (snap_state.status != s) {
@@ -410,10 +959,22 @@ Status StressTest::AssertSame(DB* db, ColumnFamilyHandle* cf,
   return Status::OK();
 }
 
-void StressTest::VerificationAbort(SharedState* shared, std::string msg,
-                                   Status s) const {
-  fprintf(stderr, "Verification failed: %s. Status is %s\n", msg.c_str(),
-          s.ToString().c_str());
+void StressTest::ProcessStatus(SharedState* shared, std::string opname,
+                               const Status& s,
+                               bool ignore_injected_error) const {
+  if (s.ok()) {
+    return;
+  }
+  if (!ignore_injected_error || !IsErrorInjectedAndRetryable(s)) {
+    std::ostringstream oss;
+    oss << opname << " failed: " << s.ToString();
+    VerificationAbort(shared, oss.str());
+    assert(false);
+  }
+}
+
+void StressTest::VerificationAbort(SharedState* shared, std::string msg) const {
+  fprintf(stderr, "Verification failed: %s\n", msg.c_str());
   shared->SetVerificationFailure();
 }
 
@@ -442,58 +1003,137 @@ void StressTest::VerificationAbort(SharedState* shared, std::string msg, int cf,
 
 void StressTest::VerificationAbort(SharedState* shared, int cf, int64_t key,
                                    const Slice& value,
-                                   const WideColumns& columns,
-                                   const WideColumns& expected_columns) const {
+                                   const WideColumns& columns) const {
   assert(shared);
 
   auto key_str = Key(key);
 
   fprintf(stderr,
           "Verification failed for column family %d key %s (%" PRIi64
-          "): Value and columns inconsistent: %s\n",
+          "): Value and columns inconsistent: value: %s, columns: %s\n",
           cf, Slice(key_str).ToString(/* hex */ true).c_str(), key,
-          DebugString(value, columns, expected_columns).c_str());
+          value.ToString(/* hex */ true).c_str(),
+          WideColumnsToHex(columns).c_str());
 
   shared->SetVerificationFailure();
 }
 
+// Under --verify_cpu_corruption_dir, right after each write op
+// (put/delete/deleterange), flush, and compaction (compactrange/compactfiles),
+// verifies that op for corruption and, on the first one found, writes a result
+// file into the directory and marks the run as a verification failure. It catches:
+// (a) a corruption returned by the op itself or by the read-back
+// (Status::Corruption); or (b) a silent data corruption (SDC) -- a read-back
+// that SUCCEEDS but returns the wrong result vs the committed expected state: a
+// lost key (NotFound), a resurrected key (deleted but present), or a wrong value
+// (bytes differ). Surfacing these with an immediate read right after the op
+// (instead of waiting for a later read or the end-of-run db verification) gives
+// the most immediate and accurate verification when an external CPU-fault
+// injector (e.g. gdb) flips a register inside that op.
+//
+// REQUIRES (enforced at startup) --threads=1 and all fault injection off (every
+// *_fault_one_in = 0 and sync_fault_injection = false): the full-keyspace
+// read-back is only well-defined with a single writer, and injected I/O faults
+// would otherwise taint it.
+//
+// OUTPUT CONTRACT (one file per worker thread):
+// <dir>/data_corruption.<thread_id>.json -- a JSON object with fields: kind (one
+// of lost|resurrected|wrong-value|detected-corruption), cf (int), key (int),
+// value_from_db (hex), value_from_expected (hex), op_status (string).
+//
+// PERFORMANCE: the read-back scans the entire keyspace after every op
+// (O(max_key) Get calls per op), so this is meant for single-op
+// CPU-fault-injection debugging, not general stress runs.
+void StressTest::MaybeVerifyCpuCorruption(ThreadState* thread,
+                                          const char* op_label,
+                                          const Status& op_status) {
+  if (FLAGS_verify_cpu_corruption_dir.empty()) {
+    return;
+  }
+  auto shared = thread->shared;
+
+  if (shared->HasVerificationFailedYet()) {
+    return;
+  }
+
+  // The op itself returned Corruption: an integrity check caught the
+  // corruption.
+  if (op_status.IsCorruption()) {
+    WriteDataCorruption(thread->tid, /* cf */ -1, /* key */ -1,
+                        {"detected-corruption", Slice(), Slice(),
+                         std::string(op_label) + ": " + op_status.ToString()});
+    VerificationAbort(shared,
+                      std::string(op_label) +
+                          " detected data corruption: " + op_status.ToString());
+    return;
+  }
+
+  // Single writer (the run is pinned to --threads=1): read every key back and
+  // compare it against the committed expected state, ending the run on the
+  // first data corruption found.
+  // TODO: this full-keyspace read-back duplicates the canonical verifier
+  // VerifyDb (no_batched_ops_stress.cc). Refactor that key/value compare into a
+  // shared per-key helper both can call, so this stays in sync with the model.
+  ReadOptions read_opts;
+  read_opts.verify_checksums = true;
+  // A user-timestamp DB needs a read timestamp; supply one like the canonical
+  // verifier (no_batched_ops_stress.cc).
+  std::string read_ts_str;
+  Slice read_ts;
+  if (FLAGS_user_timestamp_size > 0) {
+    read_ts_str = GetNowNanos();
+    read_ts = read_ts_str;
+    read_opts.timestamp = &read_ts;
+  }
+  const int64_t max_key = shared->GetMaxKey();
+  std::string db_value;
+  char expected_scratch[kValueMaxLen];
+  for (int cf = 0; cf < static_cast<int>(column_families_.size()); ++cf) {
+    for (int64_t key = 0; key < max_key; ++key) {
+      const ExpectedValue expected = shared->Get(cf, key);
+      db_value.clear();
+      const Status s =
+          db_->Get(read_opts, column_families_[cf], Key(key), &db_value);
+      const std::optional<DataCorruption> corruption =
+          ClassifyReadBack(s, db_value, expected, expected_scratch);
+      if (corruption.has_value()) {
+        WriteDataCorruption(thread->tid, cf, key, *corruption);
+        VerificationAbort(
+            shared,
+            std::string(corruption->kind) + " (" + corruption->op_status + ")",
+            cf, key, corruption->value_from_db,
+            corruption->value_from_expected);
+        return;
+      }
+    }
+  }
+}
+
 std::string StressTest::DebugString(const Slice& value,
-                                    const WideColumns& columns,
-                                    const WideColumns& expected_columns) {
+                                    const WideColumns& columns) {
   std::ostringstream oss;
 
-  oss << "value: " << value.ToString(/* hex */ true);
-
-  auto dump = [](const WideColumns& cols, std::ostream& os) {
-    if (cols.empty()) {
-      return;
-    }
-
-    os << std::hex;
-
-    auto it = cols.begin();
-    os << *it;
-    for (++it; it != cols.end(); ++it) {
-      os << ' ' << *it;
-    }
-  };
-
-  oss << ", columns: ";
-  dump(columns, oss);
-
-  oss << ", expected_columns: ";
-  dump(expected_columns, oss);
+  oss << "value: " << value.ToString(/* hex */ true)
+      << ", columns: " << WideColumnsToHex(columns);
 
   return oss.str();
 }
 
 void StressTest::PrintStatistics() {
-  if (dbstats) {
-    fprintf(stdout, "STATISTICS:\n%s\n", dbstats->ToString().c_str());
+  // Print statistics from the DB instance instead of global dbstats
+  if (db_) {
+    auto stats = db_->GetOptions().statistics;
+    if (stats) {
+      fprintf(stdout, "STATISTICS:\n%s\n", stats->ToString().c_str());
+    }
   }
-  if (dbstats_secondaries) {
-    fprintf(stdout, "Secondary instances STATISTICS:\n%s\n",
-            dbstats_secondaries->ToString().c_str());
+  // Print statistics from secondary DB instance if it exists
+  if (secondary_db_) {
+    auto stats = secondary_db_->GetOptions().statistics;
+    if (stats) {
+      fprintf(stdout, "Secondary instance STATISTICS:\n%s\n",
+              stats->ToString().c_str());
+    }
   }
 }
 
@@ -514,58 +1154,66 @@ void StressTest::PreloadDbAndReopenAsReadOnly(int64_t number_of_keys,
   for (auto cfh : column_families_) {
     for (int64_t k = 0; k != number_of_keys; ++k) {
       const std::string key = Key(k);
-
-      constexpr uint32_t value_base = 0;
+      PendingExpectedValue pending_expected_value =
+          shared->PreparePut(cf_idx, k);
+      const uint32_t value_base = pending_expected_value.GetFinalValueBase();
       const size_t sz = GenerateValue(value_base, value, sizeof(value));
 
       const Slice v(value, sz);
 
-      shared->Put(cf_idx, k, value_base, true /* pending */);
+      std::string ts;
+      if (FLAGS_user_timestamp_size > 0) {
+        ts = GetNowNanos();
+      }
 
-      if (FLAGS_use_merge) {
+      if (FLAGS_use_put_entity_one_in > 0 &&
+          (value_base % FLAGS_use_put_entity_one_in) == 0) {
         if (!FLAGS_use_txn) {
-          s = db_->Merge(write_opts, cfh, key, v);
-        } else {
-#ifndef ROCKSDB_LITE
-          Transaction* txn;
-          s = NewTxn(write_opts, &txn);
-          if (s.ok()) {
-            s = txn->Merge(cfh, key, v);
-            if (s.ok()) {
-              s = CommitTxn(txn);
-            }
+          if (FLAGS_use_attribute_group) {
+            s = db_->PutEntity(write_opts, key,
+                               GenerateAttributeGroups({cfh}, value_base, v));
+          } else {
+            s = db_->PutEntity(write_opts, cfh, key,
+                               GenerateWideColumns(value_base, v));
           }
-#endif
+        } else {
+          s = ExecuteTransaction(
+              write_opts, /*thread=*/nullptr, [&](Transaction& txn) {
+                return txn.PutEntity(cfh, key,
+                                     GenerateWideColumns(value_base, v));
+              });
         }
-      } else if (FLAGS_use_put_entity_one_in > 0) {
-        s = db_->PutEntity(write_opts, cfh, key,
-                           GenerateWideColumns(value_base, v));
+      } else if (FLAGS_use_merge) {
+        if (!FLAGS_use_txn) {
+          if (FLAGS_user_timestamp_size > 0) {
+            s = db_->Merge(write_opts, cfh, key, ts, v);
+          } else {
+            s = db_->Merge(write_opts, cfh, key, v);
+          }
+        } else {
+          s = ExecuteTransaction(
+              write_opts, /*thread=*/nullptr,
+              [&](Transaction& txn) { return txn.Merge(cfh, key, v); });
+        }
       } else {
         if (!FLAGS_use_txn) {
           if (FLAGS_user_timestamp_size > 0) {
-            const std::string ts = GetNowNanos();
             s = db_->Put(write_opts, cfh, key, ts, v);
           } else {
             s = db_->Put(write_opts, cfh, key, v);
           }
         } else {
-#ifndef ROCKSDB_LITE
-          Transaction* txn;
-          s = NewTxn(write_opts, &txn);
-          if (s.ok()) {
-            s = txn->Put(cfh, key, v);
-            if (s.ok()) {
-              s = CommitTxn(txn);
-            }
-          }
-#endif
+          s = ExecuteTransaction(
+              write_opts, /*thread=*/nullptr,
+              [&](Transaction& txn) { return txn.Put(cfh, key, v); });
         }
       }
 
-      shared->Put(cf_idx, k, value_base, false /* pending */);
       if (!s.ok()) {
+        pending_expected_value.Rollback();
         break;
       }
+      pending_expected_value.Commit();
     }
     if (!s.ok()) {
       break;
@@ -576,15 +1224,12 @@ void StressTest::PreloadDbAndReopenAsReadOnly(int64_t number_of_keys,
     s = db_->Flush(FlushOptions(), column_families_);
   }
   if (s.ok()) {
-    for (auto cf : column_families_) {
-      delete cf;
-    }
-    column_families_.clear();
-    delete db_;
+    CleanUpColumnFamilies();
+    db_owner_.reset();
     db_ = nullptr;
-#ifndef ROCKSDB_LITE
     txn_db_ = nullptr;
-#endif
+    optimistic_txn_db_ = nullptr;
+    secondary_db_.reset();
 
     db_preload_finished_.store(true);
     auto now = clock_->NowMicros();
@@ -622,7 +1267,12 @@ Status StressTest::SetOptions(ThreadState* thread) {
   return db_->SetOptions(cfh, opts);
 }
 
-#ifndef ROCKSDB_LITE
+Options StressTest::GetOptions(int cf_id) {
+  auto cfh = column_families_[cf_id];
+  assert(cfh);
+  return db_->GetOptions(cfh);
+}
+
 void StressTest::ProcessRecoveredPreparedTxns(SharedState* shared) {
   assert(txn_db_);
   std::vector<Transaction*> recovered_prepared_trans;
@@ -645,8 +1295,7 @@ void StressTest::ProcessRecoveredPreparedTxnsHelper(Transaction* txn,
     for (wbwi_iter->SeekToFirst(); wbwi_iter->Valid(); wbwi_iter->Next()) {
       uint64_t key_val;
       if (GetIntVal(wbwi_iter->Entry().key.ToString(), &key_val)) {
-        shared->Put(static_cast<int>(i) /* cf_idx */, key_val,
-                    0 /* value_base */, true /* pending */);
+        shared->SyncPendingPut(static_cast<int>(i) /* cf_idx */, key_val);
       }
     }
   }
@@ -659,77 +1308,205 @@ void StressTest::ProcessRecoveredPreparedTxnsHelper(Transaction* txn,
   }
 }
 
-Status StressTest::NewTxn(WriteOptions& write_opts, Transaction** txn) {
+Status StressTest::NewTxn(WriteOptions& write_opts, ThreadState* thread,
+                          std::unique_ptr<Transaction>* out_txn,
+                          bool* commit_bypass_memtable) {
   if (!FLAGS_use_txn) {
     return Status::InvalidArgument("NewTxn when FLAGS_use_txn is not set");
   }
   write_opts.disableWAL = FLAGS_disable_wal;
   static std::atomic<uint64_t> txn_id = {0};
-  TransactionOptions txn_options;
-  txn_options.use_only_the_last_commit_time_batch_for_recovery =
-      FLAGS_use_only_the_last_commit_time_batch_for_recovery;
-  txn_options.lock_timeout = 600000;  // 10 min
-  txn_options.deadlock_detect = true;
-  *txn = txn_db_->BeginTransaction(write_opts, txn_options);
-  auto istr = std::to_string(txn_id.fetch_add(1));
-  Status s = (*txn)->SetName("xid" + istr);
-  return s;
+  if (FLAGS_use_optimistic_txn) {
+    out_txn->reset(optimistic_txn_db_->BeginTransaction(write_opts));
+    return Status::OK();
+  } else {
+    TransactionOptions txn_options;
+    txn_options.use_only_the_last_commit_time_batch_for_recovery =
+        FLAGS_use_only_the_last_commit_time_batch_for_recovery;
+    txn_options.lock_timeout = 600000;  // 10 min
+    txn_options.deadlock_detect = true;
+    if (FLAGS_commit_bypass_memtable_one_in > 0 &&
+        thread->rand.OneIn(FLAGS_commit_bypass_memtable_one_in)) {
+      assert(FLAGS_txn_write_policy == 0);
+      assert(FLAGS_user_timestamp_size == 0);
+      if (thread->rand.OneIn(2)) {
+        txn_options.commit_bypass_memtable = true;
+      }
+      if (thread->rand.OneIn(2)) {
+        txn_options.large_txn_commit_optimize_threshold = 1;
+      }
+      if (thread->rand.OneIn(2) ||
+          (!txn_options.commit_bypass_memtable &&
+           txn_options.large_txn_commit_optimize_threshold != 1)) {
+        txn_options.large_txn_commit_optimize_byte_threshold = 1;
+      }
+      if (commit_bypass_memtable) {
+        *commit_bypass_memtable = txn_options.commit_bypass_memtable;
+      }
+    }
+    out_txn->reset(txn_db_->BeginTransaction(write_opts, txn_options));
+    auto istr = std::to_string(txn_id.fetch_add(1));
+    Status s = (*out_txn)->SetName("xid" + istr);
+    return s;
+  }
 }
 
-Status StressTest::CommitTxn(Transaction* txn, ThreadState* thread) {
+Status StressTest::CommitTxn(Transaction& txn, ThreadState* thread) {
   if (!FLAGS_use_txn) {
     return Status::InvalidArgument("CommitTxn when FLAGS_use_txn is not set");
   }
-  assert(txn_db_);
-  Status s = txn->Prepare();
-  std::shared_ptr<const Snapshot> timestamped_snapshot;
-  if (s.ok()) {
-    if (thread && FLAGS_create_timestamped_snapshot_one_in &&
-        thread->rand.OneIn(FLAGS_create_timestamped_snapshot_one_in)) {
-      uint64_t ts = db_stress_env->NowNanos();
-      s = txn->CommitAndTryCreateSnapshot(/*notifier=*/nullptr, ts,
-                                          &timestamped_snapshot);
+  Status s = Status::OK();
+  // We don't issue write to transaction's underlying WriteBatch in stress test
+  assert(txn.GetWriteBatch()->GetWriteBatch()->Count());
+  assert(txn.GetWriteBatch()->GetWBWIOpCount() ==
+         txn.GetWriteBatch()->GetWriteBatch()->Count());
+  if (FLAGS_use_optimistic_txn) {
+    assert(optimistic_txn_db_);
+    s = txn.Commit();
+  } else {
+    assert(txn_db_);
+    s = txn.Prepare();
+    const bool prepared = s.ok();
+    std::shared_ptr<const Snapshot> timestamped_snapshot;
+    if (s.ok()) {
+      if (thread && FLAGS_create_timestamped_snapshot_one_in &&
+          thread->rand.OneIn(FLAGS_create_timestamped_snapshot_one_in)) {
+        uint64_t ts = raw_env->NowNanos();
+        s = txn.CommitAndTryCreateSnapshot(/*notifier=*/nullptr, ts,
+                                           &timestamped_snapshot);
 
-      std::pair<Status, std::shared_ptr<const Snapshot>> res;
-      if (thread->tid == 0) {
-        uint64_t now = db_stress_env->NowNanos();
-        res = txn_db_->CreateTimestampedSnapshot(now);
-        if (res.first.ok()) {
-          assert(res.second);
-          assert(res.second->GetTimestamp() == now);
-          if (timestamped_snapshot) {
-            assert(res.second->GetTimestamp() >
-                   timestamped_snapshot->GetTimestamp());
+        std::pair<Status, std::shared_ptr<const Snapshot>> res;
+        if (thread->tid == 0) {
+          uint64_t now = raw_env->NowNanos();
+          res = txn_db_->CreateTimestampedSnapshot(now);
+          if (res.first.ok()) {
+            assert(res.second);
+            assert(res.second->GetTimestamp() == now);
+            if (timestamped_snapshot) {
+              assert(res.second->GetTimestamp() >
+                     timestamped_snapshot->GetTimestamp());
+            }
+          } else {
+            assert(!res.second);
           }
-        } else {
-          assert(!res.second);
+        }
+      } else {
+        s = txn.Commit();
+      }
+    }
+    if (prepared && !s.ok()) {
+      Status rollback_s = txn.Rollback();
+      int rollback_recovery_retries = 0;
+      int resume_busy_count = 0;
+      std::string last_resume_status;
+      if (!rollback_s.ok() && IsErrorInjectedAndRetryable(rollback_s) &&
+          db_ != nullptr) {
+        // Retry budget: count only actual rollback attempts (after Resume
+        // succeeds), not time spent waiting for recovery to finish on another
+        // thread. With many concurrent threads hitting write errors, recovery
+        // can take much longer than individual threads' retry budgets.
+        constexpr int kMaxRollbackRetries = 100;
+        constexpr int kMaxResumeBusyWaits = 3000;
+        constexpr int kRetryIntervalMicros = 10 * 1000;
+        for (; rollback_recovery_retries < kMaxRollbackRetries &&
+               resume_busy_count < kMaxResumeBusyWaits && !rollback_s.ok();) {
+          const Status resume_s = db_->Resume();
+          if (resume_s.ok()) {
+            ++rollback_recovery_retries;
+            last_resume_status = resume_s.ToString();
+            rollback_s = txn.Rollback();
+            if (rollback_s.ok() || !IsErrorInjectedAndRetryable(rollback_s)) {
+              break;
+            }
+          } else if (!resume_s.IsBusy()) {
+            last_resume_status = resume_s.ToString();
+            break;
+          } else {
+            ++resume_busy_count;
+            last_resume_status = resume_s.ToString();
+          }
+          clock_->SleepForMicroseconds(kRetryIntervalMicros);
         }
       }
-    } else {
-      s = txn->Commit();
+      if (!rollback_s.ok()) {
+        fprintf(stderr,
+                "Rollback after failed prepared transaction commit failed: "
+                "txn=%s, commit_status=%s, rollback_status=%s, "
+                "recovery_retries=%d, resume_busy_count=%d, "
+                "last_resume_status=%s\n",
+                txn.GetName().c_str(), s.ToString().c_str(),
+                rollback_s.ToString().c_str(), rollback_recovery_retries,
+                resume_busy_count, last_resume_status.c_str());
+      }
+    }
+    if (thread && FLAGS_create_timestamped_snapshot_one_in > 0 &&
+        thread->rand.OneInOpt(50000)) {
+      uint64_t now = raw_env->NowNanos();
+      constexpr uint64_t time_diff = static_cast<uint64_t>(1000) * 1000 * 1000;
+      txn_db_->ReleaseTimestampedSnapshotsOlderThan(now - time_diff);
     }
   }
-  if (thread && FLAGS_create_timestamped_snapshot_one_in > 0 &&
-      thread->rand.OneInOpt(50000)) {
-    uint64_t now = db_stress_env->NowNanos();
-    constexpr uint64_t time_diff = static_cast<uint64_t>(1000) * 1000 * 1000;
-    txn_db_->ReleaseTimestampedSnapshotsOlderThan(now - time_diff);
-  }
-  delete txn;
   return s;
 }
 
-Status StressTest::RollbackTxn(Transaction* txn) {
-  if (!FLAGS_use_txn) {
-    return Status::InvalidArgument(
-        "RollbackTxn when FLAGS_use_txn is not"
-        " set");
+bool StressTest::IsExpectedTxnError(const Status& s) {
+  if ((s.IsDeadlock() || s.IsTimedOut()) &&
+      (FLAGS_use_multiget || FLAGS_use_multi_get_entity)) {
+    return true;
   }
-  Status s = txn->Rollback();
-  delete txn;
+  // Optimistic transaction may return TryAgain when memtable history is
+  // insufficient for conflict detection (controlled by
+  // max_write_buffer_size_to_maintain). ExecuteTransaction retries up to 10
+  // times, and if all retries fail, it returns TryAgain. This is an expected
+  // condition and should not crash the stress test.
+  if (s.IsTryAgain() && FLAGS_use_optimistic_txn) {
+    return true;
+  }
+  return false;
+}
+
+Status StressTest::ExecuteTransaction(WriteOptions& write_opts,
+                                      ThreadState* thread,
+                                      std::function<Status(Transaction&)>&& ops,
+                                      bool* commit_bypass_memtable) {
+  std::unique_ptr<Transaction> txn;
+  Status s = NewTxn(write_opts, thread, &txn, commit_bypass_memtable);
+  std::string try_again_messages;
+  if (s.ok()) {
+    for (int tries = 1;; ++tries) {
+      s = ops(*txn);
+      if (s.ok()) {
+        s = CommitTxn(*txn, thread);
+        if (s.ok()) {
+          break;
+        }
+      }
+      // Optimistic txn might return TryAgain, in which case rollback
+      // and try again.
+      if (!s.IsTryAgain() || !FLAGS_use_optimistic_txn) {
+        break;
+      }
+      // Record and report historical TryAgain messages for debugging
+      try_again_messages +=
+          std::to_string(SystemClock::Default()->NowMicros() / 1000);
+      try_again_messages += "ms ";
+      try_again_messages += s.getState();
+      try_again_messages += "\n";
+      // In theory, each Rollback after TryAgain should have an independent
+      // chance of success, so too many retries could indicate something is
+      // not working properly.
+      if (tries >= 10) {
+        s = Status::TryAgain(try_again_messages);
+        break;
+      }
+      s = txn->Rollback();
+      if (!s.ok()) {
+        break;
+      }
+    }
+  }
   return s;
 }
-#endif
 
 void StressTest::OperateDb(ThreadState* thread) {
   ReadOptions read_opts(FLAGS_verify_checksum, true);
@@ -738,10 +1515,29 @@ void StressTest::OperateDb(ThreadState* thread) {
   read_opts.async_io = FLAGS_async_io;
   read_opts.adaptive_readahead = FLAGS_adaptive_readahead;
   read_opts.readahead_size = FLAGS_readahead_size;
+  read_opts.auto_readahead_size = FLAGS_auto_readahead_size;
+  read_opts.fill_cache = FLAGS_fill_cache;
+  read_opts.optimize_multiget_for_io = FLAGS_optimize_multiget_for_io;
+  read_opts.allow_unprepared_value = FLAGS_allow_unprepared_value;
+  read_opts.auto_refresh_iterator_with_snapshot =
+      FLAGS_auto_refresh_iterator_with_snapshot;
+  if (FLAGS_use_trie_index && !FLAGS_use_udi_as_primary_index && udi_factory_) {
+    read_opts.table_index_factory = udi_factory_.get();
+  }
+  std::unique_ptr<StressReadScopedBlockBufferProvider>
+      read_scoped_block_buffer_provider;
+  if (FLAGS_read_scoped_block_buffer_provider) {
+    read_scoped_block_buffer_provider =
+        std::make_unique<StressReadScopedBlockBufferProvider>();
+    read_opts.read_scoped_block_buffer_provider =
+        read_scoped_block_buffer_provider.get();
+  }
   WriteOptions write_opts;
   if (FLAGS_rate_limit_auto_wal_flush) {
     write_opts.rate_limiter_priority = Env::IO_USER;
   }
+  write_opts.memtable_insert_hint_per_batch =
+      FLAGS_memtable_insert_hint_per_batch;
   auto shared = thread->shared;
   char value[100];
   std::string from_db;
@@ -761,29 +1557,6 @@ void StressTest::OperateDb(ThreadState* thread) {
 
   const uint64_t ops_per_open = FLAGS_ops_per_thread / (FLAGS_reopen + 1);
 
-#ifndef NDEBUG
-  if (FLAGS_read_fault_one_in) {
-    fault_fs_guard->SetThreadLocalReadErrorContext(thread->shared->GetSeed(),
-                                                   FLAGS_read_fault_one_in);
-  }
-#endif  // NDEBUG
-  if (FLAGS_write_fault_one_in) {
-    IOStatus error_msg;
-    if (FLAGS_injest_error_severity <= 1 || FLAGS_injest_error_severity > 2) {
-      error_msg = IOStatus::IOError("Retryable IO Error");
-      error_msg.SetRetryable(true);
-    } else if (FLAGS_injest_error_severity == 2) {
-      // Ingest the fatal error
-      error_msg = IOStatus::IOError("Fatal IO Error");
-      error_msg.SetDataLoss(true);
-    }
-    std::vector<FileType> types = {FileType::kTableFile,
-                                   FileType::kDescriptorFile,
-                                   FileType::kCurrentFile};
-    fault_fs_guard->SetRandomWriteError(
-        thread->shared->GetSeed(), FLAGS_write_fault_one_in, error_msg,
-        /*inject_for_all_file_types=*/false, types);
-  }
   thread->stats.Start();
   for (int open_cnt = 0; open_cnt <= FLAGS_reopen; ++open_cnt) {
     if (thread->shared->HasVerificationFailedYet() ||
@@ -807,7 +1580,46 @@ void StressTest::OperateDb(ThreadState* thread) {
       }
       // Commenting this out as we don't want to reset stats on each open.
       // thread->stats.Start();
+      if (FLAGS_use_trie_index && udi_factory_) {
+        read_opts.table_index_factory = udi_factory_.get();
+      }
     }
+
+#ifndef NDEBUG
+    if (db_fault_injection_fs_) {
+      db_fault_injection_fs_->SetThreadLocalErrorContext(
+          FaultInjectionIOType::kRead, thread->shared->GetSeed(),
+          FLAGS_read_fault_one_in,
+          FLAGS_inject_error_severity == 1 /* retryable */,
+          FLAGS_inject_error_severity == 2 /* has_data_loss*/);
+      db_fault_injection_fs_->EnableThreadLocalErrorInjection(
+          FaultInjectionIOType::kRead);
+
+      db_fault_injection_fs_->SetThreadLocalErrorContext(
+          FaultInjectionIOType::kWrite, thread->shared->GetSeed(),
+          FLAGS_write_fault_one_in,
+          FLAGS_inject_error_severity == 1 /* retryable */,
+          FLAGS_inject_error_severity == 2 /* has_data_loss*/);
+      db_fault_injection_fs_->EnableThreadLocalErrorInjection(
+          FaultInjectionIOType::kWrite);
+
+      db_fault_injection_fs_->SetThreadLocalErrorContext(
+          FaultInjectionIOType::kMetadataRead, thread->shared->GetSeed(),
+          FLAGS_metadata_read_fault_one_in,
+          FLAGS_inject_error_severity == 1 /* retryable */,
+          FLAGS_inject_error_severity == 2 /* has_data_loss*/);
+      db_fault_injection_fs_->EnableThreadLocalErrorInjection(
+          FaultInjectionIOType::kMetadataRead);
+
+      db_fault_injection_fs_->SetThreadLocalErrorContext(
+          FaultInjectionIOType::kMetadataWrite, thread->shared->GetSeed(),
+          FLAGS_metadata_write_fault_one_in,
+          FLAGS_inject_error_severity == 1 /* retryable */,
+          FLAGS_inject_error_severity == 2 /* has_data_loss*/);
+      db_fault_injection_fs_->EnableThreadLocalErrorInjection(
+          FaultInjectionIOType::kMetadataWrite);
+    }
+#endif  // NDEBUG
 
     for (uint64_t i = 0; i < ops_per_open; i++) {
       if (thread->shared->HasVerificationFailedYet()) {
@@ -816,7 +1628,8 @@ void StressTest::OperateDb(ThreadState* thread) {
 
       // Change Options
       if (thread->rand.OneInOpt(FLAGS_set_options_one_in)) {
-        SetOptions(thread);
+        Status s = SetOptions(thread);
+        ProcessStatus(shared, "SetOptions", s);
       }
 
       if (thread->rand.OneInOpt(FLAGS_set_in_place_one_in)) {
@@ -825,7 +1638,15 @@ void StressTest::OperateDb(ThreadState* thread) {
 
       if (thread->tid == 0 && FLAGS_verify_db_one_in > 0 &&
           thread->rand.OneIn(FLAGS_verify_db_one_in)) {
+        //  Temporarily disable error injection for verification
+        if (db_fault_injection_fs_) {
+          db_fault_injection_fs_->DisableAllThreadLocalErrorInjection();
+        }
         ContinuouslyVerifyDb(thread);
+        //  Enable back error injection disabled for verification
+        if (db_fault_injection_fs_) {
+          db_fault_injection_fs_->EnableAllThreadLocalErrorInjection();
+        }
         if (thread->shared->ShouldStopTest()) {
           break;
         }
@@ -836,15 +1657,83 @@ void StressTest::OperateDb(ThreadState* thread) {
       if (thread->rand.OneInOpt(FLAGS_manual_wal_flush_one_in)) {
         bool sync = thread->rand.OneIn(2) ? true : false;
         Status s = db_->FlushWAL(sync);
-        if (!s.ok() && !(sync && s.IsNotSupported())) {
+        if (!s.ok() && !IsErrorInjectedAndRetryable(s) &&
+            !(sync && s.IsNotSupported())) {
           fprintf(stderr, "FlushWAL(sync=%s) failed: %s\n",
                   (sync ? "true" : "false"), s.ToString().c_str());
         }
       }
 
+      if (thread->rand.OneInOpt(FLAGS_lock_wal_one_in)) {
+        Status s = db_->LockWAL();
+        if (!s.ok() && !IsErrorInjectedAndRetryable(s)) {
+          fprintf(stderr, "LockWAL() failed: %s\n", s.ToString().c_str());
+        } else if (s.ok()) {
+          //  Temporarily disable error injection for verification
+          if (db_fault_injection_fs_) {
+            db_fault_injection_fs_->DisableAllThreadLocalErrorInjection();
+          }
+
+          // Verify no writes during LockWAL
+          auto old_seqno = db_->GetLatestSequenceNumber();
+          // And also that WAL is not changed during LockWAL()
+          std::unique_ptr<WalFile> old_wal;
+          s = db_->GetCurrentWalFile(&old_wal);
+          if (!s.ok()) {
+            fprintf(stderr, "GetCurrentWalFile() failed: %s\n",
+                    s.ToString().c_str());
+          } else {
+            // Yield for a while
+            do {
+              std::this_thread::yield();
+            } while (thread->rand.OneIn(2));
+            // Current WAL and size should not have changed
+            std::unique_ptr<WalFile> new_wal;
+            s = db_->GetCurrentWalFile(&new_wal);
+            if (!s.ok()) {
+              fprintf(stderr, "GetCurrentWalFile() failed: %s\n",
+                      s.ToString().c_str());
+            } else {
+              if (old_wal->LogNumber() != new_wal->LogNumber()) {
+                fprintf(stderr,
+                        "Failed: WAL number changed during LockWAL(): %" PRIu64
+                        " to %" PRIu64 "\n",
+                        old_wal->LogNumber(), new_wal->LogNumber());
+              }
+              if (old_wal->SizeFileBytes() != new_wal->SizeFileBytes()) {
+                fprintf(stderr,
+                        "Failed: WAL %" PRIu64
+                        " size changed during LockWAL(): %" PRIu64
+                        " to %" PRIu64 "\n",
+                        old_wal->LogNumber(), old_wal->SizeFileBytes(),
+                        new_wal->SizeFileBytes());
+              }
+            }
+          }
+          // Verify no writes during LockWAL
+          auto new_seqno = db_->GetLatestSequenceNumber();
+          if (old_seqno != new_seqno) {
+            fprintf(
+                stderr,
+                "Failure: latest seqno changed from %u to %u with WAL locked\n",
+                (unsigned)old_seqno, (unsigned)new_seqno);
+          }
+          // Verification done. Now unlock WAL
+          s = db_->UnlockWAL();
+          if (!s.ok()) {
+            fprintf(stderr, "UnlockWAL() failed: %s\n", s.ToString().c_str());
+          }
+
+          //  Enable back error injection disabled for verification
+          if (db_fault_injection_fs_) {
+            db_fault_injection_fs_->EnableAllThreadLocalErrorInjection();
+          }
+        }
+      }
+
       if (thread->rand.OneInOpt(FLAGS_sync_wal_one_in)) {
         Status s = db_->SyncWAL();
-        if (!s.ok() && !s.IsNotSupported()) {
+        if (!s.ok() && !s.IsNotSupported() && !IsErrorInjectedAndRetryable(s)) {
           fprintf(stderr, "SyncWAL() failed: %s\n", s.ToString().c_str());
         }
       }
@@ -867,66 +1756,107 @@ void StressTest::OperateDb(ThreadState* thread) {
         }
       }
 
+      if (thread->rand.OneInOpt(FLAGS_promote_l0_one_in)) {
+        TestPromoteL0(thread, column_family);
+      }
+
       std::vector<int> rand_column_families =
           GenerateColumnFamilies(FLAGS_column_families, rand_column_family);
 
       if (thread->rand.OneInOpt(FLAGS_flush_one_in)) {
-        Status status = TestFlush(rand_column_families);
-        if (!status.ok()) {
-          fprintf(stdout, "Unable to perform Flush(): %s\n",
-                  status.ToString().c_str());
+        TestFlush(thread, rand_column_families);
+      }
+
+      if (thread->rand.OneInOpt(FLAGS_get_live_files_apis_one_in)) {
+        Status s_1 = TestGetLiveFiles();
+        ProcessStatus(shared, "GetLiveFiles", s_1);
+        Status s_2 = TestGetLiveFilesMetaData();
+        ProcessStatus(shared, "GetLiveFilesMetaData", s_2);
+        // TODO: enable again after making `GetLiveFilesStorageInfo()`
+        // compatible with `Options::recycle_log_file_num`
+        if (FLAGS_recycle_log_file_num == 0) {
+          Status s_3 = TestGetLiveFilesStorageInfo();
+          ProcessStatus(shared, "GetLiveFilesStorageInfo", s_3);
         }
       }
 
-#ifndef ROCKSDB_LITE
-      // Verify GetLiveFiles with a 1 in N chance.
-      if (thread->rand.OneInOpt(FLAGS_get_live_files_one_in) &&
-          !FLAGS_write_fault_one_in) {
-        Status status = VerifyGetLiveFiles();
-        if (!status.ok()) {
-          VerificationAbort(shared, "VerifyGetLiveFiles status not OK", status);
-        }
+      if (thread->rand.OneInOpt(FLAGS_get_all_column_family_metadata_one_in)) {
+        Status status = TestGetAllColumnFamilyMetaData();
+        ProcessStatus(shared, "GetAllColumnFamilyMetaData", status);
       }
 
-      // Verify GetSortedWalFiles with a 1 in N chance.
       if (thread->rand.OneInOpt(FLAGS_get_sorted_wal_files_one_in)) {
-        Status status = VerifyGetSortedWalFiles();
-        if (!status.ok()) {
-          VerificationAbort(shared, "VerifyGetSortedWalFiles status not OK",
-                            status);
-        }
+        Status status = TestGetSortedWalFiles();
+        ProcessStatus(shared, "GetSortedWalFiles", status);
       }
 
-      // Verify GetCurrentWalFile with a 1 in N chance.
       if (thread->rand.OneInOpt(FLAGS_get_current_wal_file_one_in)) {
-        Status status = VerifyGetCurrentWalFile();
-        if (!status.ok()) {
-          VerificationAbort(shared, "VerifyGetCurrentWalFile status not OK",
-                            status);
-        }
+        Status status = TestGetCurrentWalFile();
+        ProcessStatus(shared, "GetCurrentWalFile", status);
       }
-#endif  // !ROCKSDB_LITE
+
+      if (thread->rand.OneInOpt(FLAGS_reset_stats_one_in)) {
+        Status status = TestResetStats();
+        ProcessStatus(shared, "ResetStats", status);
+      }
 
       if (thread->rand.OneInOpt(FLAGS_pause_background_one_in)) {
         Status status = TestPauseBackground(thread);
-        if (!status.ok()) {
-          VerificationAbort(
-              shared, "Pause/ContinueBackgroundWork status not OK", status);
-        }
+        ProcessStatus(shared, "Pause/ContinueBackgroundWork", status);
       }
 
-#ifndef ROCKSDB_LITE
+      if (thread->rand.OneInOpt(FLAGS_disable_file_deletions_one_in)) {
+        Status status = TestDisableFileDeletions(thread);
+        ProcessStatus(shared, "TestDisableFileDeletions", status);
+      }
+
+      if (thread->rand.OneInOpt(FLAGS_disable_manual_compaction_one_in)) {
+        Status status = TestDisableManualCompaction(thread);
+        ProcessStatus(shared, "TestDisableManualCompaction", status);
+      }
+
+      if (thread->rand.OneInOpt(FLAGS_abort_and_resume_compactions_one_in)) {
+        Status status = TestAbortAndResumeCompactions(thread);
+        ProcessStatus(shared, "TestAbortAndResumeCompactions", status);
+      }
+
       if (thread->rand.OneInOpt(FLAGS_verify_checksum_one_in)) {
+        ThreadStatusUtil::SetEnableTracking(FLAGS_enable_thread_tracking);
+        ThreadStatusUtil::SetThreadOperation(
+            ThreadStatus::OperationType::OP_VERIFY_DB_CHECKSUM);
         Status status = db_->VerifyChecksum();
-        if (!status.ok()) {
-          VerificationAbort(shared, "VerifyChecksum status not OK", status);
-        }
+        ThreadStatusUtil::ResetThreadStatus();
+        ProcessStatus(shared, "VerifyChecksum", status);
+      }
+
+      if (thread->rand.OneInOpt(FLAGS_verify_file_checksums_one_in)) {
+        ThreadStatusUtil::SetEnableTracking(FLAGS_enable_thread_tracking);
+        ThreadStatusUtil::SetThreadOperation(
+            ThreadStatus::OperationType::OP_VERIFY_FILE_CHECKSUMS);
+        Status status = db_->VerifyFileChecksums(read_opts);
+        ThreadStatusUtil::ResetThreadStatus();
+        ProcessStatus(shared, "VerifyFileChecksums", status);
       }
 
       if (thread->rand.OneInOpt(FLAGS_get_property_one_in)) {
+        // TestGetProperty doesn't return status for us to tell whether it has
+        // failed due to injected error. So we disable fault injection to avoid
+        // false positive
+        if (db_fault_injection_fs_) {
+          db_fault_injection_fs_->DisableAllThreadLocalErrorInjection();
+        }
+
         TestGetProperty(thread);
+
+        if (db_fault_injection_fs_) {
+          db_fault_injection_fs_->EnableAllThreadLocalErrorInjection();
+        }
       }
-#endif
+
+      if (thread->rand.OneInOpt(FLAGS_get_properties_of_all_tables_one_in)) {
+        Status status = TestGetPropertiesOfAllTables();
+        ProcessStatus(shared, "TestGetPropertiesOfAllTables", status);
+      }
 
       std::vector<int64_t> rand_keys = GenerateKeys(rand_key);
 
@@ -940,46 +1870,43 @@ void StressTest::OperateDb(ThreadState* thread) {
         uint64_t total_size = 0;
         if (FLAGS_backup_max_size > 0) {
           std::vector<FileAttributes> files;
-          db_stress_env->GetChildrenFileAttributes(FLAGS_db, &files);
+          GetDbEnv()->GetChildrenFileAttributes(GetDbPath(), &files);
           for (auto& file : files) {
             total_size += file.size_bytes;
           }
         }
 
         if (total_size <= FLAGS_backup_max_size) {
-          Status s = TestBackupRestore(thread, rand_column_families, rand_keys);
-          if (!s.ok()) {
-            VerificationAbort(shared, "Backup/restore gave inconsistent state",
-                              s);
+          // TODO(hx235): enable error injection with
+          // backup/restore after fixing the various issues it surfaces
+          if (db_fault_injection_fs_) {
+            db_fault_injection_fs_->DisableAllThreadLocalErrorInjection();
           }
+          Status s = TestBackupRestore(thread, rand_column_families, rand_keys);
+          if (db_fault_injection_fs_) {
+            db_fault_injection_fs_->EnableAllThreadLocalErrorInjection();
+          }
+          ProcessStatus(shared, "Backup/restore", s);
         }
       }
 
       if (thread->rand.OneInOpt(FLAGS_checkpoint_one_in)) {
         Status s = TestCheckpoint(thread, rand_column_families, rand_keys);
-        if (!s.ok()) {
-          VerificationAbort(shared, "Checkpoint gave inconsistent state", s);
-        }
+        ProcessStatus(shared, "Checkpoint", s);
       }
 
-#ifndef ROCKSDB_LITE
       if (thread->rand.OneInOpt(FLAGS_approximate_size_one_in)) {
         Status s =
             TestApproximateSize(thread, i, rand_column_families, rand_keys);
-        if (!s.ok()) {
-          VerificationAbort(shared, "ApproximateSize Failed", s);
-        }
+        ProcessStatus(shared, "ApproximateSize", s);
       }
-#endif  // !ROCKSDB_LITE
       if (thread->rand.OneInOpt(FLAGS_acquire_snapshot_one_in)) {
         TestAcquireSnapshot(thread, rand_column_family, keystr, i);
       }
 
       /*always*/ {
         Status s = MaybeReleaseSnapshots(thread, i);
-        if (!s.ok()) {
-          VerificationAbort(shared, "Snapshot gave inconsistent state", s);
-        }
+        ProcessStatus(shared, "Snapshot", s);
       }
 
       // Assign timestamps if necessary.
@@ -991,6 +1918,16 @@ void StressTest::OperateDb(ThreadState* thread) {
         read_opts.timestamp = &read_ts;
       }
 
+      if (thread->rand.OneInOpt(FLAGS_key_may_exist_one_in)) {
+        TestKeyMayExist(thread, read_opts, rand_column_families, rand_keys);
+      }
+      // Historical expected-state restore replays exactly
+      // `db->GetLatestSequenceNumber() - saved_seqno_` write ops from the
+      // trace. Missing trace entries are fatal, while extra suffix entries are
+      // tolerated. Keep fault injection disabled during user writes until each
+      // injected failure mode is audited against that contract.
+      bool disable_fault_injection_during_user_write =
+          db_fault_injection_fs_ && MightHaveUnsyncedDataLoss();
       int prob_op = thread->rand.Uniform(100);
       // Reset this in case we pick something other than a read op. We don't
       // want to use a stale value when deciding at the beginning of the loop
@@ -998,7 +1935,27 @@ void StressTest::OperateDb(ThreadState* thread) {
       if (prob_op >= 0 && prob_op < static_cast<int>(FLAGS_readpercent)) {
         assert(0 <= prob_op);
         // OPERATION read
-        if (FLAGS_use_multiget) {
+        ThreadStatusUtil::SetEnableTracking(FLAGS_enable_thread_tracking);
+        if (FLAGS_use_multi_get_entity) {
+          constexpr uint64_t max_batch_size = 64;
+          const uint64_t batch_size = std::min(
+              static_cast<uint64_t>(thread->rand.Uniform(max_batch_size)) + 1,
+              ops_per_open - i);
+          assert(batch_size >= 1);
+          assert(batch_size <= max_batch_size);
+          assert(i + batch_size <= ops_per_open);
+
+          rand_keys = GenerateNKeys(thread, static_cast<int>(batch_size), i);
+          ThreadStatusUtil::SetThreadOperation(
+              ThreadStatus::OperationType::OP_MULTIGETENTITY);
+          TestMultiGetEntity(thread, read_opts, rand_column_families,
+                             rand_keys);
+          i += batch_size - 1;
+        } else if (FLAGS_use_get_entity) {
+          ThreadStatusUtil::SetThreadOperation(
+              ThreadStatus::OperationType::OP_GETENTITY);
+          TestGetEntity(thread, read_opts, rand_column_families, rand_keys);
+        } else if (FLAGS_use_multiget) {
           // Leave room for one more iteration of the loop with a single key
           // batch. This is to ensure that each thread does exactly the same
           // number of ops
@@ -1008,11 +1965,16 @@ void StressTest::OperateDb(ThreadState* thread) {
           // If its the last iteration, ensure that multiget_batch_size is 1
           multiget_batch_size = std::max(multiget_batch_size, 1);
           rand_keys = GenerateNKeys(thread, multiget_batch_size, i);
+          ThreadStatusUtil::SetThreadOperation(
+              ThreadStatus::OperationType::OP_MULTIGET);
           TestMultiGet(thread, read_opts, rand_column_families, rand_keys);
           i += multiget_batch_size - 1;
         } else {
+          ThreadStatusUtil::SetThreadOperation(
+              ThreadStatus::OperationType::OP_GET);
           TestGet(thread, read_opts, rand_column_families, rand_keys);
         }
+        ThreadStatusUtil::ResetThreadStatus();
       } else if (prob_op < prefix_bound) {
         assert(static_cast<int>(FLAGS_readpercent) <= prob_op);
         // OPERATION prefix scan
@@ -1024,31 +1986,81 @@ void StressTest::OperateDb(ThreadState* thread) {
       } else if (prob_op < write_bound) {
         assert(prefix_bound <= prob_op);
         // OPERATION write
+        if (disable_fault_injection_during_user_write) {
+          db_fault_injection_fs_->DisableAllThreadLocalErrorInjection();
+        }
         TestPut(thread, write_opts, read_opts, rand_column_families, rand_keys,
                 value);
+        if (disable_fault_injection_during_user_write) {
+          db_fault_injection_fs_->EnableAllThreadLocalErrorInjection();
+        }
       } else if (prob_op < del_bound) {
         assert(write_bound <= prob_op);
         // OPERATION delete
+        if (disable_fault_injection_during_user_write) {
+          db_fault_injection_fs_->DisableAllThreadLocalErrorInjection();
+        }
         TestDelete(thread, write_opts, rand_column_families, rand_keys);
+        if (disable_fault_injection_during_user_write) {
+          db_fault_injection_fs_->EnableAllThreadLocalErrorInjection();
+        }
       } else if (prob_op < delrange_bound) {
         assert(del_bound <= prob_op);
         // OPERATION delete range
+        if (disable_fault_injection_during_user_write) {
+          db_fault_injection_fs_->DisableAllThreadLocalErrorInjection();
+        }
         TestDeleteRange(thread, write_opts, rand_column_families, rand_keys);
+        if (disable_fault_injection_during_user_write) {
+          db_fault_injection_fs_->EnableAllThreadLocalErrorInjection();
+        }
       } else if (prob_op < iterate_bound) {
         assert(delrange_bound <= prob_op);
         // OPERATION iterate
-        if (!FLAGS_skip_verifydb &&
-            thread->rand.OneInOpt(
-                FLAGS_verify_iterator_with_expected_state_one_in)) {
+        if (FLAGS_use_multiscan) {
+          int num_seeks = static_cast<int>(
+              std::min(static_cast<uint64_t>(thread->rand.Uniform(64)),
+                       static_cast<uint64_t>(FLAGS_ops_per_thread - i - 1)));
+          // Generate 2x num_seeks random keys, as each scan has a start key
+          // and an upper bound
+          rand_keys = GenerateNKeys(thread, num_seeks * 2, i);
+          i += num_seeks - 1;
+          ThreadStatusUtil::SetEnableTracking(FLAGS_enable_thread_tracking);
+          ThreadStatusUtil::SetThreadOperation(
+              ThreadStatus::OperationType::OP_DBITERATOR);
+          Status s;
+          s = TestMultiScan(thread, read_opts, rand_column_families, rand_keys);
+          ThreadStatusUtil::ResetThreadStatus();
+        } else if (!FLAGS_skip_verifydb &&
+                   thread->rand.OneInOpt(
+                       FLAGS_verify_iterator_with_expected_state_one_in)) {
+          ThreadStatusUtil::SetEnableTracking(FLAGS_enable_thread_tracking);
+          ThreadStatusUtil::SetThreadOperation(
+              ThreadStatus::OperationType::OP_DBITERATOR);
           TestIterateAgainstExpected(thread, read_opts, rand_column_families,
                                      rand_keys);
+          ThreadStatusUtil::ResetThreadStatus();
         } else {
-          int num_seeks = static_cast<int>(
-              std::min(static_cast<uint64_t>(thread->rand.Uniform(4)),
-                       FLAGS_ops_per_thread - i - 1));
+          int num_seeks = static_cast<int>(std::min(
+              std::max(static_cast<uint64_t>(thread->rand.Uniform(4)),
+                       static_cast<uint64_t>(1)),
+              std::max(static_cast<uint64_t>(FLAGS_ops_per_thread - i - 1),
+                       static_cast<uint64_t>(1))));
           rand_keys = GenerateNKeys(thread, num_seeks, i);
           i += num_seeks - 1;
-          TestIterate(thread, read_opts, rand_column_families, rand_keys);
+          ThreadStatusUtil::SetEnableTracking(FLAGS_enable_thread_tracking);
+          ThreadStatusUtil::SetThreadOperation(
+              ThreadStatus::OperationType::OP_DBITERATOR);
+          Status s;
+          if (FLAGS_use_multi_cf_iterator && FLAGS_use_attribute_group) {
+            s = TestIterateAttributeGroups(thread, read_opts,
+                                           rand_column_families, rand_keys);
+            ProcessStatus(shared, "IterateAttributeGroups", s);
+          } else {
+            s = TestIterate(thread, read_opts, rand_column_families, rand_keys);
+            ProcessStatus(shared, "Iterate", s);
+          }
+          ThreadStatusUtil::ResetThreadStatus();
         }
       } else {
         assert(iterate_bound <= prob_op);
@@ -1056,6 +2068,12 @@ void StressTest::OperateDb(ThreadState* thread) {
       }
       thread->stats.FinishedSingleOp();
     }
+
+#ifndef NDEBUG
+    if (db_fault_injection_fs_) {
+      db_fault_injection_fs_->DisableAllThreadLocalErrorInjection();
+    }
+#endif  // NDEBUG
   }
   while (!thread->snapshot_queue.empty()) {
     db_->ReleaseSnapshot(thread->snapshot_queue.front().second.snapshot);
@@ -1066,7 +2084,6 @@ void StressTest::OperateDb(ThreadState* thread) {
   thread->stats.Stop();
 }
 
-#ifndef ROCKSDB_LITE
 // Generated a list of keys that close to boundaries of SST keys.
 // If there isn't any SST file in the DB, return empty list.
 std::vector<std::string> StressTest::GetWhiteBoxKeys(ThreadState* thread,
@@ -1125,7 +2142,6 @@ std::vector<std::string> StressTest::GetWhiteBoxKeys(ThreadState* thread,
   }
   return ret;
 }
-#endif  // !ROCKSDB_LITE
 
 // Given a key K, this creates an iterator which scans to K and then
 // does a random sequence of Next/Prev operations.
@@ -1133,10 +2149,81 @@ Status StressTest::TestIterate(ThreadState* thread,
                                const ReadOptions& read_opts,
                                const std::vector<int>& rand_column_families,
                                const std::vector<int64_t>& rand_keys) {
+  auto new_iter_func = [&rand_column_families, this](const ReadOptions& ro) {
+    if (FLAGS_use_multi_cf_iterator) {
+      std::vector<ColumnFamilyHandle*> cfhs;
+      cfhs.reserve(rand_column_families.size());
+      for (auto cf_index : rand_column_families) {
+        cfhs.emplace_back(column_families_[cf_index]);
+      }
+      assert(!cfhs.empty());
+      return db_->NewCoalescingIterator(ro, cfhs);
+    } else {
+      ColumnFamilyHandle* const cfh = column_families_[rand_column_families[0]];
+      assert(cfh);
+      return std::unique_ptr<Iterator>(db_->NewIterator(ro, cfh));
+    }
+  };
+
+  auto verify_func = [](Iterator* iter) {
+    if (!VerifyWideColumns(iter->value(), iter->columns())) {
+      fprintf(stderr,
+              "Value and columns inconsistent for iterator: value: %s, "
+              "columns: %s\n",
+              iter->value().ToString(/* hex */ true).c_str(),
+              WideColumnsToHex(iter->columns()).c_str());
+      return false;
+    }
+    return true;
+  };
+
+  return TestIterateImpl<Iterator>(thread, read_opts, rand_column_families,
+                                   rand_keys, new_iter_func, verify_func);
+}
+
+Status StressTest::TestIterateAttributeGroups(
+    ThreadState* thread, const ReadOptions& read_opts,
+    const std::vector<int>& rand_column_families,
+    const std::vector<int64_t>& rand_keys) {
+  auto new_iter_func = [&rand_column_families, this](const ReadOptions& ro) {
+    assert(FLAGS_use_multi_cf_iterator);
+    std::vector<ColumnFamilyHandle*> cfhs;
+    cfhs.reserve(rand_column_families.size());
+    for (auto cf_index : rand_column_families) {
+      cfhs.emplace_back(column_families_[cf_index]);
+    }
+    assert(!cfhs.empty());
+    return db_->NewAttributeGroupIterator(ro, cfhs);
+  };
+  auto verify_func = [](AttributeGroupIterator* iter) {
+    if (!VerifyIteratorAttributeGroups(iter->attribute_groups())) {
+      // TODO - print out attribute group values
+      fprintf(stderr,
+              "one of the columns in the attribute groups inconsistent for "
+              "iterator\n");
+      return false;
+    }
+    return true;
+  };
+
+  return TestIterateImpl<AttributeGroupIterator>(
+      thread, read_opts, rand_column_families, rand_keys, new_iter_func,
+      verify_func);
+}
+
+Status StressTest::TestMultiScan(ThreadState* thread,
+                                 const ReadOptions& read_opts,
+                                 const std::vector<int>& rand_column_families,
+                                 const std::vector<int64_t>& rand_keys) {
+  size_t num_scans = rand_keys.size() / 2;
   assert(!rand_column_families.empty());
   assert(!rand_keys.empty());
 
+  ThreadStatus::OperationType cur_op_type =
+      ThreadStatusUtil::GetThreadOperation();
+  ThreadStatusUtil::SetThreadOperation(ThreadStatus::OperationType::OP_UNKNOWN);
   ManagedSnapshot snapshot_guard(db_);
+  ThreadStatusUtil::SetThreadOperation(cur_op_type);
 
   ReadOptions ro = read_opts;
   ro.snapshot = snapshot_guard.snapshot();
@@ -1145,95 +2232,73 @@ Status StressTest::TestIterate(ThreadState* thread,
   Slice read_ts_slice;
   MaybeUseOlderTimestampForRangeScan(thread, read_ts_str, read_ts_slice, ro);
 
-  bool expect_total_order = false;
-  if (thread->rand.OneIn(16)) {
-    // When prefix extractor is used, it's useful to cover total order seek.
-    ro.total_order_seek = true;
-    expect_total_order = true;
-  } else if (thread->rand.OneIn(4)) {
-    ro.total_order_seek = false;
-    ro.auto_prefix_mode = true;
-    expect_total_order = true;
-  } else if (options_.prefix_extractor.get() == nullptr) {
-    expect_total_order = true;
+  std::vector<std::string> start_key_strs;
+  std::vector<std::string> end_key_strs;
+  // TODO support reverse BytewiseComparator in the stress test
+  MultiScanArgs scan_opts(options_.comparator);
+  scan_opts.use_async_io =
+      FLAGS_multiscan_use_async_io &&
+      CheckFSFeatureSupport(options_.env->GetFileSystem().get(),
+                            FSSupportedOps::kAsyncIO);
+  std::shared_ptr<IODispatcher> io_dispatcher;
+  if (FLAGS_multiscan_max_prefetch_memory_bytes > 0) {
+    IODispatcherOptions io_opts;
+    io_opts.max_prefetch_memory_bytes =
+        FLAGS_multiscan_max_prefetch_memory_bytes;
+    io_dispatcher.reset(NewIODispatcher(io_opts));
+    scan_opts.io_dispatcher = io_dispatcher;
   }
+  start_key_strs.reserve(num_scans);
+  end_key_strs.reserve(num_scans);
 
-  std::string upper_bound_str;
-  Slice upper_bound;
-  if (thread->rand.OneIn(16)) {
-    // With a 1/16 chance, set an iterator upper bound.
-    // Note: upper_bound can be smaller than the seek key.
-    const int64_t rand_upper_key = GenerateOneKey(thread, FLAGS_ops_per_thread);
-    upper_bound_str = Key(rand_upper_key);
-    upper_bound = Slice(upper_bound_str);
-    ro.iterate_upper_bound = &upper_bound;
-  }
-  std::string lower_bound_str;
-  Slice lower_bound;
-  if (thread->rand.OneIn(16)) {
-    // With a 1/16 chance, enable iterator lower bound.
-    // Note: lower_bound can be greater than the seek key.
-    const int64_t rand_lower_key = GenerateOneKey(thread, FLAGS_ops_per_thread);
-    lower_bound_str = Key(rand_lower_key);
-    lower_bound = Slice(lower_bound_str);
-    ro.iterate_lower_bound = &lower_bound;
-  }
-
-  ColumnFamilyHandle* const cfh = column_families_[rand_column_families[0]];
-  assert(cfh);
-
-  std::unique_ptr<Iterator> iter(db_->NewIterator(ro, cfh));
-
-  std::vector<std::string> key_strs;
-  if (thread->rand.OneIn(16)) {
-    // Generate keys close to lower or upper bound of SST files.
-    key_strs = GetWhiteBoxKeys(thread, db_, cfh, rand_keys.size());
-  }
-  if (key_strs.empty()) {
-    // Use the random keys passed in.
-    for (int64_t rkey : rand_keys) {
-      key_strs.push_back(Key(rkey));
-    }
+  // Will be initialized before Seek() below.
+  Slice ub;
+  ro.iterate_upper_bound = &ub;
+  for (size_t i = 0; i < num_scans * 2; i += 2) {
+    assert(rand_keys[i] <= rand_keys[i + 1]);
+    start_key_strs.emplace_back(Key(rand_keys[i]));
+    end_key_strs.emplace_back(Key(rand_keys[i + 1]));
+    scan_opts.insert(Slice(start_key_strs.back()), Slice(end_key_strs.back()));
   }
 
   std::string op_logs;
-  constexpr size_t kOpLogsLimit = 10000;
+  ro.pin_data = thread->rand.OneIn(2);
+  ro.background_purge_on_iterator_cleanup = thread->rand.OneIn(2);
 
-  for (const std::string& key_str : key_strs) {
+  assert(options_.prefix_extractor.get() == nullptr);
+
+  std::unique_ptr<Iterator> iter;
+  iter.reset(db_->NewIterator(ro, column_families_[rand_column_families[0]]));
+  iter->Prepare(scan_opts);
+
+  constexpr size_t kOpLogsLimit = 50000;
+
+  auto verify_func = [](Iterator* iterator) {
+    if (!VerifyWideColumns(iterator->value(), iterator->columns())) {
+      fprintf(stderr,
+              "Value and columns inconsistent for iterator: value: %s, "
+              "columns: %s\n",
+              iterator->value().ToString(/* hex */ true).c_str(),
+              WideColumnsToHex(iterator->columns()).c_str());
+      return false;
+    }
+    return true;
+  };
+
+  // Sometimes stop before draining all prefetched blocks, matching applications
+  // that stop after a bounded number of results. In one mode the whole prepared
+  // MultiScan is abandoned. In the other mode only the current range is
+  // stopped, so the next range's Seek() exercises releasing skipped blocks on
+  // the same prepared iterator.
+  const bool early_exit = thread->rand.OneIn(2);
+  const bool abandon_scan_after_early_exit =
+      early_exit && thread->rand.OneIn(2);
+  bool abandon_prepared_scan = false;
+
+  for (const ScanOptions& scan_opt : scan_opts.GetScanRanges()) {
     if (op_logs.size() > kOpLogsLimit) {
       // Shouldn't take too much memory for the history log. Clear it.
       op_logs = "(cleared...)\n";
-    }
-
-    if (ro.iterate_upper_bound != nullptr && thread->rand.OneIn(2)) {
-      // With a 1/2 chance, change the upper bound.
-      // It is possible that it is changed before first use, but there is no
-      // problem with that.
-      const int64_t rand_upper_key =
-          GenerateOneKey(thread, FLAGS_ops_per_thread);
-      upper_bound_str = Key(rand_upper_key);
-      upper_bound = Slice(upper_bound_str);
-    }
-    if (ro.iterate_lower_bound != nullptr && thread->rand.OneIn(4)) {
-      // With a 1/4 chance, change the lower bound.
-      // It is possible that it is changed before first use, but there is no
-      // problem with that.
-      const int64_t rand_lower_key =
-          GenerateOneKey(thread, FLAGS_ops_per_thread);
-      lower_bound_str = Key(rand_lower_key);
-      lower_bound = Slice(lower_bound_str);
-    }
-
-    // Record some options to op_logs
-    op_logs += "total_order_seek: ";
-    op_logs += (ro.total_order_seek ? "1 " : "0 ");
-    op_logs += "auto_prefix_mode: ";
-    op_logs += (ro.auto_prefix_mode ? "1 " : "0 ");
-    if (ro.iterate_upper_bound != nullptr) {
-      op_logs += "ub: " + upper_bound.ToString(true) + " ";
-    }
-    if (ro.iterate_lower_bound != nullptr) {
-      op_logs += "lb: " + lower_bound.ToString(true) + " ";
     }
 
     // Set up an iterator, perform the same operations without bounds and with
@@ -1248,6 +2313,236 @@ Status StressTest::TestIterate(ThreadState* thread,
     cmp_ro.timestamp = ro.timestamp;
     cmp_ro.iter_start_ts = ro.iter_start_ts;
     cmp_ro.snapshot = snapshot_guard.snapshot();
+    cmp_ro.auto_refresh_iterator_with_snapshot =
+        ro.auto_refresh_iterator_with_snapshot;
+    cmp_ro.total_order_seek = true;
+
+    ColumnFamilyHandle* const cmp_cfh =
+        GetControlCfh(thread, rand_column_families[0]);
+    assert(cmp_cfh);
+
+    std::unique_ptr<Iterator> cmp_iter(db_->NewIterator(cmp_ro, cmp_cfh));
+
+    bool diverged = false;
+
+    assert(scan_opt.range.start);
+    assert(scan_opt.range.limit);
+    Slice key = scan_opt.range.start.value();
+    ub = scan_opt.range.limit.value();
+
+    LastIterateOp last_op;
+    iter->Seek(key);
+    cmp_iter->Seek(key);
+    last_op = kLastOpSeek;
+    op_logs += "S " + key.ToString(true) + " ";
+
+    if (iter->Valid() && ro.allow_unprepared_value) {
+      op_logs += "*";
+
+      if (!iter->PrepareValue()) {
+        assert(!iter->Valid());
+        assert(!iter->status().ok());
+      }
+    }
+
+    if (!iter->status().ok() && IsErrorInjectedAndRetryable(iter->status())) {
+      return iter->status();
+    } else if (!cmp_iter->status().ok() &&
+               IsErrorInjectedAndRetryable(cmp_iter->status())) {
+      return cmp_iter->status();
+    }
+
+    VerifyIterator(thread, cmp_cfh, ro, iter.get(), cmp_iter.get(), last_op,
+                   key, rand_column_families, op_logs, verify_func, &diverged);
+
+    uint64_t range_iterations = 0;
+    while (iter->Valid()) {
+      if (early_exit && range_iterations >= FLAGS_num_iterations) {
+        if (abandon_scan_after_early_exit) {
+          op_logs += "E";
+          abandon_prepared_scan = true;
+        } else {
+          op_logs += "R";
+        }
+        break;
+      }
+
+      iter->Next();
+      if (!diverged) {
+        assert(cmp_iter->Valid());
+        cmp_iter->Next();
+      }
+      op_logs += "N";
+      ++range_iterations;
+
+      if (iter->Valid() && ro.allow_unprepared_value) {
+        op_logs += "*";
+
+        if (!iter->PrepareValue()) {
+          assert(!iter->Valid());
+          assert(!iter->status().ok());
+        }
+      }
+
+      if (!iter->status().ok() && IsErrorInjectedAndRetryable(iter->status())) {
+        return iter->status();
+      } else if (!cmp_iter->status().ok() &&
+                 IsErrorInjectedAndRetryable(cmp_iter->status())) {
+        return cmp_iter->status();
+      }
+
+      VerifyIterator(thread, cmp_cfh, ro, iter.get(), cmp_iter.get(), last_op,
+                     key, rand_column_families, op_logs, verify_func,
+                     &diverged);
+
+      if (diverged) {
+        if (thread->shared->HasVerificationFailedYet()) {
+          const std::vector<ScanOptions>& scanoptions =
+              scan_opts.GetScanRanges();
+          for (const auto& t : scanoptions) {
+            fprintf(stdout, "Multiscan options: %s to %s \n",
+                    t.range.start.value().ToString(true).c_str(),
+                    t.range.limit.value().ToString(true).c_str());
+          }
+        }
+        break;
+      }
+    }
+
+    thread->stats.AddIterations(1);
+
+    op_logs += "; ";
+    if (diverged || abandon_prepared_scan) {
+      break;
+    }
+  }
+
+  return Status::OK();
+}
+
+template <typename IterType, typename NewIterFunc, typename VerifyFunc>
+Status StressTest::TestIterateImpl(ThreadState* thread,
+                                   const ReadOptions& read_opts,
+                                   const std::vector<int>& rand_column_families,
+                                   const std::vector<int64_t>& rand_keys,
+                                   NewIterFunc new_iter_func,
+                                   VerifyFunc verify_func) {
+  assert(!rand_column_families.empty());
+  assert(!rand_keys.empty());
+
+  ManagedSnapshot snapshot_guard(db_);
+
+  ReadOptions ro = read_opts;
+  ro.snapshot = snapshot_guard.snapshot();
+
+  std::string read_ts_str;
+  Slice read_ts_slice;
+  MaybeUseOlderTimestampForRangeScan(thread, read_ts_str, read_ts_slice, ro);
+
+  std::string op_logs;
+  ro.pin_data = thread->rand.OneIn(2);
+  ro.background_purge_on_iterator_cleanup = thread->rand.OneIn(2);
+
+  bool expect_total_order = false;
+  if (thread->rand.OneIn(16)) {
+    // When prefix extractor is used, it's useful to cover total order seek.
+    ro.total_order_seek = true;
+    expect_total_order = true;
+  } else if (thread->rand.OneIn(4)) {
+    ro.total_order_seek = thread->rand.OneIn(2);
+    ro.auto_prefix_mode = true;
+    expect_total_order = true;
+  } else if (options_.prefix_extractor.get() == nullptr) {
+    expect_total_order = true;
+  }
+  std::string upper_bound_str;
+  Slice upper_bound;
+  // Prefer no bound with no range query filtering; prefer bound with it
+  if (FLAGS_use_sqfc_for_range_queries ^ thread->rand.OneIn(16)) {
+    // Note: upper_bound can be smaller than the seek key.
+    const int64_t rand_upper_key = GenerateOneKey(thread, FLAGS_ops_per_thread);
+    upper_bound_str = Key(rand_upper_key);
+    upper_bound = Slice(upper_bound_str);
+    ro.iterate_upper_bound = &upper_bound;
+  }
+
+  std::string lower_bound_str;
+  Slice lower_bound;
+  if (FLAGS_use_sqfc_for_range_queries ^ thread->rand.OneIn(16)) {
+    // Note: lower_bound can be greater than the seek key.
+    const int64_t rand_lower_key = GenerateOneKey(thread, FLAGS_ops_per_thread);
+    lower_bound_str = Key(rand_lower_key);
+    lower_bound = Slice(lower_bound_str);
+    ro.iterate_lower_bound = &lower_bound;
+  }
+
+  if (FLAGS_use_sqfc_for_range_queries && ro.iterate_upper_bound &&
+      ro.iterate_lower_bound) {
+    ro.table_filter = sqfc_factory_->GetTableFilterForRangeQuery(
+        *ro.iterate_lower_bound, *ro.iterate_upper_bound);
+  }
+
+  std::unique_ptr<IterType> iter = new_iter_func(ro);
+
+  std::vector<std::string> key_strs;
+  if (thread->rand.OneIn(16)) {
+    // Generate keys close to lower or upper bound of SST files.
+    key_strs =
+        GetWhiteBoxKeys(thread, db_, column_families_[rand_column_families[0]],
+                        rand_keys.size());
+  }
+  if (key_strs.empty()) {
+    // Use the random keys passed in.
+    for (int64_t rkey : rand_keys) {
+      key_strs.push_back(Key(rkey));
+    }
+  }
+
+  constexpr size_t kOpLogsLimit = 10000;
+
+  for (const std::string& key_str : key_strs) {
+    if (op_logs.size() > kOpLogsLimit) {
+      // Shouldn't take too much memory for the history log. Clear it.
+      op_logs = "(cleared...)\n";
+    }
+
+    if (!FLAGS_use_sqfc_for_range_queries &&
+        ro.iterate_upper_bound != nullptr && thread->rand.OneIn(2)) {
+      // With a 1/2 chance, change the upper bound.
+      // Not compatible with sqfc range filter.
+      // It is possible that it is changed before first use, but there is no
+      // problem with that.
+      const int64_t rand_upper_key =
+          GenerateOneKey(thread, FLAGS_ops_per_thread);
+      upper_bound_str = Key(rand_upper_key);
+      upper_bound = Slice(upper_bound_str);
+    }
+    if (!FLAGS_use_sqfc_for_range_queries &&
+        ro.iterate_lower_bound != nullptr && thread->rand.OneIn(4)) {
+      // With a 1/4 chance, change the lower bound.
+      // Not compatible with sqfc range filter.
+      // It is possible that it is changed before first use, but there is no
+      // problem with that.
+      const int64_t rand_lower_key =
+          GenerateOneKey(thread, FLAGS_ops_per_thread);
+      lower_bound_str = Key(rand_lower_key);
+      lower_bound = Slice(lower_bound_str);
+    }
+
+    // Set up an iterator, perform the same operations without bounds and with
+    // total order seek, and compare the results. This is to identify bugs
+    // related to bounds, prefix extractor, or reseeking. Sometimes we are
+    // comparing iterators with the same set-up, and it doesn't hurt to check
+    // them to be equal.
+    //
+    // This `ReadOptions` is for validation purposes. Ignore
+    // `FLAGS_rate_limit_user_ops` to avoid slowing any validation.
+    ReadOptions cmp_ro;
+    cmp_ro.timestamp = ro.timestamp;
+    cmp_ro.iter_start_ts = ro.iter_start_ts;
+    cmp_ro.snapshot = snapshot_guard.snapshot();
+    cmp_ro.auto_refresh_iterator_with_snapshot =
+        ro.auto_refresh_iterator_with_snapshot;
     cmp_ro.total_order_seek = true;
 
     ColumnFamilyHandle* const cmp_cfh =
@@ -1260,20 +2555,36 @@ Status StressTest::TestIterate(ThreadState* thread,
 
     Slice key(key_str);
 
-    const bool support_seek_first_or_last = expect_total_order;
+    const bool support_seek_to_first =
+        expect_total_order && FLAGS_test_backward_scan;
+    const bool support_seek_to_last =
+        expect_total_order && FLAGS_test_backward_scan;
+    const bool support_seek_for_prev = FLAGS_test_backward_scan;
+
+    // Write-prepared and Write-unprepared and multi-cf-iterator do not support
+    // Refresh() yet.
+    if (!(FLAGS_use_txn && FLAGS_txn_write_policy != 0 /* write committed */) &&
+        !FLAGS_use_multi_cf_iterator && thread->rand.OneIn(4)) {
+      Status s = iter->Refresh(snapshot_guard.snapshot());
+      if (!s.ok() && IsErrorInjectedAndRetryable(s)) {
+        return s;
+      }
+      assert(s.ok());
+      op_logs += "Refresh ";
+    }
 
     LastIterateOp last_op;
-    if (support_seek_first_or_last && thread->rand.OneIn(100)) {
+    if (support_seek_to_first && thread->rand.OneIn(100)) {
       iter->SeekToFirst();
       cmp_iter->SeekToFirst();
       last_op = kLastOpSeekToFirst;
       op_logs += "STF ";
-    } else if (support_seek_first_or_last && thread->rand.OneIn(100)) {
+    } else if (support_seek_to_last && thread->rand.OneIn(100)) {
       iter->SeekToLast();
       cmp_iter->SeekToLast();
       last_op = kLastOpSeekToLast;
       op_logs += "STL ";
-    } else if (thread->rand.OneIn(8)) {
+    } else if (support_seek_for_prev && thread->rand.OneIn(8)) {
       iter->SeekForPrev(key);
       cmp_iter->SeekForPrev(key);
       last_op = kLastOpSeekForPrev;
@@ -1285,11 +2596,28 @@ Status StressTest::TestIterate(ThreadState* thread,
       op_logs += "S " + key.ToString(true) + " ";
     }
 
+    if (iter->Valid() && ro.allow_unprepared_value) {
+      op_logs += "*";
+
+      if (!iter->PrepareValue()) {
+        assert(!iter->Valid());
+        assert(!iter->status().ok());
+      }
+    }
+
+    if (!iter->status().ok() && IsErrorInjectedAndRetryable(iter->status())) {
+      return iter->status();
+    } else if (!cmp_iter->status().ok() &&
+               IsErrorInjectedAndRetryable(cmp_iter->status())) {
+      return cmp_iter->status();
+    }
+
     VerifyIterator(thread, cmp_cfh, ro, iter.get(), cmp_iter.get(), last_op,
-                   key, op_logs, &diverged);
+                   key, rand_column_families, op_logs, verify_func, &diverged);
 
     const bool no_reverse =
-        (FLAGS_memtablerep == "prefix_hash" && !expect_total_order);
+        (FLAGS_memtablerep == "prefix_hash" && !expect_total_order) ||
+        !FLAGS_test_backward_scan;
     for (uint64_t i = 0; i < FLAGS_num_iterations && iter->Valid(); ++i) {
       if (no_reverse || thread->rand.OneIn(2)) {
         iter->Next();
@@ -1309,8 +2637,25 @@ Status StressTest::TestIterate(ThreadState* thread,
 
       last_op = kLastOpNextOrPrev;
 
+      if (iter->Valid() && ro.allow_unprepared_value) {
+        op_logs += "*";
+
+        if (!iter->PrepareValue()) {
+          assert(!iter->Valid());
+          assert(!iter->status().ok());
+        }
+      }
+
+      if (!iter->status().ok() && IsErrorInjectedAndRetryable(iter->status())) {
+        return iter->status();
+      } else if (!cmp_iter->status().ok() &&
+                 IsErrorInjectedAndRetryable(cmp_iter->status())) {
+        return cmp_iter->status();
+      }
+
       VerifyIterator(thread, cmp_cfh, ro, iter.get(), cmp_iter.get(), last_op,
-                     key, op_logs, &diverged);
+                     key, rand_column_families, op_logs, verify_func,
+                     &diverged);
     }
 
     thread->stats.AddIterations(1);
@@ -1321,26 +2666,133 @@ Status StressTest::TestIterate(ThreadState* thread,
   return Status::OK();
 }
 
-#ifndef ROCKSDB_LITE
-// Test the return status of GetLiveFiles.
-Status StressTest::VerifyGetLiveFiles() const {
+Status StressTest::TestGetLiveFiles() const {
   std::vector<std::string> live_file;
   uint64_t manifest_size = 0;
   return db_->GetLiveFiles(live_file, &manifest_size);
 }
 
-// Test the return status of GetSortedWalFiles.
-Status StressTest::VerifyGetSortedWalFiles() const {
-  VectorLogPtr log_ptr;
+Status StressTest::TestGetLiveFilesMetaData() const {
+  std::vector<LiveFileMetaData> live_file_metadata;
+  db_->GetLiveFilesMetaData(&live_file_metadata);
+  return Status::OK();
+}
+
+Status StressTest::TestGetLiveFilesStorageInfo() const {
+  std::vector<LiveFileStorageInfo> live_file_storage_info;
+  LiveFilesStorageInfoOptions live_opts;
+  live_opts.atomic_flush = FLAGS_checkpoint_atomic_flush;
+  return db_->GetLiveFilesStorageInfo(live_opts, &live_file_storage_info);
+}
+
+Status StressTest::TestGetAllColumnFamilyMetaData() const {
+  std::vector<ColumnFamilyMetaData> all_cf_metadata;
+  db_->GetAllColumnFamilyMetaData(&all_cf_metadata);
+  return Status::OK();
+}
+
+Status StressTest::TestGetSortedWalFiles() const {
+  VectorWalPtr log_ptr;
   return db_->GetSortedWalFiles(log_ptr);
 }
 
-// Test the return status of GetCurrentWalFile.
-Status StressTest::VerifyGetCurrentWalFile() const {
-  std::unique_ptr<LogFile> cur_wal_file;
+Status StressTest::TestGetCurrentWalFile() const {
+  std::unique_ptr<WalFile> cur_wal_file;
   return db_->GetCurrentWalFile(&cur_wal_file);
 }
-#endif  // !ROCKSDB_LITE
+
+void StressTest::DumpIteratorDivergenceDiagnostics(
+    ColumnFamilyHandle* cmp_cfh, const ReadOptions& ro, const Slice& seek_key,
+    const std::vector<int>& rand_column_families) const {
+  fprintf(stderr,
+          "Iterator divergence diagnostics: seek_key=%s, cmp_cf=%s, "
+          "prefix_extractor=%d, using_udi=%d, use_multi_cf_iterator=%d, "
+          "selected_cf_count=%zu\n",
+          seek_key.ToString(/*hex=*/true).c_str(), cmp_cfh->GetName().c_str(),
+          static_cast<int>(options_.prefix_extractor != nullptr),
+          static_cast<int>(ro.table_index_factory != nullptr),
+          static_cast<int>(FLAGS_use_multi_cf_iterator),
+          rand_column_families.size());
+
+  auto make_debug_iter =
+      [&](const ReadOptions& debug_ro,
+          bool use_multi_cf_iter) -> std::unique_ptr<Iterator> {
+    if (use_multi_cf_iter) {
+      std::vector<ColumnFamilyHandle*> cfhs;
+      cfhs.reserve(rand_column_families.size());
+      for (int cf_index : rand_column_families) {
+        cfhs.emplace_back(column_families_[cf_index]);
+      }
+      return db_->NewCoalescingIterator(debug_ro, cfhs);
+    }
+    return std::unique_ptr<Iterator>(db_->NewIterator(debug_ro, cmp_cfh));
+  };
+
+  auto dump_debug_iter = [&](const char* label, const ReadOptions& debug_ro,
+                             bool use_multi_cf_iter) {
+    auto debug_iter = make_debug_iter(debug_ro, use_multi_cf_iter);
+    debug_iter->Seek(seek_key);
+
+    std::string sv_number;
+    const Status prop_s = debug_iter->GetProperty(
+        "rocksdb.iterator.super-version-number", &sv_number);
+    fprintf(stderr,
+            "%s before_prepare: valid=%d, status=%s, sv=%s, key=%s, "
+            "value_size=%zu\n",
+            label, static_cast<int>(debug_iter->Valid()),
+            debug_iter->status().ToString().c_str(),
+            prop_s.ok() ? sv_number.c_str() : prop_s.ToString().c_str(),
+            debug_iter->Valid() ? debug_iter->key().ToString(true).c_str()
+                                : "(invalid)",
+            debug_iter->Valid() ? debug_iter->value().size() : 0U);
+
+    if (!debug_iter->Valid()) {
+      return;
+    }
+
+    bool prepared = true;
+    if (debug_ro.allow_unprepared_value) {
+      prepared = debug_iter->PrepareValue();
+    }
+
+    fprintf(stderr,
+            "%s after_prepare: prepared=%d, valid=%d, status=%s, key=%s, "
+            "value_size=%zu, columns=%zu, wide_columns_ok=%d\n",
+            label, static_cast<int>(prepared),
+            static_cast<int>(debug_iter->Valid()),
+            debug_iter->status().ToString().c_str(),
+            debug_iter->Valid() ? debug_iter->key().ToString(true).c_str()
+                                : "(invalid)",
+            debug_iter->Valid() ? debug_iter->value().size() : 0U,
+            debug_iter->Valid() ? debug_iter->columns().size() : 0U,
+            static_cast<int>(
+                debug_iter->Valid() &&
+                VerifyWideColumns(debug_iter->value(), debug_iter->columns())));
+  };
+
+  ReadOptions standard_ro = ro;
+  standard_ro.table_index_factory = nullptr;
+  dump_debug_iter("Debug standard direct", standard_ro,
+                  /*use_multi_cf_iter=*/false);
+
+  if (udi_factory_) {
+    ReadOptions trie_ro = ro;
+    trie_ro.table_index_factory = udi_factory_.get();
+    dump_debug_iter("Debug trie direct", trie_ro,
+                    /*use_multi_cf_iter=*/false);
+  }
+
+  if (FLAGS_use_multi_cf_iterator) {
+    dump_debug_iter("Debug standard coalescing", standard_ro,
+                    /*use_multi_cf_iter=*/true);
+    if (udi_factory_) {
+      ReadOptions trie_ro = ro;
+      trie_ro.table_index_factory = udi_factory_.get();
+      dump_debug_iter("Debug trie coalescing", trie_ro,
+                      /*use_multi_cf_iter=*/true);
+    }
+  }
+}
 
 // Compare the two iterator, iter and cmp_iter are in the same position,
 // unless iter might be made invalidate or undefined because of
@@ -1348,12 +2800,12 @@ Status StressTest::VerifyGetCurrentWalFile() const {
 // Will flag failure if the verification fails.
 // diverged = true if the two iterator is already diverged.
 // True if verification passed, false if not.
-void StressTest::VerifyIterator(ThreadState* thread,
-                                ColumnFamilyHandle* cmp_cfh,
-                                const ReadOptions& ro, Iterator* iter,
-                                Iterator* cmp_iter, LastIterateOp op,
-                                const Slice& seek_key,
-                                const std::string& op_logs, bool* diverged) {
+template <typename IterType, typename VerifyFuncType>
+void StressTest::VerifyIterator(
+    ThreadState* thread, ColumnFamilyHandle* cmp_cfh, const ReadOptions& ro,
+    IterType* iter, Iterator* cmp_iter, LastIterateOp op, const Slice& seek_key,
+    const std::vector<int>& rand_column_families, const std::string& op_logs,
+    VerifyFuncType verify_func, bool* diverged) {
   assert(diverged);
 
   if (*diverged) {
@@ -1369,11 +2821,11 @@ void StressTest::VerifyIterator(ThreadState* thread,
   }
 
   if (op == kLastOpSeekToFirst && ro.iterate_lower_bound != nullptr) {
-    // SeekToFirst() with lower bound is not well defined.
+    // SeekToFirst() with lower bound is not well-defined.
     *diverged = true;
     return;
   } else if (op == kLastOpSeekToLast && ro.iterate_upper_bound != nullptr) {
-    // SeekToLast() with higher bound is not well defined.
+    // SeekToLast() with higher bound is not well-defined.
     *diverged = true;
     return;
   } else if (op == kLastOpSeek && ro.iterate_lower_bound != nullptr &&
@@ -1384,7 +2836,7 @@ void StressTest::VerifyIterator(ThreadState* thread,
                options_.comparator->CompareWithoutTimestamp(
                    *ro.iterate_lower_bound, /*a_has_ts=*/false,
                    *ro.iterate_upper_bound, /*b_has_ts*/ false) >= 0))) {
-    // Lower bound behavior is not well defined if it is larger than
+    // Lower bound behavior is not well-defined if it is larger than
     // seek key or upper bound. Disable the check for now.
     *diverged = true;
     return;
@@ -1396,16 +2848,54 @@ void StressTest::VerifyIterator(ThreadState* thread,
                options_.comparator->CompareWithoutTimestamp(
                    *ro.iterate_lower_bound, /*a_has_ts=*/false,
                    *ro.iterate_upper_bound, /*b_has_ts=*/false) >= 0))) {
-    // Uppder bound behavior is not well defined if it is smaller than
+    // Upper bound behavior is not well-defined if it is smaller than
     // seek key or lower bound. Disable the check for now.
     *diverged = true;
     return;
+  }
+
+  if (!ro.total_order_seek && options_.prefix_extractor != nullptr &&
+      ro.iterate_lower_bound != nullptr) {
+    const SliceTransform* prefix_extractor = options_.prefix_extractor.get();
+    if (!prefix_extractor->InDomain(seek_key) ||
+        !prefix_extractor->InDomain(*ro.iterate_lower_bound) ||
+        prefix_extractor->Transform(seek_key) !=
+            prefix_extractor->Transform(*ro.iterate_lower_bound)) {
+      // ReadOptions requires the seek target and iterate_lower_bound to share
+      // a prefix when prefix iteration is enabled. Skip verification for this
+      // undefined configuration.
+      *diverged = true;
+      return;
+    }
   }
 
   const SliceTransform* pe = (ro.total_order_seek || ro.auto_prefix_mode)
                                  ? nullptr
                                  : options_.prefix_extractor.get();
   const Comparator* cmp = options_.comparator;
+  std::ostringstream read_opt_oss;
+  read_opt_oss << "pin_data: " << ro.pin_data
+               << ", background_purge_on_iterator_cleanup: "
+               << ro.background_purge_on_iterator_cleanup
+               << ", total_order_seek: " << ro.total_order_seek
+               << ", auto_prefix_mode: " << ro.auto_prefix_mode
+               << ", iterate_upper_bound: "
+               << (ro.iterate_upper_bound
+                       ? ro.iterate_upper_bound->ToString(true).c_str()
+                       : "")
+               << ", iterate_lower_bound: "
+               << (ro.iterate_lower_bound
+                       ? ro.iterate_lower_bound->ToString(true).c_str()
+                       : "")
+               << ", allow_unprepared_value: " << ro.allow_unprepared_value
+               << ", auto_refresh_iterator_with_snapshot: "
+               << ro.auto_refresh_iterator_with_snapshot
+               << ", snapshot: " << (ro.snapshot ? "non-nullptr" : "nullptr")
+               << ", timestamp: "
+               << (ro.timestamp ? ro.timestamp->ToString(true).c_str() : "")
+               << ", iter_start_ts: "
+               << (ro.iter_start_ts ? ro.iter_start_ts->ToString(true).c_str()
+                                    : "");
 
   if (iter->Valid() && !cmp_iter->Valid()) {
     if (pe != nullptr) {
@@ -1424,13 +2914,15 @@ void StressTest::VerifyIterator(ThreadState* thread,
       }
     }
     fprintf(stderr,
-            "Control interator is invalid but iterator has key %s "
-            "%s\n",
-            iter->key().ToString(true).c_str(), op_logs.c_str());
+            "Control iterator is invalid but iterator has key %s "
+            "%s under specified iterator ReadOptions: %s (Empty string or "
+            "missing field indicates default option or value is used)\n",
+            iter->key().ToString(true).c_str(), op_logs.c_str(),
+            read_opt_oss.str().c_str());
 
     *diverged = true;
   } else if (cmp_iter->Valid()) {
-    // Iterator is not valid. It can be legimate if it has already been
+    // Iterator is not valid. It can be legitimate if it has already been
     // out of upper or lower bound, or filtered out by prefix iterator.
     const Slice& total_order_key = cmp_iter->key();
 
@@ -1453,10 +2945,13 @@ void StressTest::VerifyIterator(ThreadState* thread,
           return;
         }
         fprintf(stderr,
-                "Iterator stays in prefix but contol doesn't"
-                " iterator key %s control iterator key %s %s\n",
+                "Iterator stays in prefix but control doesn't"
+                " iterator key %s control iterator key %s %s under specified "
+                "iterator ReadOptions: %s (Empty string or "
+                "missing field indicates default option or value is used)\n",
                 iter->key().ToString(true).c_str(),
-                cmp_iter->key().ToString(true).c_str(), op_logs.c_str());
+                cmp_iter->key().ToString(true).c_str(), op_logs.c_str(),
+                read_opt_oss.str().c_str());
       }
     }
     // Check upper or lower bounds.
@@ -1473,13 +2968,17 @@ void StressTest::VerifyIterator(ThreadState* thread,
                                          /*b_has_ts=*/false) > 0))) {
         fprintf(stderr,
                 "Iterator diverged from control iterator which"
-                " has value %s %s\n",
-                total_order_key.ToString(true).c_str(), op_logs.c_str());
+                " has value %s %s  under specified iterator ReadOptions: %s "
+                "(Empty string or "
+                "missing field indicates default option or value is used)\n",
+                total_order_key.ToString(true).c_str(), op_logs.c_str(),
+                read_opt_oss.str().c_str());
         if (iter->Valid()) {
           fprintf(stderr, "iterator has value %s\n",
                   iter->key().ToString(true).c_str());
         } else {
-          fprintf(stderr, "iterator is not valid\n");
+          fprintf(stderr, "iterator is not valid with status: %s\n",
+                  iter->status().ToString().c_str());
         }
         *diverged = true;
       }
@@ -1487,57 +2986,22 @@ void StressTest::VerifyIterator(ThreadState* thread,
   }
 
   if (!*diverged && iter->Valid()) {
-    const WideColumns expected_columns =
-        GenerateExpectedWideColumns(GetValueBase(iter->value()), iter->value());
-    if (iter->columns() != expected_columns) {
-      fprintf(stderr, "Value and columns inconsistent for iterator: %s\n",
-              DebugString(iter->value(), iter->columns(), expected_columns)
-                  .c_str());
-
+    if (!verify_func(iter)) {
       *diverged = true;
     }
   }
 
   if (*diverged) {
-    fprintf(stderr, "Control CF %s\n", cmp_cfh->GetName().c_str());
+    DumpIteratorDivergenceDiagnostics(cmp_cfh, ro, seek_key,
+                                      rand_column_families);
+    fprintf(stderr, "VerifyIterator failed. Control CF %s\n",
+            cmp_cfh->GetName().c_str());
     thread->stats.AddErrors(1);
     // Fail fast to preserve the DB state.
     thread->shared->SetVerificationFailure();
   }
 }
 
-#ifdef ROCKSDB_LITE
-Status StressTest::TestBackupRestore(
-    ThreadState* /* thread */,
-    const std::vector<int>& /* rand_column_families */,
-    const std::vector<int64_t>& /* rand_keys */) {
-  assert(false);
-  fprintf(stderr,
-          "RocksDB lite does not support "
-          "TestBackupRestore\n");
-  std::terminate();
-}
-
-Status StressTest::TestCheckpoint(
-    ThreadState* /* thread */,
-    const std::vector<int>& /* rand_column_families */,
-    const std::vector<int64_t>& /* rand_keys */) {
-  assert(false);
-  fprintf(stderr,
-          "RocksDB lite does not support "
-          "TestCheckpoint\n");
-  std::terminate();
-}
-
-void StressTest::TestCompactFiles(ThreadState* /* thread */,
-                                  ColumnFamilyHandle* /* column_family */) {
-  assert(false);
-  fprintf(stderr,
-          "RocksDB lite does not support "
-          "CompactFiles\n");
-  std::terminate();
-}
-#else   // ROCKSDB_LITE
 Status StressTest::TestBackupRestore(
     ThreadState* thread, const std::vector<int>& rand_column_families,
     const std::vector<int64_t>& rand_keys) {
@@ -1551,9 +3015,9 @@ Status StressTest::TestBackupRestore(
   }
 
   const std::string backup_dir =
-      FLAGS_db + "/.backup" + std::to_string(thread->tid);
+      GetDbPath() + "/.backup" + std::to_string(thread->tid);
   const std::string restore_dir =
-      FLAGS_db + "/.restore" + std::to_string(thread->tid);
+      GetDbPath() + "/.restore" + std::to_string(thread->tid);
   BackupEngineOptions backup_opts(backup_dir);
   // For debugging, get info_log from live options
   backup_opts.info_log = db_->GetDBOptions().info_log.get();
@@ -1586,12 +3050,56 @@ Status StressTest::TestBackupRestore(
   } else {
     backup_opts.schema_version = 2;
   }
+  if (thread->rand.OneIn(3)) {
+    backup_opts.max_background_operations = 16;
+  } else {
+    backup_opts.max_background_operations = 1;
+  }
+  if (thread->rand.OneIn(2)) {
+    backup_opts.backup_rate_limiter.reset(NewGenericRateLimiter(
+        FLAGS_backup_max_size * 1000000 /* rate_bytes_per_sec */,
+        1 /* refill_period_us */));
+  }
+  if (thread->rand.OneIn(2)) {
+    backup_opts.restore_rate_limiter.reset(NewGenericRateLimiter(
+        FLAGS_backup_max_size * 1000000 /* rate_bytes_per_sec */,
+        1 /* refill_period_us */));
+  }
+  backup_opts.current_temperatures_override_manifest = thread->rand.OneIn(2);
+  std::ostringstream backup_opt_oss;
+  backup_opt_oss << "share_table_files: " << backup_opts.share_table_files
+                 << ", share_files_with_checksum: "
+                 << backup_opts.share_files_with_checksum
+                 << ", share_files_with_checksum_naming: "
+                 << backup_opts.share_files_with_checksum_naming
+                 << ", schema_version: " << backup_opts.schema_version
+                 << ", max_background_operations: "
+                 << backup_opts.max_background_operations
+                 << ", backup_rate_limiter: "
+                 << backup_opts.backup_rate_limiter.get()
+                 << ", restore_rate_limiter: "
+                 << backup_opts.restore_rate_limiter.get()
+                 << ", current_temperatures_override_manifest: "
+                 << backup_opts.current_temperatures_override_manifest;
+
+  std::ostringstream create_backup_opt_oss;
+  std::ostringstream restore_opts_oss;
   BackupEngine* backup_engine = nullptr;
   std::string from = "a backup/restore operation";
-  Status s = BackupEngine::Open(db_stress_env, backup_opts, &backup_engine);
+  Status s = BackupEngine::Open(GetDbEnv(), backup_opts, &backup_engine);
   if (!s.ok()) {
     from = "BackupEngine::Open";
   }
+
+  if (s.ok() && FLAGS_manual_wal_flush_one_in > 0) {
+    // To avoid missing buffered WAL data during backup and cause false-positive
+    // inconsistent values between original DB and restored DB
+    s = db_->FlushWAL(/*sync=*/false);
+    if (!s.ok()) {
+      from = "FlushWAL";
+    }
+  }
+
   if (s.ok()) {
     if (backup_opts.schema_version >= 2 && thread->rand.OneIn(2)) {
       TEST_BackupMetaSchemaOptions test_opts;
@@ -1612,6 +3120,24 @@ Status StressTest::TestBackupRestore(
       // lock and wait on a background operation (flush).
       create_opts.flush_before_backup = true;
     }
+    if (FLAGS_atomic_flush) {
+      // When atomic flush is enabled for the DB, use it for backup too.
+      // This ensures cross-CF consistency without needing WAL files.
+      // flush_before_backup must be true for atomic_flush to take effect.
+      create_opts.flush_before_backup = true;
+      create_opts.atomic_flush = true;
+    }
+    create_opts.decrease_background_thread_cpu_priority = thread->rand.OneIn(2);
+    create_opts.background_thread_cpu_priority = static_cast<CpuPriority>(
+        thread->rand.Next() % (static_cast<int>(CpuPriority::kHigh) + 1));
+    create_backup_opt_oss << "flush_before_backup: "
+                          << create_opts.flush_before_backup
+                          << ", atomic_flush: " << create_opts.atomic_flush
+                          << ", decrease_background_thread_cpu_priority: "
+                          << create_opts.decrease_background_thread_cpu_priority
+                          << ", background_thread_cpu_priority: "
+                          << static_cast<int>(
+                                 create_opts.background_thread_cpu_priority);
     s = backup_engine->CreateNewBackup(create_opts, db_);
     if (!s.ok()) {
       from = "BackupEngine::CreateNewBackup";
@@ -1620,7 +3146,7 @@ Status StressTest::TestBackupRestore(
   if (s.ok()) {
     delete backup_engine;
     backup_engine = nullptr;
-    s = BackupEngine::Open(db_stress_env, backup_opts, &backup_engine);
+    s = BackupEngine::Open(GetDbEnv(), backup_opts, &backup_engine);
     if (!s.ok()) {
       from = "BackupEngine::Open (again)";
     }
@@ -1649,19 +3175,21 @@ Status StressTest::TestBackupRestore(
   const bool allow_persistent = thread->tid == 0;  // not too many
   bool from_latest = false;
   int count = static_cast<int>(backup_info.size());
+  RestoreOptions restore_options;
+  restore_options.keep_log_files = thread->rand.OneIn(2);
+  restore_opts_oss << "keep_log_files: " << restore_options.keep_log_files;
   if (s.ok() && !inplace_not_restore) {
     if (count > 1) {
       s = backup_engine->RestoreDBFromBackup(
-          RestoreOptions(), backup_info[thread->rand.Uniform(count)].backup_id,
+          restore_options, backup_info[thread->rand.Uniform(count)].backup_id,
           restore_dir /* db_dir */, restore_dir /* wal_dir */);
       if (!s.ok()) {
         from = "BackupEngine::RestoreDBFromBackup";
       }
     } else {
       from_latest = true;
-      s = backup_engine->RestoreDBFromLatestBackup(RestoreOptions(),
-                                                   restore_dir /* db_dir */,
-                                                   restore_dir /* wal_dir */);
+      s = backup_engine->RestoreDBFromLatestBackup(
+          restore_options, restore_dir /* db_dir */, restore_dir /* wal_dir */);
       if (!s.ok()) {
         from = "BackupEngine::RestoreDBFromLatestBackup";
       }
@@ -1680,35 +3208,38 @@ Status StressTest::TestBackupRestore(
       from = "BackupEngine::PurgeOldBackups";
     }
   }
-  DB* restored_db = nullptr;
+  std::unique_ptr<DB> restored_db;
   std::vector<ColumnFamilyHandle*> restored_cf_handles;
+
   // Not yet implemented: opening restored BlobDB or TransactionDB
+  Options db_opt;
   if (s.ok() && !FLAGS_use_txn && !FLAGS_use_blob_db) {
-    Options restore_options(options_);
-    restore_options.best_efforts_recovery = false;
-    restore_options.listeners.clear();
-    // Avoid dangling/shared file descriptors, for reliable destroy
-    restore_options.sst_file_manager = nullptr;
+    s = PrepareOptionsForRestoredDB(&db_opt);
+    if (!s.ok()) {
+      from = "PrepareRestoredDBOptions in backup/restore";
+    }
+  }
+  if (s.ok() && !FLAGS_use_txn && !FLAGS_use_blob_db) {
     std::vector<ColumnFamilyDescriptor> cf_descriptors;
     // TODO(ajkr): `column_family_names_` is not safe to access here when
     // `clear_column_family_one_in != 0`. But we can't easily switch to
     // `ListColumnFamilies` to get names because it won't necessarily give
     // the same order as `column_family_names_`.
     assert(FLAGS_clear_column_family_one_in == 0);
-    for (auto name : column_family_names_) {
-      cf_descriptors.emplace_back(name, ColumnFamilyOptions(restore_options));
+    for (const auto& name : column_family_names_) {
+      cf_descriptors.emplace_back(name, ColumnFamilyOptions(db_opt));
     }
     if (inplace_not_restore) {
       BackupInfo& info = backup_info[thread->rand.Uniform(count)];
-      restore_options.env = info.env_for_open.get();
-      s = DB::OpenForReadOnly(DBOptions(restore_options), info.name_for_open,
+      db_opt.env = info.env_for_open.get();
+      s = DB::OpenForReadOnly(DBOptions(db_opt), info.name_for_open,
                               cf_descriptors, &restored_cf_handles,
                               &restored_db);
       if (!s.ok()) {
         from = "DB::OpenForReadOnly in backup/restore";
       }
     } else {
-      s = DB::Open(DBOptions(restore_options), restore_dir, cf_descriptors,
+      s = DB::Open(DBOptions(db_opt), restore_dir, cf_descriptors,
                    &restored_cf_handles, &restored_db);
       if (!s.ok()) {
         from = "DB::Open in backup/restore";
@@ -1765,8 +3296,7 @@ Status StressTest::TestBackupRestore(
     for (auto* cf_handle : restored_cf_handles) {
       restored_db->DestroyColumnFamilyHandle(cf_handle);
     }
-    delete restored_db;
-    restored_db = nullptr;
+    restored_db.reset();
   }
   if (s.ok() && inplace_not_restore) {
     // Purge late if inplace open read-only
@@ -1784,28 +3314,108 @@ Status StressTest::TestBackupRestore(
     delete backup_engine;
     backup_engine = nullptr;
   }
-  if (s.ok()) {
+
+  // Temporarily disable error injection for clean up
+  if (db_fault_injection_fs_) {
+    db_fault_injection_fs_->DisableAllThreadLocalErrorInjection();
+  }
+
+  if (s.ok() || IsErrorInjectedAndRetryable(s)) {
     // Preserve directories on failure, or allowed persistent backup
     if (!allow_persistent) {
-      s = DestroyDir(db_stress_env, backup_dir);
+      s = DestroyDir(GetDbEnv(), backup_dir);
       if (!s.ok()) {
         from = "Destroy backup dir";
       }
     }
   }
-  if (s.ok()) {
-    s = DestroyDir(db_stress_env, restore_dir);
+
+  if (s.ok() || IsErrorInjectedAndRetryable(s)) {
+    s = DestroyDir(GetDbEnv(), restore_dir);
     if (!s.ok()) {
       from = "Destroy restore dir";
     }
   }
-  if (!s.ok()) {
-    fprintf(stderr, "Failure in %s with: %s\n", from.c_str(),
-            s.ToString().c_str());
+
+  // Enable back error injection disabled for clean up
+  if (db_fault_injection_fs_) {
+    db_fault_injection_fs_->EnableAllThreadLocalErrorInjection();
+  }
+
+  if (!s.ok() && !IsErrorInjectedAndRetryable(s)) {
+    fprintf(stderr,
+            "Failure in %s with: %s under specified BackupEngineOptions: %s, "
+            "CreateBackupOptions: %s, RestoreOptions: %s (Empty string or "
+            "missing field indicates default option or value is used)\n",
+            from.c_str(), s.ToString().c_str(), backup_opt_oss.str().c_str(),
+            create_backup_opt_oss.str().c_str(),
+            restore_opts_oss.str().c_str());
   }
   return s;
 }
 
+void InitializeMergeOperator(Options& options) {
+  if (FLAGS_use_full_merge_v1) {
+    options.merge_operator = MergeOperators::CreateDeprecatedPutOperator();
+  } else {
+    if (FLAGS_use_put_entity_one_in > 0) {
+      options.merge_operator = std::make_shared<DBStressWideMergeOperator>();
+    } else {
+      options.merge_operator = MergeOperators::CreatePutOperator();
+    }
+  }
+}
+
+Status StressTest::PrepareOptionsForRestoredDB(Options* options) {
+  assert(options);
+  // To avoid race with other threads' operations (e.g, SetOptions())
+  // on the same pointer sub-option (e.g, `std::shared_ptr<const FilterPolicy>
+  // filter_policy`) while having the same settings as `options_`, we create a
+  // new Options object from `options_`'s string to deep copy these pointer
+  // sub-options
+  Status s;
+  ConfigOptions config_opts;
+
+  std::string db_options_str;
+  s = GetStringFromDBOptions(config_opts, options_, &db_options_str);
+  if (!s.ok()) {
+    return s;
+  }
+  DBOptions db_options;
+  s = GetDBOptionsFromString(config_opts, Options(), db_options_str,
+                             &db_options);
+  if (!s.ok()) {
+    return s;
+  }
+
+  std::string cf_options_str;
+  s = GetStringFromColumnFamilyOptions(config_opts, options_, &cf_options_str);
+  if (!s.ok()) {
+    return s;
+  }
+  ColumnFamilyOptions cf_options;
+  s = GetColumnFamilyOptionsFromString(config_opts, Options(), cf_options_str,
+                                       &cf_options);
+  if (!s.ok()) {
+    return s;
+  }
+
+  *options = Options(db_options, cf_options);
+  options->best_efforts_recovery = false;
+  options->listeners.clear();
+  // Avoid dangling/shared file descriptors, for reliable destroy
+  options->sst_file_manager = nullptr;
+  // GetColumnFamilyOptionsFromString does not create customized merge operator.
+  InitializeMergeOperator(*options);
+  if (FLAGS_user_timestamp_size > 0) {
+    // Check OPTIONS string loading can bootstrap the correct user comparator
+    // from object registry.
+    assert(options->comparator);
+    assert(options->comparator == test::BytewiseComparatorWithU64TsWrapper());
+  }
+
+  return Status::OK();
+}
 Status StressTest::TestApproximateSize(
     ThreadState* thread, uint64_t iteration,
     const std::vector<int>& rand_column_families,
@@ -1830,22 +3440,32 @@ Status StressTest::TestApproximateSize(
   std::string key1_str = Key(key1);
   std::string key2_str = Key(key2);
   Range range{Slice(key1_str), Slice(key2_str)};
-  SizeApproximationOptions sao;
-  sao.include_memtables = thread->rand.OneIn(2);
-  if (sao.include_memtables) {
-    sao.include_files = thread->rand.OneIn(2);
-  }
-  if (thread->rand.OneIn(2)) {
-    if (thread->rand.OneIn(2)) {
-      sao.files_size_error_margin = 0.0;
-    } else {
-      sao.files_size_error_margin =
-          static_cast<double>(thread->rand.Uniform(3));
+  if (thread->rand.OneIn(3)) {
+    // Call GetApproximateMemTableStats instead
+    uint64_t count, size;
+    db_->GetApproximateMemTableStats(column_families_[rand_column_families[0]],
+                                     range, &count, &size);
+    return Status::OK();
+  } else {
+    // Call GetApproximateSizes
+    SizeApproximationOptions sao;
+    sao.include_memtables = thread->rand.OneIn(2);
+    sao.include_blob_files = thread->rand.OneIn(2);
+    if (sao.include_memtables || sao.include_blob_files) {
+      sao.include_files = thread->rand.OneIn(2);
     }
+    if (thread->rand.OneIn(2)) {
+      if (thread->rand.OneIn(2)) {
+        sao.files_size_error_margin = 0.0;
+      } else {
+        sao.files_size_error_margin =
+            static_cast<double>(thread->rand.Uniform(3));
+      }
+    }
+    uint64_t result;
+    return db_->GetApproximateSizes(
+        sao, column_families_[rand_column_families[0]], &range, 1, &result);
   }
-  uint64_t result;
-  return db_->GetApproximateSizes(
-      sao, column_families_[rand_column_families[0]], &range, 1, &result);
 }
 
 Status StressTest::TestCheckpoint(ThreadState* thread,
@@ -1861,46 +3481,58 @@ Status StressTest::TestCheckpoint(ThreadState* thread,
   }
 
   std::string checkpoint_dir =
-      FLAGS_db + "/.checkpoint" + std::to_string(thread->tid);
+      GetDbPath() + "/.checkpoint" + std::to_string(thread->tid);
   Options tmp_opts(options_);
   tmp_opts.listeners.clear();
-  tmp_opts.env = db_stress_env;
-
-  DestroyDB(checkpoint_dir, tmp_opts);
-
-  if (db_stress_env->FileExists(checkpoint_dir).ok()) {
-    // If the directory might still exist, try to delete the files one by one.
-    // Likely a trash file is still there.
-    Status my_s = DestroyDir(db_stress_env, checkpoint_dir);
-    if (!my_s.ok()) {
-      fprintf(stderr, "Fail to destory directory before checkpoint: %s",
-              my_s.ToString().c_str());
-    }
+  tmp_opts.env = GetDbEnv();
+  // Avoid delayed deletion so whole directory can be deleted
+  tmp_opts.sst_file_manager.reset();
+  //  Temporarily disable error injection for clean-up
+  if (db_fault_injection_fs_) {
+    db_fault_injection_fs_->DisableAllThreadLocalErrorInjection();
   }
-
+  DestroyDB(checkpoint_dir, tmp_opts);
+  // Enable back error injection disabled for clean-up
+  if (db_fault_injection_fs_) {
+    db_fault_injection_fs_->EnableAllThreadLocalErrorInjection();
+  }
   Checkpoint* checkpoint = nullptr;
   Status s = Checkpoint::Create(db_, &checkpoint);
   if (s.ok()) {
     s = checkpoint->CreateCheckpoint(checkpoint_dir);
-    if (!s.ok()) {
+    if (!s.ok() && !IsErrorInjectedAndRetryable(s)) {
       fprintf(stderr, "Fail to create checkpoint to %s\n",
               checkpoint_dir.c_str());
       std::vector<std::string> files;
-      Status my_s = db_stress_env->GetChildren(checkpoint_dir, &files);
-      if (my_s.ok()) {
+
+      // Temporarily disable error injection to print debugging information
+      if (db_fault_injection_fs_) {
+        db_fault_injection_fs_->DisableThreadLocalErrorInjection(
+            FaultInjectionIOType::kMetadataRead);
+      }
+
+      Status my_s = GetDbEnv()->GetChildren(checkpoint_dir, &files);
+
+      // Enable back disable error injection disabled for printing debugging
+      // information
+      if (db_fault_injection_fs_) {
+        db_fault_injection_fs_->EnableThreadLocalErrorInjection(
+            FaultInjectionIOType::kMetadataRead);
+      }
+      if (!my_s.ok()) {
+        fprintf(stderr, "Fail to GetChildren under %s due to %s\n",
+                checkpoint_dir.c_str(), my_s.ToString().c_str());
+      } else {
         for (const auto& f : files) {
           fprintf(stderr, " %s\n", f.c_str());
         }
-      } else {
-        fprintf(stderr, "Fail to get files under the directory to %s\n",
-                my_s.ToString().c_str());
       }
     }
   }
   delete checkpoint;
   checkpoint = nullptr;
   std::vector<ColumnFamilyHandle*> cf_handles;
-  DB* checkpoint_db = nullptr;
+  std::unique_ptr<DB> checkpoint_db;
   if (s.ok()) {
     Options options(options_);
     options.best_efforts_recovery = false;
@@ -1964,15 +3596,24 @@ Status StressTest::TestCheckpoint(ThreadState* thread,
       delete cfh;
     }
     cf_handles.clear();
-    delete checkpoint_db;
-    checkpoint_db = nullptr;
+    checkpoint_db.reset();
   }
 
-  if (!s.ok()) {
+  //  Temporarily disable error injection for clean-up
+  if (db_fault_injection_fs_) {
+    db_fault_injection_fs_->DisableAllThreadLocalErrorInjection();
+  }
+
+  if (!s.ok() && !IsErrorInjectedAndRetryable(s)) {
     fprintf(stderr, "A checkpoint operation failed with: %s\n",
             s.ToString().c_str());
   } else {
     DestroyDB(checkpoint_dir, tmp_opts);
+  }
+
+  // Enable back error injection disabled for clean-up
+  if (db_fault_injection_fs_) {
+    db_fault_injection_fs_->EnableAllThreadLocalErrorInjection();
   }
   return s;
 }
@@ -2055,6 +3696,11 @@ void StressTest::TestGetProperty(ThreadState* thread) const {
   }
 }
 
+Status StressTest::TestGetPropertiesOfAllTables() const {
+  TablePropertiesCollection props;
+  return db_->GetPropertiesOfAllTables(&props);
+}
+
 void StressTest::TestCompactFiles(ThreadState* thread,
                                   ColumnFamilyHandle* column_family) {
   ROCKSDB_NAMESPACE::ColumnFamilyMetaData cf_meta_data;
@@ -2092,31 +3738,82 @@ void StressTest::TestCompactFiles(ThreadState* thread,
 
       size_t output_level =
           std::min(random_level + 1, cf_meta_data.levels.size() - 1);
-      auto s = db_->CompactFiles(CompactionOptions(), column_family,
-                                 input_files, static_cast<int>(output_level));
+      CompactionOptions compact_options;
+      if (thread->rand.OneIn(2)) {
+        compact_options.output_file_size_limit = FLAGS_target_file_size_base;
+      }
+      std::ostringstream compact_opt_oss;
+      compact_opt_oss << "output_file_size_limit: "
+                      << compact_options.output_file_size_limit;
+      auto s = db_->CompactFiles(compact_options, column_family, input_files,
+                                 static_cast<int>(output_level));
       if (!s.ok()) {
-        fprintf(stdout, "Unable to perform CompactFiles(): %s\n",
-                s.ToString().c_str());
         thread->stats.AddNumCompactFilesFailed(1);
       } else {
         thread->stats.AddNumCompactFilesSucceed(1);
+      }
+      // Verify before the fail-fast: a corruption that CompactFiles itself
+      // returns must be recorded (CORRUPTION) before we terminate, or it
+      // mis-buckets as CRASH. No-op unless CPU-corruption verification is on.
+      MaybeVerifyCpuCorruption(thread, "compactfiles", s);
+      if (!s.ok() && !IsTolerableCompactionFailure(s)) {
+        fprintf(stderr,
+                "Unable to perform CompactFiles(): %s under specified "
+                "CompactionOptions: %s (Empty string or missing field "
+                "indicates default option or value is used)\n",
+                s.ToString().c_str(), compact_opt_oss.str().c_str());
+        thread->shared->SafeTerminate();
       }
       break;
     }
   }
 }
-#endif  // ROCKSDB_LITE
 
-Status StressTest::TestFlush(const std::vector<int>& rand_column_families) {
-  FlushOptions flush_opts;
-  if (FLAGS_atomic_flush) {
-    return db_->Flush(flush_opts, column_families_);
+void StressTest::TestPromoteL0(ThreadState* thread,
+                               ColumnFamilyHandle* column_family) {
+  int target_level = thread->rand.Next() % options_.num_levels;
+  Status s = db_->PromoteL0(column_family, target_level);
+  if (!s.ok()) {
+    // The second error occurs when another concurrent PromoteL0() moving the
+    // same files finishes first which is an allowed behavior
+    bool non_ok_status_allowed =
+        s.IsInvalidArgument() ||
+        (s.IsCorruption() &&
+         s.ToString().find("VersionBuilder: Cannot delete table file") !=
+             std::string::npos &&
+         s.ToString().find("since it is on level") != std::string::npos);
+
+    if (!non_ok_status_allowed) {
+      fprintf(stderr,
+              "Unable to perform PromoteL0(): %s under specified "
+              "target_level: %d.\n",
+              s.ToString().c_str(), target_level);
+      thread->shared->SafeTerminate();
+    }
   }
-  std::vector<ColumnFamilyHandle*> cfhs;
-  std::for_each(rand_column_families.begin(), rand_column_families.end(),
-                [this, &cfhs](int k) { cfhs.push_back(column_families_[k]); });
-  return db_->Flush(flush_opts, cfhs);
 }
+
+void StressTest::TestFlush(ThreadState* thread,
+                           const std::vector<int>& rand_column_families) {
+  FlushOptions flush_opts;
+  assert(flush_opts.wait);
+  Status status;
+  if (FLAGS_atomic_flush) {
+    status = db_->Flush(flush_opts, column_families_);
+  } else {
+    std::vector<ColumnFamilyHandle*> cfhs;
+    std::for_each(
+        rand_column_families.begin(), rand_column_families.end(),
+        [this, &cfhs](int k) { cfhs.push_back(column_families_[k]); });
+    status = db_->Flush(flush_opts, cfhs);
+  }
+  // Verify before the fail-fast (a no-op unless CPU-corruption verification is
+  // on), then route the status through the standard flush error handling.
+  MaybeVerifyCpuCorruption(thread, "flush", status);
+  ProcessStatus(thread->shared, "Flush", status);
+}
+
+Status StressTest::TestResetStats() { return db_->ResetStats(); }
 
 Status StressTest::TestPauseBackground(ThreadState* thread) {
   Status status = db_->PauseBackgroundWork();
@@ -2134,6 +3831,42 @@ Status StressTest::TestPauseBackground(ThreadState* thread) {
   return db_->ContinueBackgroundWork();
 }
 
+Status StressTest::TestDisableFileDeletions(ThreadState* thread) {
+  Status status = db_->DisableFileDeletions();
+  if (!status.ok()) {
+    return status;
+  }
+  // Similar to TestPauseBackground()
+  int pwr2_micros =
+      std::min(thread->rand.Uniform(25), thread->rand.Uniform(25));
+  clock_->SleepForMicroseconds(1 << pwr2_micros);
+  return db_->EnableFileDeletions();
+}
+
+Status StressTest::TestDisableManualCompaction(ThreadState* thread) {
+  db_->DisableManualCompaction();
+  // Similar to TestPauseBackground()
+  int pwr2_micros =
+      std::min(thread->rand.Uniform(25), thread->rand.Uniform(25));
+  clock_->SleepForMicroseconds(1 << pwr2_micros);
+  db_->EnableManualCompaction();
+  return Status::OK();
+}
+
+Status StressTest::TestAbortAndResumeCompactions(ThreadState* thread) {
+  // Abort all running compactions and prevent new ones from starting
+  db_->AbortAllCompactions();
+  // Sleep to allow other threads to attempt operations while aborted
+  // Uses same sleep pattern as TestPauseBackground and
+  // TestDisableManualCompaction
+  int pwr2_micros =
+      std::min(thread->rand.Uniform(25), thread->rand.Uniform(25));
+  clock_->SleepForMicroseconds(1 << pwr2_micros);
+  // Resume compactions
+  db_->ResumeAllCompactions();
+  return Status::OK();
+}
+
 void StressTest::TestAcquireSnapshot(ThreadState* thread,
                                      int rand_column_family,
                                      const std::string& keystr, uint64_t i) {
@@ -2142,16 +3875,14 @@ void StressTest::TestAcquireSnapshot(ThreadState* thread,
   // This `ReadOptions` is for validation purposes. Ignore
   // `FLAGS_rate_limit_user_ops` to avoid slowing any validation.
   ReadOptions ropt;
-#ifndef ROCKSDB_LITE
   auto db_impl = static_cast_with_check<DBImpl>(db_->GetRootDB());
   const bool ww_snapshot = thread->rand.OneIn(10);
   const Snapshot* snapshot =
       ww_snapshot ? db_impl->GetSnapshotForWriteConflictBoundary()
                   : db_->GetSnapshot();
-#else
-  const Snapshot* snapshot = db_->GetSnapshot();
-#endif  // !ROCKSDB_LITE
   ropt.snapshot = snapshot;
+  ropt.auto_refresh_iterator_with_snapshot =
+      FLAGS_auto_refresh_iterator_with_snapshot;
 
   // Ideally, we want snapshot taking and timestamp generation to be atomic
   // here, so that the snapshot corresponds to the timestamp. However, it is
@@ -2168,7 +3899,11 @@ void StressTest::TestAcquireSnapshot(ThreadState* thread,
   // When taking a snapshot, we also read a key from that snapshot. We
   // will later read the same key before releasing the snapshot and
   // verify that the results are the same.
-  auto status_at = db_->Get(ropt, column_family, key, &value_at);
+  Status status_at = db_->Get(ropt, column_family, key, &value_at);
+  if (!status_at.ok() && IsErrorInjectedAndRetryable(status_at)) {
+    db_->ReleaseSnapshot(snapshot);
+    return;
+  }
   std::vector<bool>* key_vec = nullptr;
 
   if (FLAGS_compare_full_db_state_snapshot && (thread->tid == 0)) {
@@ -2244,7 +3979,13 @@ void StressTest::TestCompactRange(ThreadState* thread, int64_t rand_key,
 
   CompactRangeOptions cro;
   cro.exclusive_manual_compaction = static_cast<bool>(thread->rand.Next() % 2);
-  cro.change_level = static_cast<bool>(thread->rand.Next() % 2);
+  if (static_cast<ROCKSDB_NAMESPACE::CompactionStyle>(FLAGS_compaction_style) !=
+      ROCKSDB_NAMESPACE::CompactionStyle::kCompactionStyleFIFO) {
+    cro.change_level = static_cast<bool>(thread->rand.Next() % 2);
+  }
+  if (thread->rand.OneIn(2)) {
+    cro.target_level = thread->rand.Next() % options_.num_levels;
+  }
   std::vector<BottommostLevelCompaction> bottom_level_styles = {
       BottommostLevelCompaction::kSkip,
       BottommostLevelCompaction::kIfHaveCompactionFilter,
@@ -2268,33 +4009,74 @@ void StressTest::TestCompactRange(ThreadState* thread, int64_t rand_key,
   const Snapshot* pre_snapshot = nullptr;
   uint32_t pre_hash = 0;
   if (thread->rand.OneIn(2)) {
-    // Do some validation by declaring a snapshot and compare the data before
-    // and after the compaction
+    // Temporarily disable error injection to for validation
+    if (db_fault_injection_fs_) {
+      db_fault_injection_fs_->DisableAllThreadLocalErrorInjection();
+    }
+
+    // Declare a snapshot and compare the data before and after the compaction
     pre_snapshot = db_->GetSnapshot();
     pre_hash =
         GetRangeHash(thread, pre_snapshot, column_family, start_key, end_key);
-  }
 
+    // Enable back error injection disabled for validation
+    if (db_fault_injection_fs_) {
+      db_fault_injection_fs_->EnableAllThreadLocalErrorInjection();
+    }
+  }
+  std::ostringstream compact_range_opt_oss;
+  compact_range_opt_oss << "exclusive_manual_compaction: "
+                        << cro.exclusive_manual_compaction
+                        << ", change_level: " << cro.change_level
+                        << ", target_level: " << cro.target_level
+                        << ", bottommost_level_compaction: "
+                        << static_cast<int>(cro.bottommost_level_compaction)
+                        << ", allow_write_stall: " << cro.allow_write_stall
+                        << ", max_subcompactions: " << cro.max_subcompactions
+                        << ", blob_garbage_collection_policy: "
+                        << static_cast<int>(cro.blob_garbage_collection_policy)
+                        << ", blob_garbage_collection_age_cutoff: "
+                        << cro.blob_garbage_collection_age_cutoff;
   Status status = db_->CompactRange(cro, column_family, &start_key, &end_key);
 
-  if (!status.ok()) {
-    fprintf(stdout, "Unable to perform CompactRange(): %s\n",
-            status.ToString().c_str());
+  // Verify before the fail-fast: a corruption that CompactRange itself returns
+  // must be recorded (CORRUPTION) before we flag failure, or it mis-buckets.
+  // No-op unless CPU-corruption verification is on.
+  MaybeVerifyCpuCorruption(thread, "compactrange", status);
+  if (!status.ok() && !IsTolerableCompactionFailure(status)) {
+    fprintf(stderr,
+            "Unable to perform CompactRange(): %s under specified "
+            "CompactRangeOptions: %s (Empty string or missing field "
+            "indicates default option or value is used)\n",
+            status.ToString().c_str(), compact_range_opt_oss.str().c_str());
+    // Fail fast to preserve the DB state.
+    thread->shared->SetVerificationFailure();
   }
 
   if (pre_snapshot != nullptr) {
+    // Temporarily disable error injection for validation
+    if (db_fault_injection_fs_) {
+      db_fault_injection_fs_->DisableAllThreadLocalErrorInjection();
+    }
     uint32_t post_hash =
         GetRangeHash(thread, pre_snapshot, column_family, start_key, end_key);
     if (pre_hash != post_hash) {
       fprintf(stderr,
               "Data hash different before and after compact range "
-              "start_key %s end_key %s\n",
-              start_key.ToString(true).c_str(), end_key.ToString(true).c_str());
+              "start_key %s end_key %s under specified CompactRangeOptions: %s "
+              "(Empty string or "
+              "missing field indicates default option or value is used)\n",
+              start_key.ToString(true).c_str(), end_key.ToString(true).c_str(),
+              compact_range_opt_oss.str().c_str());
       thread->stats.AddErrors(1);
       // Fail fast to preserve the DB state.
       thread->shared->SetVerificationFailure();
     }
     db_->ReleaseSnapshot(pre_snapshot);
+    if (db_fault_injection_fs_) {
+      // Enable back error injection disabled for validation
+      db_fault_injection_fs_->EnableAllThreadLocalErrorInjection();
+    }
   }
 }
 
@@ -2307,6 +4089,8 @@ uint32_t StressTest::GetRangeHash(ThreadState* thread, const Snapshot* snapshot,
   ReadOptions ro;
   ro.snapshot = snapshot;
   ro.total_order_seek = true;
+  ro.auto_refresh_iterator_with_snapshot =
+      FLAGS_auto_refresh_iterator_with_snapshot;
   std::string ts_str;
   Slice ts;
   if (FLAGS_user_timestamp_size > 0) {
@@ -2354,32 +4138,43 @@ void StressTest::PrintEnv() const {
   fprintf(stdout, "Format version            : %d\n", FLAGS_format_version);
   fprintf(stdout, "TransactionDB             : %s\n",
           FLAGS_use_txn ? "true" : "false");
-
   if (FLAGS_use_txn) {
-#ifndef ROCKSDB_LITE
-    fprintf(stdout, "Two write queues:         : %s\n",
-            FLAGS_two_write_queues ? "true" : "false");
-    fprintf(stdout, "Write policy              : %d\n",
-            static_cast<int>(FLAGS_txn_write_policy));
-    if (static_cast<uint64_t>(TxnDBWritePolicy::WRITE_PREPARED) ==
-            FLAGS_txn_write_policy ||
-        static_cast<uint64_t>(TxnDBWritePolicy::WRITE_UNPREPARED) ==
-            FLAGS_txn_write_policy) {
-      fprintf(stdout, "Snapshot cache bits       : %d\n",
-              static_cast<int>(FLAGS_wp_snapshot_cache_bits));
-      fprintf(stdout, "Commit cache bits         : %d\n",
-              static_cast<int>(FLAGS_wp_commit_cache_bits));
+    fprintf(stdout, "TransactionDB Type        : %s\n",
+            FLAGS_use_optimistic_txn ? "Optimistic" : "Pessimistic");
+    if (FLAGS_use_optimistic_txn) {
+      fprintf(stdout, "OCC Validation Type       : %d\n",
+              static_cast<int>(FLAGS_occ_validation_policy));
+      if (static_cast<uint64_t>(OccValidationPolicy::kValidateParallel) ==
+          FLAGS_occ_validation_policy) {
+        fprintf(stdout, "Share Lock Buckets        : %s\n",
+                FLAGS_share_occ_lock_buckets ? "true" : "false");
+        if (FLAGS_share_occ_lock_buckets) {
+          fprintf(stdout, "Lock Bucket Count         : %d\n",
+                  static_cast<int>(FLAGS_occ_lock_bucket_count));
+        }
+      }
+    } else {
+      fprintf(stdout, "Two write queues:         : %s\n",
+              FLAGS_two_write_queues ? "true" : "false");
+      fprintf(stdout, "Write policy              : %d\n",
+              static_cast<int>(FLAGS_txn_write_policy));
+      if (static_cast<uint64_t>(TxnDBWritePolicy::WRITE_PREPARED) ==
+              FLAGS_txn_write_policy ||
+          static_cast<uint64_t>(TxnDBWritePolicy::WRITE_UNPREPARED) ==
+              FLAGS_txn_write_policy) {
+        fprintf(stdout, "Snapshot cache bits       : %d\n",
+                static_cast<int>(FLAGS_wp_snapshot_cache_bits));
+        fprintf(stdout, "Commit cache bits         : %d\n",
+                static_cast<int>(FLAGS_wp_commit_cache_bits));
+      }
+      fprintf(stdout, "last cwb for recovery    : %s\n",
+              FLAGS_use_only_the_last_commit_time_batch_for_recovery ? "true"
+                                                                     : "false");
     }
-    fprintf(stdout, "last cwb for recovery    : %s\n",
-            FLAGS_use_only_the_last_commit_time_batch_for_recovery ? "true"
-                                                                   : "false");
-#endif  // !ROCKSDB_LITE
   }
 
-#ifndef ROCKSDB_LITE
   fprintf(stdout, "Stacked BlobDB            : %s\n",
           FLAGS_use_blob_db ? "true" : "false");
-#endif  // !ROCKSDB_LITE
   fprintf(stdout, "Read only mode            : %s\n",
           FLAGS_read_only ? "true" : "false");
   fprintf(stdout, "Atomic flush              : %s\n",
@@ -2420,7 +4215,8 @@ void StressTest::PrintEnv() const {
   fprintf(stdout, "Num times DB reopens      : %d\n", FLAGS_reopen);
   fprintf(stdout, "Batches/snapshots         : %d\n",
           FLAGS_test_batches_snapshots);
-  fprintf(stdout, "Do update in place        : %d\n", FLAGS_in_place_update);
+  fprintf(stdout, "Do update in place        : %d\n",
+          FLAGS_inplace_update_support);
   fprintf(stdout, "Num keys per lock         : %d\n",
           1 << FLAGS_log2_keys_per_lock);
   std::string compression = CompressionTypeToString(compression_type_e);
@@ -2439,9 +4235,16 @@ void StressTest::PrintEnv() const {
           FLAGS_subcompactions);
   fprintf(stdout, "Use MultiGet              : %s\n",
           FLAGS_use_multiget ? "true" : "false");
+  fprintf(stdout, "Use GetEntity             : %s\n",
+          FLAGS_use_get_entity ? "true" : "false");
+  fprintf(stdout, "Use MultiGetEntity        : %s\n",
+          FLAGS_use_multi_get_entity ? "true" : "false");
+  fprintf(stdout, "Verification only         : %s\n",
+          FLAGS_verification_only ? "true" : "false");
 
-  const char* memtablerep = "";
+  const char* memtablerep;
   switch (FLAGS_rep_factory) {
+    default:
     case kSkipList:
       memtablerep = "skip_list";
       break;
@@ -2467,6 +4270,8 @@ void StressTest::PrintEnv() const {
 #endif
   fprintf(stdout, "Periodic Compaction Secs  : %" PRIu64 "\n",
           FLAGS_periodic_compaction_seconds);
+  fprintf(stdout, "Daily Offpeak UTC         : %s\n",
+          FLAGS_daily_offpeak_time_utc.c_str());
   fprintf(stdout, "Compaction TTL            : %" PRIu64 "\n",
           FLAGS_compaction_ttl);
   const char* compaction_pri = "";
@@ -2492,53 +4297,141 @@ void StressTest::PrintEnv() const {
           static_cast<int>(FLAGS_avoid_unnecessary_blocking_io));
   fprintf(stdout, "Write DB ID to manifest   : %d\n",
           static_cast<int>(FLAGS_write_dbid_to_manifest));
+  fprintf(stdout, "Optimize manifest recovery: %d\n",
+          static_cast<int>(FLAGS_optimize_manifest_for_recovery));
+  fprintf(stdout, "Reuse manifest on open    : %d\n",
+          static_cast<int>(FLAGS_reuse_manifest_on_open));
   fprintf(stdout, "Max Write Batch Group Size: %" PRIu64 "\n",
           FLAGS_max_write_batch_group_size_bytes);
   fprintf(stdout, "Use dynamic level         : %d\n",
           static_cast<int>(FLAGS_level_compaction_dynamic_level_bytes));
+  fprintf(stdout, "Metadata read fault one in         : %d\n",
+          FLAGS_metadata_read_fault_one_in);
+  fprintf(stdout, "Metadata write fault one in        : %d\n",
+          FLAGS_metadata_write_fault_one_in);
   fprintf(stdout, "Read fault one in         : %d\n", FLAGS_read_fault_one_in);
   fprintf(stdout, "Write fault one in        : %d\n", FLAGS_write_fault_one_in);
+  fprintf(stdout, "Open metadata read fault one in:\n");
+  fprintf(stdout, "                            %d\n",
+          FLAGS_open_metadata_read_fault_one_in);
   fprintf(stdout, "Open metadata write fault one in:\n");
   fprintf(stdout, "                            %d\n",
           FLAGS_open_metadata_write_fault_one_in);
+  fprintf(stdout, "Open read fault one in          :\n");
+  fprintf(stdout, "                            %d\n",
+          FLAGS_open_read_fault_one_in);
+  fprintf(stdout, "Open write fault one in         :\n");
+  fprintf(stdout, "                            %d\n",
+          FLAGS_open_write_fault_one_in);
   fprintf(stdout, "Sync fault injection      : %d\n",
           FLAGS_sync_fault_injection);
   fprintf(stdout, "Best efforts recovery     : %d\n",
           static_cast<int>(FLAGS_best_efforts_recovery));
-  fprintf(stdout, "Fail if OPTIONS file error: %d\n",
-          static_cast<int>(FLAGS_fail_if_options_file_error));
   fprintf(stdout, "User timestamp size bytes : %d\n",
           static_cast<int>(FLAGS_user_timestamp_size));
+  fprintf(stdout, "Persist user defined timestamps : %d\n",
+          FLAGS_persist_user_defined_timestamps);
   fprintf(stdout, "WAL compression           : %s\n",
           FLAGS_wal_compression.c_str());
   fprintf(stdout, "Try verify sst unique id  : %d\n",
           static_cast<int>(FLAGS_verify_sst_unique_id_in_manifest));
+  fprintf(stdout, "Fast SST open             : %d\n",
+          static_cast<int>(FLAGS_fast_sst_open));
 
   fprintf(stdout, "------------------------------------------------\n");
 }
 
-void StressTest::Open(SharedState* shared) {
+void StressTest::Open(SharedState* shared, bool reopen) {
   assert(db_ == nullptr);
-#ifndef ROCKSDB_LITE
   assert(txn_db_ == nullptr);
-#else
-  (void)shared;
-#endif
+  assert(optimistic_txn_db_ == nullptr);
+  if (FLAGS_use_trie_index) {
+    udi_factory_ = std::make_shared<trie_index::TrieIndexFactory>();
+  }
   if (!InitializeOptionsFromFile(options_)) {
-    InitializeOptionsFromFlags(cache_, compressed_cache_, filter_policy_,
+    InitializeOptionsFromFlags(block_cache, filter_policy_, udi_factory_,
                                options_);
   }
-  InitializeOptionsGeneral(cache_, compressed_cache_, filter_policy_, options_);
+  InitializeOptionsGeneral(block_cache, filter_policy_, sqfc_factory_,
+                           options_);
+  // InitializeOptions* helpers set options_.env = raw_env (no fault injection).
+  // Override with per-StressTest env that includes FaultInjectionTestFS +
+  // DbStressFSWrapper for all DB I/O.
+  options_.env = GetDbEnv();
+  // InitializeOptionsGeneral creates SstFileManager with raw_env. Override
+  // with per-StressTest env so file deletions go through DbStressFSWrapper.
+  if (options_.sst_file_manager) {
+    Status status;
+    options_.sst_file_manager.reset(NewSstFileManager(
+        GetDbEnv(), options_.info_log, "" /* trash_dir */,
+        static_cast<int64_t>(FLAGS_sst_file_manager_bytes_per_sec),
+        true /* delete_existing_trash */, &status,
+        0.25 /* max_trash_db_ratio */,
+        FLAGS_sst_file_manager_bytes_per_truncate));
+    if (!status.ok()) {
+      fprintf(stderr, "SstFileManager creation failed: %s\n",
+              status.ToString().c_str());
+      exit(1);
+    }
+  }
+  DbStressCustomCompressionManager::Register();
 
+  if (!strcasecmp(FLAGS_compression_manager.c_str(), "custom")) {
+    options_.compression_manager =
+        std::make_shared<DbStressCustomCompressionManager>();
+  } else if (!strcasecmp(FLAGS_compression_manager.c_str(), "mixed")) {
+    options_.compression_manager =
+        std::make_shared<RoundRobinManager>(GetBuiltinV2CompressionManager());
+  } else if (!strcasecmp(FLAGS_compression_manager.c_str(), "randommixed")) {
+    options_.compression_manager =
+        std::make_shared<RandomMixedCompressionManager>(
+            GetBuiltinV2CompressionManager());
+  } else if (!strcasecmp(FLAGS_compression_manager.c_str(), "autoskip")) {
+    options_.compression_manager =
+        CreateAutoSkipCompressionManager(GetBuiltinV2CompressionManager());
+  } else if (!strcasecmp(FLAGS_compression_manager.c_str(), "none")) {
+    // Nothing to do using default compression manager
+  } else {
+    fprintf(stderr, "Unknown compression manager: %s\n",
+            FLAGS_compression_manager.c_str());
+    exit(1);
+  }
   if (FLAGS_prefix_size == 0 && FLAGS_rep_factory == kHashSkipList) {
     fprintf(stderr,
             "prefeix_size cannot be zero if memtablerep == prefix_hash\n");
     exit(1);
   }
   if (FLAGS_prefix_size != 0 && FLAGS_rep_factory != kHashSkipList) {
-    fprintf(stderr,
+    fprintf(stdout,
             "WARNING: prefix_size is non-zero but "
             "memtablerep != prefix_hash\n");
+  }
+
+  // Remote Compaction
+  if (FLAGS_remote_compaction_worker_threads > 0) {
+    if ((options_.enable_blob_files ||
+         options_.enable_blob_garbage_collection ||
+         FLAGS_allow_setting_blob_options_dynamically)) {
+      fprintf(stderr,
+              "Integrated BlobDB is currently incompatible with Remote "
+              "Compaction\n");
+      exit(1);
+    }
+    // Each DB open/reopen gets a fresh compaction service instance with a clean
+    // aborted_ state
+    auto compaction_service = std::make_shared<DbStressCompactionService>(
+        shared, FLAGS_remote_compaction_failure_fall_back_to_local);
+
+    options_.compaction_service = compaction_service;
+  }
+
+  if (FLAGS_allow_resumption_one_in > 0) {
+    if (FLAGS_remote_compaction_worker_threads == 0) {
+      fprintf(stderr,
+              "allow_resumption or randomize_allow_resumption requires "
+              "remote_compaction_worker_threads > 0\n");
+      exit(1);
+    }
   }
 
   if ((options_.enable_blob_files || options_.enable_blob_garbage_collection ||
@@ -2552,12 +4445,14 @@ void StressTest::Open(SharedState* shared) {
 
   fprintf(stdout,
           "Integrated BlobDB: blob files enabled %d, min blob size %" PRIu64
+          ", direct write enabled %d, direct write partitions %" PRIu32
           ", blob file size %" PRIu64
           ", blob compression type %s, blob GC enabled %d, cutoff %f, force "
           "threshold %f, blob compaction readahead size %" PRIu64
           ", blob file starting level %d\n",
           options_.enable_blob_files, options_.min_blob_size,
-          options_.blob_file_size,
+          options_.enable_blob_direct_write,
+          options_.blob_direct_write_partitions, options_.blob_file_size,
           CompressionTypeToString(options_.blob_compression_type).c_str(),
           options_.enable_blob_garbage_collection,
           options_.blob_garbage_collection_age_cutoff,
@@ -2581,13 +4476,13 @@ void StressTest::Open(SharedState* shared) {
     fprintf(stdout, "Integrated BlobDB: blob cache disabled\n");
   }
 
-  fprintf(stdout, "DB path: [%s]\n", FLAGS_db.c_str());
+  fprintf(stdout, "DB path: [%s]\n", GetDbPath().c_str());
 
   Status s;
 
   if (FLAGS_ttl == -1) {
     std::vector<std::string> existing_column_families;
-    s = DB::ListColumnFamilies(DBOptions(options_), FLAGS_db,
+    s = DB::ListColumnFamilies(DBOptions(options_), GetDbPath(),
                                &existing_column_families);  // ignore errors
     if (!s.ok()) {
       // DB doesn't exist
@@ -2607,12 +4502,12 @@ void StressTest::Open(SharedState* shared) {
       if (sorted_cfn != existing_column_families) {
         fprintf(stderr, "Expected column families differ from the existing:\n");
         fprintf(stderr, "Expected: {");
-        for (auto cf : sorted_cfn) {
+        for (const auto& cf : sorted_cfn) {
           fprintf(stderr, "%s ", cf.c_str());
         }
         fprintf(stderr, "}\n");
         fprintf(stderr, "Existing: {");
-        for (auto cf : existing_column_families) {
+        for (const auto& cf : existing_column_families) {
           fprintf(stderr, "%s ", cf.c_str());
         }
         fprintf(stderr, "}\n");
@@ -2620,7 +4515,7 @@ void StressTest::Open(SharedState* shared) {
       assert(sorted_cfn == existing_column_families);
     }
     std::vector<ColumnFamilyDescriptor> cf_descriptors;
-    for (auto name : column_family_names_) {
+    for (const auto& name : column_family_names_) {
       if (name != kDefaultColumnFamilyName) {
         new_column_family_name_ =
             std::max(new_column_family_name_.load(), std::stoi(name) + 1);
@@ -2634,122 +4529,89 @@ void StressTest::Open(SharedState* shared) {
       column_family_names_.push_back(name);
     }
 
-    options_.listeners.clear();
-#ifndef ROCKSDB_LITE
-    options_.listeners.emplace_back(new DbStressListener(
-        FLAGS_db, options_.db_paths, cf_descriptors, db_stress_listener_env));
-#endif  // !ROCKSDB_LITE
-    RegisterAdditionalListeners();
-
+    // If this is for DB reopen,  error injection may have been enabled.
+    // Disable it here in case there is no open fault injection.
+    if (db_fault_injection_fs_) {
+      db_fault_injection_fs_->DisableAllThreadLocalErrorInjection();
+    }
+    // TODO; test transaction DB Open with fault injection
     if (!FLAGS_use_txn) {
-      // Determine whether we need to ingest file metadata write failures
-      // during DB reopen. If it does, enable it.
-      // Only ingest metadata error if it is reopening, as initial open
-      // failure doesn't need to be handled.
-      // TODO cover transaction DB is not covered in this fault test too.
-      bool ingest_meta_error = false;
-      bool ingest_write_error = false;
-      bool ingest_read_error = false;
-      if ((FLAGS_open_metadata_write_fault_one_in ||
-           FLAGS_open_write_fault_one_in || FLAGS_open_read_fault_one_in) &&
-          fault_fs_guard
-              ->FileExists(FLAGS_db + "/CURRENT", IOOptions(), nullptr)
-              .ok()) {
-        if (!FLAGS_sync) {
-          // When DB Stress is not sync mode, we expect all WAL writes to
-          // WAL is durable. Buffering unsynced writes will cause false
-          // positive in crash tests. Before we figure out a way to
-          // solve it, skip WAL from failure injection.
-          fault_fs_guard->SetSkipDirectWritableTypes({kWalFile});
-        }
-        ingest_meta_error = FLAGS_open_metadata_write_fault_one_in;
-        ingest_write_error = FLAGS_open_write_fault_one_in;
-        ingest_read_error = FLAGS_open_read_fault_one_in;
-        if (ingest_meta_error) {
-          fault_fs_guard->EnableMetadataWriteErrorInjection();
-          fault_fs_guard->SetRandomMetadataWriteError(
-              FLAGS_open_metadata_write_fault_one_in);
-        }
-        if (ingest_write_error) {
-          fault_fs_guard->SetFilesystemDirectWritable(false);
-          fault_fs_guard->EnableWriteErrorInjection();
-          fault_fs_guard->SetRandomWriteError(
-              static_cast<uint32_t>(FLAGS_seed), FLAGS_open_write_fault_one_in,
-              IOStatus::IOError("Injected Open Error"),
-              /*inject_for_all_file_types=*/true, /*types=*/{});
-        }
-        if (ingest_read_error) {
-          fault_fs_guard->SetRandomReadError(FLAGS_open_read_fault_one_in);
-        }
-      }
+      OpenFaultInjectionConfig open_fault_injection;
+      open_fault_injection.sync_fault = FLAGS_sync_fault_injection;
+      open_fault_injection.metadata_read_one_in =
+          FLAGS_open_metadata_read_fault_one_in;
+      open_fault_injection.metadata_write_one_in =
+          FLAGS_open_metadata_write_fault_one_in;
+      open_fault_injection.read_one_in = FLAGS_open_read_fault_one_in;
+      open_fault_injection.write_one_in = FLAGS_open_write_fault_one_in;
       while (true) {
-#ifndef ROCKSDB_LITE
+        InitializeListenersForOpen(shared, cf_descriptors);
+
+        const bool open_fault_injection_enabled = MaybeEnableOpenFaultInjection(
+            db_fault_injection_fs_, GetDbPath(), open_fault_injection);
         // StackableDB-based BlobDB
         if (FLAGS_use_blob_db) {
           blob_db::BlobDBOptions blob_db_options;
-          blob_db_options.min_blob_size = FLAGS_blob_db_min_blob_size;
-          blob_db_options.bytes_per_sync = FLAGS_blob_db_bytes_per_sync;
           blob_db_options.blob_file_size = FLAGS_blob_db_file_size;
           blob_db_options.enable_garbage_collection = FLAGS_blob_db_enable_gc;
-          blob_db_options.garbage_collection_cutoff = FLAGS_blob_db_gc_cutoff;
 
           blob_db::BlobDB* blob_db = nullptr;
-          s = blob_db::BlobDB::Open(options_, blob_db_options, FLAGS_db,
+          s = blob_db::BlobDB::Open(options_, blob_db_options, GetDbPath(),
                                     cf_descriptors, &column_families_,
                                     &blob_db);
           if (s.ok()) {
+            db_owner_.reset(blob_db);
             db_ = blob_db;
           }
-        } else
-#endif  // !ROCKSDB_LITE
-        {
+        } else {
           if (db_preload_finished_.load() && FLAGS_read_only) {
-            s = DB::OpenForReadOnly(DBOptions(options_), FLAGS_db,
-                                    cf_descriptors, &column_families_, &db_);
+            s = DB::OpenForReadOnly(DBOptions(options_), GetDbPath(),
+                                    cf_descriptors, &column_families_,
+                                    &db_owner_);
           } else {
-            s = DB::Open(DBOptions(options_), FLAGS_db, cf_descriptors,
-                         &column_families_, &db_);
+            s = DB::Open(DBOptions(options_), GetDbPath(), cf_descriptors,
+                         &column_families_, &db_owner_);
+          }
+          if (s.ok()) {
+            db_ = db_owner_.get();
           }
         }
 
-        if (ingest_meta_error || ingest_write_error || ingest_read_error) {
-          fault_fs_guard->SetFilesystemDirectWritable(true);
-          fault_fs_guard->DisableMetadataWriteErrorInjection();
-          fault_fs_guard->DisableWriteErrorInjection();
-          fault_fs_guard->SetSkipDirectWritableTypes({});
-          fault_fs_guard->SetRandomReadError(0);
+        if (open_fault_injection_enabled) {
+          db_fault_injection_fs_->DisableAllThreadLocalErrorInjection();
+
           if (s.ok()) {
-            // Ingested errors might happen in background compactions. We
+            // Injected errors might happen in background compactions. We
             // wait for all compactions to finish to make sure DB is in
             // clean state before executing queries.
-            s = static_cast_with_check<DBImpl>(db_->GetRootDB())
-                    ->WaitForCompact(true /* wait_unscheduled */);
+            s = db_->GetRootDB()->WaitForCompact(WaitForCompactOptions());
             if (!s.ok()) {
-              for (auto cf : column_families_) {
-                delete cf;
-              }
-              column_families_.clear();
-              delete db_;
+              CleanUpColumnFamilies();
+              db_owner_.reset();
               db_ = nullptr;
+              secondary_db_.reset();
             }
           }
           if (!s.ok()) {
-            // After failure to opening a DB due to IO error, retry should
-            // successfully open the DB with correct data if no IO error shows
-            // up.
-            ingest_meta_error = false;
-            ingest_write_error = false;
-            ingest_read_error = false;
+            // After failure to opening a DB due to IO error or unsynced data
+            // loss, retry should successfully open the DB with correct data if
+            // no IO error shows up.
+            open_fault_injection.Disable();
 
-            Random rand(static_cast<uint32_t>(FLAGS_seed));
-            if (rand.OneIn(2)) {
-              fault_fs_guard->DeleteFilesCreatedAfterLastDirSync(IOOptions(),
-                                                                 nullptr);
-            }
-            if (rand.OneIn(3)) {
-              fault_fs_guard->DropUnsyncedFileData();
-            } else if (rand.OneIn(2)) {
-              fault_fs_guard->DropRandomUnsyncedFileData(&rand);
+            // TODO: Unsynced data loss during DB reopen is not supported yet in
+            //  stress test. Will need to recreate expected state if we decide
+            //  to support unsynced data loss during DB reopen.
+            if (!reopen) {
+              Random rand(static_cast<uint32_t>(FLAGS_seed));
+              if (rand.OneIn(2)) {
+                db_fault_injection_fs_->DeleteFilesCreatedAfterLastDirSync(
+                    IOOptions(), nullptr);
+              }
+              if (rand.OneIn(3)) {
+                db_fault_injection_fs_->DropUnsyncedFileData();
+              } else if (rand.OneIn(2)) {
+                db_fault_injection_fs_->DropRandomUnsyncedFileData(&rand);
+              }
             }
             continue;
           }
@@ -2757,39 +4619,76 @@ void StressTest::Open(SharedState* shared) {
         break;
       }
     } else {
-#ifndef ROCKSDB_LITE
-      TransactionDBOptions txn_db_options;
-      assert(FLAGS_txn_write_policy <= TxnDBWritePolicy::WRITE_UNPREPARED);
-      txn_db_options.write_policy =
-          static_cast<TxnDBWritePolicy>(FLAGS_txn_write_policy);
-      if (FLAGS_unordered_write) {
-        assert(txn_db_options.write_policy == TxnDBWritePolicy::WRITE_PREPARED);
-        options_.unordered_write = true;
-        options_.two_write_queues = true;
-        txn_db_options.skip_concurrency_control = true;
-      } else {
-        options_.two_write_queues = FLAGS_two_write_queues;
-      }
-      txn_db_options.wp_snapshot_cache_bits =
-          static_cast<size_t>(FLAGS_wp_snapshot_cache_bits);
-      txn_db_options.wp_commit_cache_bits =
-          static_cast<size_t>(FLAGS_wp_commit_cache_bits);
-      PrepareTxnDbOptions(shared, txn_db_options);
-      s = TransactionDB::Open(options_, txn_db_options, FLAGS_db,
-                              cf_descriptors, &column_families_, &txn_db_);
-      if (!s.ok()) {
-        fprintf(stderr, "Error in opening the TransactionDB [%s]\n",
-                s.ToString().c_str());
-        fflush(stderr);
-      }
-      assert(s.ok());
+      InitializeListenersForOpen(shared, cf_descriptors);
 
-      // Do not swap the order of the following.
-      {
-        db_ = txn_db_;
-        db_aptr_.store(txn_db_, std::memory_order_release);
+      if (FLAGS_use_optimistic_txn) {
+        OptimisticTransactionDBOptions optimistic_txn_db_options;
+        optimistic_txn_db_options.validate_policy =
+            static_cast<OccValidationPolicy>(FLAGS_occ_validation_policy);
+
+        if (FLAGS_share_occ_lock_buckets) {
+          optimistic_txn_db_options.shared_lock_buckets =
+              MakeSharedOccLockBuckets(FLAGS_occ_lock_bucket_count);
+        } else {
+          optimistic_txn_db_options.occ_lock_buckets =
+              FLAGS_occ_lock_bucket_count;
+          optimistic_txn_db_options.shared_lock_buckets = nullptr;
+        }
+        s = OptimisticTransactionDB::Open(
+            options_, optimistic_txn_db_options, GetDbPath(), cf_descriptors,
+            &column_families_, &optimistic_txn_db_);
+        if (!s.ok()) {
+          fprintf(stderr, "Error in opening the OptimisticTransactionDB [%s]\n",
+                  s.ToString().c_str());
+          fflush(stderr);
+        }
+        assert(s.ok());
+        {
+          db_owner_.reset(optimistic_txn_db_);
+          db_ = optimistic_txn_db_;
+          db_aptr_.store(optimistic_txn_db_, std::memory_order_release);
+        }
+      } else {
+        TransactionDBOptions txn_db_options;
+        // Match the 10-minute lock_timeout used for explicit transactions
+        // in NewTxn(), rather than the 1-second default which is too short
+        // for stress tests under heavy contention (see T228932399).
+        txn_db_options.default_lock_timeout = 600000;
+        assert(FLAGS_txn_write_policy <= TxnDBWritePolicy::WRITE_UNPREPARED);
+        txn_db_options.write_policy =
+            static_cast<TxnDBWritePolicy>(FLAGS_txn_write_policy);
+        if (FLAGS_unordered_write) {
+          assert(txn_db_options.write_policy ==
+                 TxnDBWritePolicy::WRITE_PREPARED);
+          options_.unordered_write = true;
+          options_.two_write_queues = true;
+          txn_db_options.skip_concurrency_control = true;
+        } else {
+          options_.two_write_queues = FLAGS_two_write_queues;
+        }
+        txn_db_options.wp_snapshot_cache_bits =
+            static_cast<size_t>(FLAGS_wp_snapshot_cache_bits);
+        txn_db_options.wp_commit_cache_bits =
+            static_cast<size_t>(FLAGS_wp_commit_cache_bits);
+        txn_db_options.use_per_key_point_lock_mgr =
+            FLAGS_use_per_key_point_lock_mgr;
+        PrepareTxnDbOptions(shared, txn_db_options);
+        s = TransactionDB::Open(options_, txn_db_options, GetDbPath(),
+                                cf_descriptors, &column_families_, &txn_db_);
+        if (!s.ok()) {
+          fprintf(stderr, "Error in opening the TransactionDB [%s]\n",
+                  s.ToString().c_str());
+          fflush(stderr);
+        }
+        assert(s.ok());
+
+        // Do not swap the order of the following.
+        {
+          db_owner_.reset(txn_db_);
+          db_ = txn_db_;
+          db_aptr_.store(txn_db_, std::memory_order_release);
+        }
       }
-#endif
     }
     if (!s.ok()) {
       fprintf(stderr, "Error in opening the DB [%s]\n", s.ToString().c_str());
@@ -2798,35 +4697,34 @@ void StressTest::Open(SharedState* shared) {
     assert(s.ok());
     assert(column_families_.size() ==
            static_cast<size_t>(FLAGS_column_families));
+    // Clear statistics reference from options_ to intentionally shorten the
+    // statistics object lifetime to be same as the db object (which is the
+    // common case in practice) and detect if RocksDB access the statistics
+    // beyond its lifetime.
+    if (FLAGS_statistics) {
+      options_.statistics.reset();
+    }
 
     // Secondary instance does not support write-prepared/write-unprepared
     // transactions, thus just disable secondary instance if we use
     // transaction.
     if (s.ok() && FLAGS_test_secondary && !FLAGS_use_txn) {
-#ifndef ROCKSDB_LITE
       Options tmp_opts;
       // TODO(yanqin) support max_open_files != -1 for secondary instance.
       tmp_opts.max_open_files = -1;
-      tmp_opts.env = db_stress_env;
-      const std::string& secondary_path = FLAGS_secondaries_base;
-      s = DB::OpenAsSecondary(tmp_opts, FLAGS_db, secondary_path,
-                              cf_descriptors, &cmp_cfhs_, &cmp_db_);
+      tmp_opts.env = GetDbEnv();
+      const std::string& secondary_path = GetSecondariesBase();
+      s = DB::OpenAsSecondary(tmp_opts, GetDbPath(), secondary_path,
+                              cf_descriptors, &secondary_cfhs_, &secondary_db_);
       assert(s.ok());
-      assert(cmp_cfhs_.size() == static_cast<size_t>(FLAGS_column_families));
-#else
-      fprintf(stderr, "Secondary is not supported in RocksDBLite\n");
-      exit(1);
-#endif  // !ROCKSDB_LITE
+      assert(secondary_cfhs_.size() ==
+             static_cast<size_t>(FLAGS_column_families));
     }
   } else {
-#ifndef ROCKSDB_LITE
     DBWithTTL* db_with_ttl;
-    s = DBWithTTL::Open(options_, FLAGS_db, &db_with_ttl, FLAGS_ttl);
+    s = DBWithTTL::Open(options_, GetDbPath(), &db_with_ttl, FLAGS_ttl);
+    db_owner_.reset(db_with_ttl);
     db_ = db_with_ttl;
-#else
-    fprintf(stderr, "TTL is not supported in RocksDBLite\n");
-    exit(1);
-#endif
   }
 
   if (FLAGS_preserve_unverified_changes) {
@@ -2845,14 +4743,271 @@ void StressTest::Open(SharedState* shared) {
 
   if (!s.ok()) {
     fprintf(stderr, "open error: %s\n", s.ToString().c_str());
-    exit(1);
+    port::ImmediateExit(1);
+  }
+
+  if (db_->GetLatestSequenceNumber() < shared->GetPersistedSeqno()) {
+    fprintf(stderr,
+            "DB of latest sequence number %" PRIu64
+            "did not recover to the persisted "
+            "sequence number %" PRIu64 " from last DB session\n",
+            db_->GetLatestSequenceNumber(), shared->GetPersistedSeqno());
+    port::ImmediateExit(1);
   }
 }
 
+void StressTest::RecordManifestStateBeforeReopen() {
+  // Determine verification mode based on flags
+  if (FLAGS_best_efforts_recovery) {
+    // Options are disabled in BER mode
+    manifest_verify_mode_ = MANIFEST_VERIFY_NONE;
+    return;
+  }
+
+  const bool optimize_manifest = FLAGS_optimize_manifest_for_recovery;
+  const bool reuse_manifest = FLAGS_reuse_manifest_on_open;
+
+  if (!optimize_manifest && !reuse_manifest) {
+    manifest_verify_mode_ = MANIFEST_VERIFY_NONE;
+    return;
+  }
+
+  if (reuse_manifest && optimize_manifest) {
+    // Check if ALL conditions for complete avoidance are met.
+    // If so, use STRICT mode where failures are fatal.
+    const bool no_fault_injection = FLAGS_metadata_write_fault_one_in == 0 &&
+                                    FLAGS_open_metadata_write_fault_one_in == 0;
+    const bool no_manifest_writes_expected =
+        FLAGS_avoid_flush_during_recovery &&  // No flush during recovery
+        !FLAGS_write_dbid_to_manifest &&      // No DB_ID write on open
+        no_fault_injection;
+    // Note: avoid_flush_during_shutdown is NOT required for STRICT mode.
+    // If avoid_flush_during_shutdown=true leaves data in WAL, but
+    // avoid_flush_during_recovery=true prevents flushing it, so MANIFEST
+    // still won't be written. Complete avoidance is still achieved.
+
+    if (no_manifest_writes_expected) {
+      // All conditions met for complete MANIFEST write avoidance.
+      // Any MANIFEST write is a bug - make it fatal.
+      manifest_verify_mode_ = MANIFEST_VERIFY_STRICT;
+    } else {
+      // Both options enabled but some conditions prevent complete avoidance.
+      // Use NO_WRITE mode with warnings.
+      manifest_verify_mode_ = MANIFEST_VERIFY_NO_WRITE;
+    }
+  } else if (reuse_manifest) {
+    manifest_verify_mode_ = MANIFEST_VERIFY_REUSE;
+  } else {
+    // Only optimize_manifest_for_recovery is enabled without
+    // reuse_manifest_on_open. The optimize_manifest_for_recovery option reduces
+    // MANIFEST writes during recovery by skipping no-op edits (edits that don't
+    // change the VersionSet state). However, without reuse_manifest_on_open,
+    // the MANIFEST file may still be recreated on DB open as part of the normal
+    // open process. Verifying that the optimization worked (i.e., fewer edits
+    // were written during recovery) would require intrusive sync points or
+    // internal counters to track how many edits were skipped. Since we can't
+    // easily observe this from the outside without such instrumentation, we
+    // skip verification in this configuration.
+    manifest_verify_mode_ = MANIFEST_VERIFY_NONE;
+    return;
+  }
+
+  // Record MANIFEST file info
+  std::vector<std::string> files;
+  const std::string& db_path = GetDbPath();
+  Status s = Env::Default()->GetChildren(db_path, &files);
+  if (!s.ok()) {
+    fprintf(
+        stderr,
+        "Warning: Failed to list DB directory for MANIFEST verification: %s\n",
+        s.ToString().c_str());
+    manifest_verify_mode_ = MANIFEST_VERIFY_NONE;
+    return;
+  }
+
+  manifest_file_number_before_reopen_ = 0;
+  manifest_file_size_before_reopen_ = 0;
+
+  for (const auto& f : files) {
+    if (f.find("MANIFEST-") == 0) {
+      // Extract file number from MANIFEST-xxxxxx
+      uint64_t number;
+      FileType type;
+      if (ParseFileName(f, &number, &type) && type == kDescriptorFile) {
+        manifest_file_number_before_reopen_ = number;
+        std::string manifest_path = db_path;
+        manifest_path.append("/").append(f);
+        Status file_s = Env::Default()->GetFileSize(
+            manifest_path, &manifest_file_size_before_reopen_);
+        if (!file_s.ok()) {
+          fprintf(stderr, "Warning: Failed to get MANIFEST file size: %s\n",
+                  file_s.ToString().c_str());
+          manifest_verify_mode_ = MANIFEST_VERIFY_NONE;
+          return;
+        }
+        break;
+      }
+    }
+  }
+
+  // Record CURRENT file content for both REUSE_ONLY and REUSE_AND_CURRENT
+  // modes. If the MANIFEST file is reused (same file number), CURRENT should
+  // not be updated since it already points to the correct MANIFEST.
+  std::string current_path = db_path;
+  current_path.append("/CURRENT");
+  s = ReadFileToString(Env::Default(), current_path,
+                       &current_file_content_before_reopen_);
+  if (!s.ok()) {
+    fprintf(stderr, "Warning: Failed to read CURRENT file: %s\n",
+            s.ToString().c_str());
+    // Clear the content so we skip CURRENT verification later
+    current_file_content_before_reopen_.clear();
+  }
+}
+
+void StressTest::VerifyManifestNotRewritten() {
+  if (manifest_verify_mode_ == MANIFEST_VERIFY_NONE) {
+    return;
+  }
+
+  const bool strict_mode = (manifest_verify_mode_ == MANIFEST_VERIFY_STRICT);
+
+  // Get current MANIFEST file info
+  const std::string& db_path = GetDbPath();
+  std::vector<std::string> files;
+  Status s = Env::Default()->GetChildren(db_path, &files);
+  if (!s.ok()) {
+    fprintf(
+        stderr,
+        "Warning: Failed to list DB directory for MANIFEST verification: %s\n",
+        s.ToString().c_str());
+    manifest_verify_mode_ = MANIFEST_VERIFY_NONE;
+    return;
+  }
+
+  uint64_t current_manifest_number = 0;
+  uint64_t current_manifest_size = 0;
+
+  for (const auto& f : files) {
+    if (f.find("MANIFEST-") == 0) {
+      uint64_t number;
+      FileType type;
+      if (ParseFileName(f, &number, &type) && type == kDescriptorFile) {
+        current_manifest_number = number;
+        std::string manifest_path = db_path;
+        manifest_path.append("/").append(f);
+        Env::Default()->GetFileSize(manifest_path, &current_manifest_size);
+        break;
+      }
+    }
+  }
+
+  // Check MANIFEST reuse
+  if (current_manifest_number != manifest_file_number_before_reopen_) {
+    if (strict_mode) {
+      fprintf(stderr,
+              "FATAL: MANIFEST file was recreated despite "
+              "reuse_manifest_on_open=1 and all conditions for complete "
+              "avoidance being met. "
+              "Before: MANIFEST-%06" PRIu64 ", After: MANIFEST-%06" PRIu64 "\n",
+              manifest_file_number_before_reopen_, current_manifest_number);
+      fprintf(stderr, "This indicates a bug in the MANIFEST optimization.\n");
+      exit(1);
+    } else {
+      fprintf(stdout,
+              "WARNING: MANIFEST file was recreated despite "
+              "reuse_manifest_on_open=1. "
+              "Before: MANIFEST-%06" PRIu64 ", After: MANIFEST-%06" PRIu64 "\n",
+              manifest_file_number_before_reopen_, current_manifest_number);
+    }
+  } else {
+    // MANIFEST was reused, check size growth
+    const uint64_t size_growth =
+        (current_manifest_size > manifest_file_size_before_reopen_)
+            ? (current_manifest_size - manifest_file_size_before_reopen_)
+            : 0;
+    if (manifest_verify_mode_ == MANIFEST_VERIFY_NO_WRITE ||
+        manifest_verify_mode_ == MANIFEST_VERIFY_STRICT) {
+      // In NO_WRITE/STRICT mode, we expect complete avoidance - zero growth.
+      // This is the D103568447 guarantee: when both options are enabled
+      // and no recovery is needed, MANIFEST should not be written at all.
+      if (size_growth > 0) {
+        if (strict_mode) {
+          fprintf(stderr,
+                  "FATAL: MANIFEST file grew by %" PRIu64
+                  " bytes after reopen despite ALL conditions for complete "
+                  "avoidance being met:\n"
+                  "  - optimize_manifest_for_recovery=1\n"
+                  "  - reuse_manifest_on_open=1\n"
+                  "  - avoid_flush_during_recovery=true\n"
+                  "  - write_dbid_to_manifest=0\n"
+                  "  - No fault injection\n"
+                  "  - Not in BER mode\n"
+                  "Expected complete avoidance (0 bytes growth). "
+                  "This indicates a bug in the MANIFEST optimization.\n",
+                  size_growth);
+          exit(1);
+        } else {
+          fprintf(stdout,
+                  "WARNING: MANIFEST file grew by %" PRIu64
+                  " bytes after reopen despite both "
+                  "optimize_manifest_for_recovery=1 and "
+                  "reuse_manifest_on_open=1. "
+                  "Expected complete avoidance (0 bytes growth).\n",
+                  size_growth);
+        }
+      }
+    } else {
+      // In REUSE mode, allow up to 10KB growth for recovery edits
+      if (size_growth > 10240) {
+        fprintf(stdout,
+                "WARNING: MANIFEST file grew by %" PRIu64
+                " bytes after reopen "
+                "(may indicate unexpected writes)\n",
+                size_growth);
+      }
+    }
+  }
+
+  // Check CURRENT file in all verification modes.
+  // If the MANIFEST file was reused (same file number), CURRENT should not
+  // have been modified since it already points to the correct MANIFEST.
+  if (!current_file_content_before_reopen_.empty()) {
+    std::string current_path = db_path;
+    current_path.append("/CURRENT");
+    std::string current_content;
+    s = ReadFileToString(Env::Default(), current_path, &current_content);
+    if (s.ok()) {
+      if (current_content != current_file_content_before_reopen_) {
+        if (strict_mode) {
+          fprintf(
+              stderr,
+              "FATAL: CURRENT file was updated despite ALL conditions for "
+              "complete avoidance being met. MANIFEST was reused but CURRENT "
+              "was modified. This indicates a bug.\n");
+          exit(1);
+        } else if (manifest_verify_mode_ == MANIFEST_VERIFY_NO_WRITE) {
+          fprintf(stdout,
+                  "WARNING: CURRENT file was updated despite both "
+                  "optimize_manifest_for_recovery=1 and "
+                  "reuse_manifest_on_open=1\n");
+        } else {
+          fprintf(stdout,
+                  "WARNING: CURRENT file was updated despite "
+                  "reuse_manifest_on_open=1 and MANIFEST being reused\n");
+        }
+      }
+    }
+  }
+
+  // Reset verification mode
+  manifest_verify_mode_ = MANIFEST_VERIFY_NONE;
+}
+
 void StressTest::Reopen(ThreadState* thread) {
-#ifndef ROCKSDB_LITE
-  // BG jobs in WritePrepared must be canceled first because i) they can access
-  // the db via a callbac ii) they hold on to a snapshot and the upcoming
+  // BG jobs in WritePrepared must be canceled first because i) they can
+  // access the db via a callbac ii) they hold on to a snapshot and the
+  // upcoming
   // ::Close would complain about it.
   const bool write_prepared = FLAGS_use_txn && FLAGS_txn_write_policy != 0;
   bool bg_canceled __attribute__((unused)) = false;
@@ -2863,16 +5018,30 @@ void StressTest::Reopen(ThreadState* thread) {
     bg_canceled = wait;
   }
   assert(!write_prepared || bg_canceled);
-#else
-  (void)thread;
-#endif
 
-  for (auto cf : column_families_) {
-    delete cf;
+  CleanUpColumnFamilies();
+
+  // Currently reopen does not restore expected state
+  // with potential data loss in mind like the first open before
+  // crash-recovery verification does. Therefore it always expects no data
+  // loss and we should ensure no data loss in testing.
+  // TODO(hx235): eliminate the FlushWAL(true /* sync */)/SyncWAL() below
+  if (!FLAGS_disable_wal) {
+    Status s;
+    if (FLAGS_manual_wal_flush_one_in > 0) {
+      s = db_->FlushWAL(/*sync=*/true);
+    } else {
+      s = db_->SyncWAL();
+    }
+    if (!s.ok()) {
+      fprintf(stderr,
+              "Error persisting WAL data which is needed before reopening the "
+              "DB: %s\n",
+              s.ToString().c_str());
+      exit(1);
+    }
   }
-  column_families_.clear();
 
-#ifndef ROCKSDB_LITE
   if (thread->rand.OneIn(2)) {
     Status s = db_->Close();
     if (!s.ok()) {
@@ -2881,21 +5050,28 @@ void StressTest::Reopen(ThreadState* thread) {
     }
     assert(s.ok());
   }
-#endif
-  delete db_;
+  assert((txn_db_ == nullptr && optimistic_txn_db_ == nullptr) ||
+         (db_ == txn_db_ || db_ == optimistic_txn_db_));
+  db_owner_.reset();
   db_ = nullptr;
-#ifndef ROCKSDB_LITE
   txn_db_ = nullptr;
-#endif
+  optimistic_txn_db_ = nullptr;
+  secondary_db_.reset();
 
   num_times_reopened_++;
   auto now = clock_->NowMicros();
   fprintf(stdout, "%s Reopening database for the %dth time\n",
           clock_->TimeToString(now / 1000000).c_str(), num_times_reopened_);
-  Open(thread->shared);
 
-  if ((FLAGS_sync_fault_injection || FLAGS_disable_wal ||
-       FLAGS_manual_wal_flush_one_in > 0) &&
+  // Record MANIFEST state before reopen for verification
+  RecordManifestStateBeforeReopen();
+
+  Open(thread->shared, /*reopen=*/true);
+
+  // Verify MANIFEST was not unnecessarily rewritten
+  VerifyManifestNotRewritten();
+
+  if (thread->shared->GetStressTest()->MightHaveUnsyncedDataLoss() &&
       IsStateTracked()) {
     Status s = thread->shared->SaveAtAndAfter(db_);
     if (!s.ok()) {
@@ -2914,6 +5090,11 @@ bool StressTest::MaybeUseOlderTimestampForPointLookup(ThreadState* thread,
     return false;
   }
 
+  if (!FLAGS_persist_user_defined_timestamps) {
+    // Not read with older timestamps to avoid get InvalidArgument.
+    return false;
+  }
+
   assert(thread);
   if (!thread->rand.OneInOpt(3)) {
     return false;
@@ -2923,7 +5104,7 @@ bool StressTest::MaybeUseOlderTimestampForPointLookup(ThreadState* thread,
   assert(shared);
   const uint64_t start_ts = shared->GetStartTimestamp();
 
-  uint64_t now = db_stress_env->NowNanos();
+  uint64_t now = raw_env->NowNanos();
 
   assert(now > start_ts);
   uint64_t time_diff = now - start_ts;
@@ -2943,6 +5124,11 @@ void StressTest::MaybeUseOlderTimestampForRangeScan(ThreadState* thread,
     return;
   }
 
+  if (!FLAGS_persist_user_defined_timestamps) {
+    // Not read with older timestamps to avoid get InvalidArgument.
+    return;
+  }
+
   assert(thread);
   if (!thread->rand.OneInOpt(3)) {
     return;
@@ -2955,7 +5141,7 @@ void StressTest::MaybeUseOlderTimestampForRangeScan(ThreadState* thread,
   assert(shared);
   const uint64_t start_ts = shared->GetStartTimestamp();
 
-  uint64_t now = db_stress_env->NowNanos();
+  uint64_t now = raw_env->NowNanos();
 
   assert(now > start_ts);
   uint64_t time_diff = now - start_ts;
@@ -2965,7 +5151,8 @@ void StressTest::MaybeUseOlderTimestampForRangeScan(ThreadState* thread,
   ts_slice = ts_str;
   read_opts.timestamp = &ts_slice;
 
-  if (!thread->rand.OneInOpt(3)) {
+  // TODO (yanqin): support Merge with iter_start_ts
+  if (!thread->rand.OneInOpt(3) || FLAGS_use_merge || FLAGS_use_full_merge_v1) {
     return;
   }
 
@@ -2986,20 +5173,10 @@ void CheckAndSetOptionsForUserTimestamp(Options& options) {
             static_cast<int>(cmp->timestamp_size()));
     exit(1);
   }
-  if (FLAGS_use_merge || FLAGS_use_full_merge_v1) {
-    fprintf(stderr, "Merge does not support timestamp yet.\n");
-    exit(1);
-  }
   if (FLAGS_use_txn) {
     fprintf(stderr, "TransactionDB does not support timestamp yet.\n");
     exit(1);
   }
-#ifndef ROCKSDB_LITE
-  if (FLAGS_enable_blob_files || FLAGS_use_blob_db) {
-    fprintf(stderr, "BlobDB not supported with timestamp.\n");
-    exit(1);
-  }
-#endif  // !ROCKSDB_LITE
   if (FLAGS_test_cf_consistency || FLAGS_test_batches_snapshots) {
     fprintf(stderr,
             "Due to per-key ts-seq ordering constraint, only the (default) "
@@ -3011,38 +5188,44 @@ void CheckAndSetOptionsForUserTimestamp(Options& options) {
     exit(1);
   }
   options.comparator = cmp;
+  options.persist_user_defined_timestamps =
+      FLAGS_persist_user_defined_timestamps;
+}
+
+bool ShouldDisableAutoCompactionsBeforeVerifyDb() {
+  return !FLAGS_disable_auto_compactions && FLAGS_enable_compaction_filter;
 }
 
 bool InitializeOptionsFromFile(Options& options) {
-#ifndef ROCKSDB_LITE
   DBOptions db_options;
+  ConfigOptions config_options;
+  config_options.ignore_unknown_options = false;
+  config_options.input_strings_escaped = true;
+  config_options.env = raw_env;
   std::vector<ColumnFamilyDescriptor> cf_descriptors;
   if (!FLAGS_options_file.empty()) {
-    Status s = LoadOptionsFromFile(FLAGS_options_file, db_stress_env,
+    Status s = LoadOptionsFromFile(config_options, FLAGS_options_file,
                                    &db_options, &cf_descriptors);
     if (!s.ok()) {
       fprintf(stderr, "Unable to load options file %s --- %s\n",
               FLAGS_options_file.c_str(), s.ToString().c_str());
       exit(1);
     }
-    db_options.env = new DbStressEnvWrapper(db_stress_env);
+    db_options.env = new CompositeEnvWrapper(raw_env);
     options = Options(db_options, cf_descriptors[0].options);
     return true;
   }
-#else
-  (void)options;
-  fprintf(stderr, "--options_file not supported in lite mode\n");
-  exit(1);
-#endif  //! ROCKSDB_LITE
   return false;
 }
 
 void InitializeOptionsFromFlags(
     const std::shared_ptr<Cache>& cache,
-    const std::shared_ptr<Cache>& block_cache_compressed,
     const std::shared_ptr<const FilterPolicy>& filter_policy,
+    const std::shared_ptr<UserDefinedIndexFactory>& udi_factory,
     Options& options) {
   BlockBasedTableOptions block_based_options;
+  block_based_options.decouple_partitioned_filters =
+      FLAGS_decouple_partitioned_filters;
   block_based_options.block_cache = cache;
   block_based_options.cache_index_and_filter_blocks =
       FLAGS_cache_index_and_filter_blocks;
@@ -3052,7 +5235,6 @@ void InitializeOptionsFromFlags(
       static_cast<PinningTier>(FLAGS_partition_pinning);
   block_based_options.metadata_cache_options.unpartitioned_pinning =
       static_cast<PinningTier>(FLAGS_unpartitioned_pinning);
-  block_based_options.block_cache_compressed = block_cache_compressed;
   block_based_options.checksum = checksum_type_e;
   block_based_options.block_size = FLAGS_block_size;
   block_based_options.cache_usage_options.options_overrides.insert(
@@ -3082,6 +5264,8 @@ void InitializeOptionsFromFlags(
             : CacheEntryRoleOptions::Decision::kDisabled}});
   block_based_options.format_version =
       static_cast<uint32_t>(FLAGS_format_version);
+  block_based_options.separate_key_value_in_data_block =
+      FLAGS_separate_key_value_in_data_block;
   block_based_options.index_block_restart_interval =
       static_cast<int32_t>(FLAGS_index_block_restart_interval);
   block_based_options.filter_policy = filter_policy;
@@ -3095,6 +5279,10 @@ void InitializeOptionsFromFlags(
   block_based_options.data_block_index_type =
       static_cast<BlockBasedTableOptions::DataBlockIndexType>(
           FLAGS_data_block_index_type);
+  block_based_options.index_block_search_type =
+      static_cast<BlockBasedTableOptions::BlockSearchType>(
+          FLAGS_index_block_search_type);
+  block_based_options.uniform_cv_threshold = FLAGS_uniform_cv_threshold;
   block_based_options.prepopulate_block_cache =
       static_cast<BlockBasedTableOptions::PrepopulateBlockCache>(
           FLAGS_prepopulate_block_cache);
@@ -3103,20 +5291,56 @@ void InitializeOptionsFromFlags(
   block_based_options.max_auto_readahead_size = FLAGS_max_auto_readahead_size;
   block_based_options.num_file_reads_for_auto_readahead =
       FLAGS_num_file_reads_for_auto_readahead;
+  block_based_options.cache_index_and_filter_blocks_with_high_priority =
+      FLAGS_cache_index_and_filter_blocks_with_high_priority;
+  block_based_options.use_delta_encoding = FLAGS_use_delta_encoding;
+  block_based_options.verify_compression = FLAGS_verify_compression;
+  block_based_options.read_amp_bytes_per_bit = FLAGS_read_amp_bytes_per_bit;
+  block_based_options.enable_index_compression = FLAGS_enable_index_compression;
+  block_based_options.index_shortening =
+      static_cast<BlockBasedTableOptions::IndexShorteningMode>(
+          FLAGS_index_shortening);
+  block_based_options.block_align = FLAGS_block_align;
+  block_based_options.super_block_alignment_size =
+      fLU64::FLAGS_super_block_alignment_size;
+  block_based_options.super_block_alignment_space_overhead_ratio =
+      fLU64::FLAGS_super_block_alignment_space_overhead_ratio;
+  if (udi_factory) {
+    block_based_options.user_defined_index_factory = udi_factory;
+    if (FLAGS_use_udi_as_primary_index) {
+      block_based_options.use_udi_as_primary_index = true;
+    }
+    // Write fault injection can corrupt the UDI meta block during SST
+    // creation. In primary mode all reads route through the UDI, so a
+    // corrupted UDI block causes the reader to fail, making compaction
+    // read zero keys from the affected SST and triggering a false
+    // positive in record count verification. In secondary mode this is
+    // not an issue because reads fall back to the standard index.
+    if (FLAGS_use_udi_as_primary_index &&
+        (FLAGS_write_fault_one_in > 0 ||
+         FLAGS_metadata_write_fault_one_in > 0)) {
+      options.compaction_verify_record_count = false;
+    }
+  }
   options.table_factory.reset(NewBlockBasedTableFactory(block_based_options));
   options.db_write_buffer_size = FLAGS_db_write_buffer_size;
   options.write_buffer_size = FLAGS_write_buffer_size;
   options.max_write_buffer_number = FLAGS_max_write_buffer_number;
   options.min_write_buffer_number_to_merge =
       FLAGS_min_write_buffer_number_to_merge;
-  options.max_write_buffer_number_to_maintain =
-      FLAGS_max_write_buffer_number_to_maintain;
   options.max_write_buffer_size_to_maintain =
       FLAGS_max_write_buffer_size_to_maintain;
   options.memtable_prefix_bloom_size_ratio =
       FLAGS_memtable_prefix_bloom_size_ratio;
+  if (FLAGS_use_write_buffer_manager) {
+    options.write_buffer_manager = wbm;
+  }
   options.memtable_whole_key_filtering = FLAGS_memtable_whole_key_filtering;
-  options.disable_auto_compactions = FLAGS_disable_auto_compactions;
+  if (ShouldDisableAutoCompactionsBeforeVerifyDb()) {
+    options.disable_auto_compactions = true;
+  } else {
+    options.disable_auto_compactions = FLAGS_disable_auto_compactions;
+  }
   options.max_background_compactions = FLAGS_max_background_compactions;
   options.max_background_flushes = FLAGS_max_background_flushes;
   options.compaction_style =
@@ -3125,21 +5349,47 @@ void InitializeOptionsFromFlags(
       ROCKSDB_NAMESPACE::CompactionStyle::kCompactionStyleFIFO) {
     options.compaction_options_fifo.allow_compaction =
         FLAGS_fifo_allow_compaction;
+    if (FLAGS_fifo_compaction_max_data_files_size_mb > 0) {
+      options.compaction_options_fifo.max_data_files_size =
+          FLAGS_fifo_compaction_max_data_files_size_mb * 1024 * 1024;
+    }
+    if (FLAGS_fifo_compaction_max_table_files_size_mb > 0) {
+      options.compaction_options_fifo.max_table_files_size =
+          FLAGS_fifo_compaction_max_table_files_size_mb * 1024 * 1024;
+    }
+    options.compaction_options_fifo.use_kv_ratio_compaction =
+        FLAGS_fifo_compaction_use_kv_ratio_compaction;
   }
   options.compaction_pri =
       static_cast<ROCKSDB_NAMESPACE::CompactionPri>(FLAGS_compaction_pri);
   options.num_levels = FLAGS_num_levels;
   if (FLAGS_prefix_size >= 0) {
     options.prefix_extractor.reset(NewFixedPrefixTransform(FLAGS_prefix_size));
+    if (FLAGS_enable_memtable_insert_with_hint_prefix_extractor) {
+      options.memtable_insert_with_hint_prefix_extractor =
+          options.prefix_extractor;
+    }
   }
   options.max_open_files = FLAGS_open_files;
-  options.statistics = dbstats;
-  options.env = db_stress_env;
+  options.open_files_async = FLAGS_open_files_async;
+  options.async_wal_precreate = FLAGS_async_wal_precreate;
+  if (FLAGS_open_files_async && !FLAGS_skip_stats_update_on_db_open) {
+    FLAGS_skip_stats_update_on_db_open = true;
+    fprintf(stderr,
+            "open_files_async requires skip_stats_update_on_db_open, "
+            "enabling it automatically\n");
+  }
+  if (FLAGS_statistics) {
+    options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
+  }
+  options.env = raw_env;
   options.use_fsync = FLAGS_use_fsync;
   options.compaction_readahead_size = FLAGS_compaction_readahead_size;
   options.allow_mmap_reads = FLAGS_mmap_read;
   options.allow_mmap_writes = FLAGS_mmap_write;
   options.use_direct_reads = FLAGS_use_direct_reads;
+  options.use_direct_io_for_compaction_reads =
+      FLAGS_use_direct_io_for_compaction_reads;
   options.use_direct_io_for_flush_and_compaction =
       FLAGS_use_direct_io_for_flush_and_compaction;
   options.recycle_log_file_num =
@@ -3166,21 +5416,29 @@ void InitializeOptionsFromFlags(
         FLAGS_compression_use_zstd_dict_trainer;
   } else if (!FLAGS_compression_use_zstd_dict_trainer) {
     fprintf(
-        stderr,
+        stdout,
         "WARNING: use_zstd_dict_trainer is false but zstd finalizeDictionary "
         "cannot be used because ZSTD 1.4.5+ is not linked with the binary."
         " zstd dictionary trainer will be used.\n");
   }
+  if (FLAGS_compression_checksum) {
+    options.compression_opts.checksum = true;
+  }
   options.max_manifest_file_size = FLAGS_max_manifest_file_size;
-  options.inplace_update_support = FLAGS_in_place_update;
+  options.max_manifest_space_amp_pct = FLAGS_max_manifest_space_amp_pct;
+  options.verify_manifest_content_on_close =
+      FLAGS_verify_manifest_content_on_close;
   options.max_subcompactions = static_cast<uint32_t>(FLAGS_subcompactions);
   options.allow_concurrent_memtable_write =
       FLAGS_allow_concurrent_memtable_write;
   options.experimental_mempurge_threshold =
       FLAGS_experimental_mempurge_threshold;
   options.periodic_compaction_seconds = FLAGS_periodic_compaction_seconds;
+  options.daily_offpeak_time_utc = FLAGS_daily_offpeak_time_utc;
   options.stats_dump_period_sec =
       static_cast<unsigned int>(FLAGS_stats_dump_period_sec);
+  options.max_compaction_trigger_wakeup_seconds =
+      FLAGS_max_compaction_trigger_wakeup_seconds;
   options.ttl = FLAGS_compaction_ttl;
   options.enable_pipelined_write = FLAGS_enable_pipelined_write;
   options.enable_write_thread_adaptive_yield =
@@ -3192,23 +5450,43 @@ void InitializeOptionsFromFlags(
       FLAGS_universal_max_merge_width;
   options.compaction_options_universal.max_size_amplification_percent =
       FLAGS_universal_max_size_amplification_percent;
+  options.compaction_options_universal.max_read_amp =
+      FLAGS_universal_max_read_amp;
   options.atomic_flush = FLAGS_atomic_flush;
   options.manual_wal_flush = FLAGS_manual_wal_flush_one_in > 0 ? true : false;
   options.avoid_unnecessary_blocking_io = FLAGS_avoid_unnecessary_blocking_io;
   options.write_dbid_to_manifest = FLAGS_write_dbid_to_manifest;
+  options.optimize_manifest_for_recovery = FLAGS_optimize_manifest_for_recovery;
+  options.write_identity_file = FLAGS_write_identity_file;
+  options.reuse_manifest_on_open = FLAGS_reuse_manifest_on_open;
   options.avoid_flush_during_recovery = FLAGS_avoid_flush_during_recovery;
+  options.enforce_write_buffer_manager_during_recovery =
+      FLAGS_enforce_write_buffer_manager_during_recovery;
   options.max_write_batch_group_size_bytes =
       FLAGS_max_write_batch_group_size_bytes;
   options.level_compaction_dynamic_level_bytes =
       FLAGS_level_compaction_dynamic_level_bytes;
   options.track_and_verify_wals_in_manifest = true;
+  options.track_and_verify_wals = FLAGS_track_and_verify_wals;
   options.verify_sst_unique_id_in_manifest =
       FLAGS_verify_sst_unique_id_in_manifest;
+  options.fast_sst_open = FLAGS_fast_sst_open;
   options.memtable_protection_bytes_per_key =
       FLAGS_memtable_protection_bytes_per_key;
+  options.block_protection_bytes_per_key = FLAGS_block_protection_bytes_per_key;
+  options.verify_output_flags =
+      static_cast<VerifyOutputFlags>(FLAGS_verify_output_flags);
+  options.paranoid_memory_checks = FLAGS_paranoid_memory_checks;
+  options.memtable_verify_per_key_checksum_on_seek =
+      FLAGS_memtable_verify_per_key_checksum_on_seek;
+  options.memtable_batch_lookup_optimization =
+      FLAGS_memtable_batch_lookup_optimization;
 
   // Integrated BlobDB
   options.enable_blob_files = FLAGS_enable_blob_files;
+  options.enable_blob_direct_write = FLAGS_enable_blob_direct_write;
+  options.blob_direct_write_partitions =
+      static_cast<uint32_t>(FLAGS_blob_direct_write_partitions);
   options.min_blob_size = FLAGS_min_blob_size;
   options.blob_file_size = FLAGS_blob_file_size;
   options.blob_compression_type =
@@ -3220,6 +5498,8 @@ void InitializeOptionsFromFlags(
       FLAGS_blob_garbage_collection_force_threshold;
   options.blob_compaction_readahead_size = FLAGS_blob_compaction_readahead_size;
   options.blob_file_starting_level = FLAGS_blob_file_starting_level;
+  options.read_triggered_compaction_threshold =
+      FLAGS_read_triggered_compaction_threshold;
 
   if (FLAGS_use_blob_cache) {
     if (FLAGS_use_shared_block_and_blob_cache) {
@@ -3253,37 +5533,47 @@ void InitializeOptionsFromFlags(
   options.wal_compression =
       StringToCompressionType(FLAGS_wal_compression.c_str());
 
-  if (FLAGS_enable_tiered_storage) {
-    options.bottommost_temperature = Temperature::kCold;
+  options.last_level_temperature =
+      StringToTemperature(FLAGS_last_level_temperature.c_str());
+  options.default_write_temperature =
+      StringToTemperature(FLAGS_default_write_temperature.c_str());
+  options.default_temperature =
+      StringToTemperature(FLAGS_default_temperature.c_str());
+
+  if (!FLAGS_file_temperature_age_thresholds.empty()) {
+    const std::string allowTrivialCopyBoolStr =
+        FLAGS_allow_trivial_copy_when_change_temperature ? "true" : "false";
+    Status s = GetColumnFamilyOptionsFromString(
+        {}, options,
+        "compaction_options_fifo={file_temperature_age_thresholds=" +
+            FLAGS_file_temperature_age_thresholds +
+            ";allow_trivial_copy_when_change_temperature=" +
+            allowTrivialCopyBoolStr + "}",
+        &options);
+    if (!s.ok()) {
+      fprintf(stderr, "While setting file_temperature_age_thresholds: %s\n",
+              s.ToString().c_str());
+      exit(1);
+    }
   }
+  // NOTE: allow -1 to mean starting disabled but dynamically changing
   options.preclude_last_level_data_seconds =
-      FLAGS_preclude_last_level_data_seconds;
+      std::max(FLAGS_preclude_last_level_data_seconds, int64_t{0});
   options.preserve_internal_time_seconds = FLAGS_preserve_internal_time_seconds;
 
   switch (FLAGS_rep_factory) {
     case kSkipList:
       // no need to do anything
       break;
-#ifndef ROCKSDB_LITE
     case kHashSkipList:
       options.memtable_factory.reset(NewHashSkipListRepFactory(10000));
       break;
     case kVectorRep:
       options.memtable_factory.reset(new VectorRepFactory());
       break;
-#else
-    default:
-      fprintf(stderr,
-              "RocksdbLite only supports skip list mem table. Skip "
-              "--rep_factory\n");
-#endif  // ROCKSDB_LITE
   }
 
-  if (FLAGS_use_full_merge_v1) {
-    options.merge_operator = MergeOperators::CreateDeprecatedPutOperator();
-  } else {
-    options.merge_operator = MergeOperators::CreatePutOperator();
-  }
+  InitializeMergeOperator(options);
 
   if (FLAGS_enable_compaction_filter) {
     options.compaction_filter_factory =
@@ -3292,29 +5582,86 @@ void InitializeOptionsFromFlags(
 
   options.best_efforts_recovery = FLAGS_best_efforts_recovery;
   options.paranoid_file_checks = FLAGS_paranoid_file_checks;
-  options.fail_if_options_file_error = FLAGS_fail_if_options_file_error;
 
   if (FLAGS_user_timestamp_size > 0) {
     CheckAndSetOptionsForUserTimestamp(options);
   }
 
   options.allow_data_in_errors = FLAGS_allow_data_in_errors;
+
+  options.enable_thread_tracking = FLAGS_enable_thread_tracking;
+
+  options.memtable_max_range_deletions = FLAGS_memtable_max_range_deletions;
+
+  options.bottommost_file_compaction_delay =
+      FLAGS_bottommost_file_compaction_delay;
+
+  options.allow_fallocate = FLAGS_allow_fallocate;
+  options.table_cache_numshardbits = FLAGS_table_cache_numshardbits;
+  options.log_readahead_size = FLAGS_log_readahead_size;
+  options.bgerror_resume_retry_interval = FLAGS_bgerror_resume_retry_interval;
+  options.delete_obsolete_files_period_micros =
+      FLAGS_delete_obsolete_files_period_micros;
+  options.max_log_file_size = FLAGS_max_log_file_size;
+  options.log_file_time_to_roll = FLAGS_log_file_time_to_roll;
+  options.use_adaptive_mutex = FLAGS_use_adaptive_mutex;
+  options.advise_random_on_open = FLAGS_advise_random_on_open;
+  // TODO (hx235): test the functionality of `WAL_ttl_seconds`,
+  // `WAL_size_limit_MB` i.e, `GetUpdatesSince()`
+  options.WAL_ttl_seconds = FLAGS_WAL_ttl_seconds;
+  options.WAL_size_limit_MB = FLAGS_WAL_size_limit_MB;
+  options.wal_bytes_per_sync = FLAGS_wal_bytes_per_sync;
+  options.strict_bytes_per_sync = FLAGS_strict_bytes_per_sync;
+  options.avoid_flush_during_shutdown = FLAGS_avoid_flush_during_shutdown;
+  options.dump_malloc_stats = FLAGS_dump_malloc_stats;
+  options.stats_history_buffer_size = FLAGS_stats_history_buffer_size;
+  options.skip_stats_update_on_db_open = FLAGS_skip_stats_update_on_db_open;
+  options.optimize_filters_for_hits = FLAGS_optimize_filters_for_hits;
+  options.sample_for_compression = FLAGS_sample_for_compression;
+  options.report_bg_io_stats = FLAGS_report_bg_io_stats;
+  options.manifest_preallocation_size = FLAGS_manifest_preallocation_size;
+  if (FLAGS_enable_checksum_handoff) {
+    options.checksum_handoff_file_types = {FileTypeSet::All()};
+  } else {
+    options.checksum_handoff_file_types = {};
+  }
+  options.max_total_wal_size = FLAGS_max_total_wal_size;
+  options.soft_pending_compaction_bytes_limit =
+      FLAGS_soft_pending_compaction_bytes_limit;
+  options.hard_pending_compaction_bytes_limit =
+      FLAGS_hard_pending_compaction_bytes_limit;
+  options.max_sequential_skip_in_iterations =
+      FLAGS_max_sequential_skip_in_iterations;
+  if (FLAGS_enable_sst_partitioner_factory) {
+    options.sst_partitioner_factory = std::shared_ptr<SstPartitionerFactory>(
+        NewSstPartitionerFixedPrefixFactory(1));
+  }
+  options.lowest_used_cache_tier =
+      static_cast<CacheTier>(FLAGS_lowest_used_cache_tier);
+  options.inplace_update_support = FLAGS_inplace_update_support;
+  options.uncache_aggressiveness = FLAGS_uncache_aggressiveness;
+
+  options.memtable_op_scan_flush_trigger = FLAGS_memtable_op_scan_flush_trigger;
+  options.min_tombstones_for_range_conversion =
+      FLAGS_min_tombstones_for_range_conversion;
+  options.compaction_options_universal.reduce_file_locking =
+      FLAGS_universal_reduce_file_locking;
 }
 
 void InitializeOptionsGeneral(
     const std::shared_ptr<Cache>& cache,
-    const std::shared_ptr<Cache>& block_cache_compressed,
     const std::shared_ptr<const FilterPolicy>& filter_policy,
+    const std::shared_ptr<SstQueryFilterConfigsManager::Factory>& sqfc_factory,
     Options& options) {
   options.create_missing_column_families = true;
   options.create_if_missing = true;
 
-  if (!options.statistics) {
-    options.statistics = dbstats;
+  if (FLAGS_statistics) {
+    options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
   }
 
   if (options.env == Options().env) {
-    options.env = db_stress_env;
+    options.env = raw_env;
   }
 
   assert(options.table_factory);
@@ -3324,10 +5671,6 @@ void InitializeOptionsGeneral(
     if (FLAGS_cache_size > 0) {
       table_options->block_cache = cache;
     }
-    if (!table_options->block_cache_compressed &&
-        FLAGS_compressed_cache_size > 0) {
-      table_options->block_cache_compressed = block_cache_compressed;
-    }
     if (!table_options->filter_policy) {
       table_options->filter_policy = filter_policy;
     }
@@ -3335,14 +5678,8 @@ void InitializeOptionsGeneral(
 
   // TODO: row_cache, thread-pool IO priority, CPU priority.
 
-  if (!options.rate_limiter) {
-    if (FLAGS_rate_limiter_bytes_per_sec > 0) {
-      options.rate_limiter.reset(NewGenericRateLimiter(
-          FLAGS_rate_limiter_bytes_per_sec, 1000 /* refill_period_us */,
-          10 /* fairness */,
-          FLAGS_rate_limit_bg_reads ? RateLimiter::Mode::kReadsOnly
-                                    : RateLimiter::Mode::kWritesOnly));
-    }
+  if (!options.rate_limiter && rate_limiter) {
+    options.rate_limiter = rate_limiter;
   }
 
   if (!options.file_checksum_gen_factory) {
@@ -3350,11 +5687,33 @@ void InitializeOptionsGeneral(
         GetFileChecksumImpl(FLAGS_file_checksum_impl);
   }
 
+  if (FLAGS_preserve_unverified_changes) {
+    if (!options.avoid_flush_during_recovery) {
+      fprintf(stderr,
+              "WARNING: flipping `avoid_flush_during_recovery` to true for "
+              "`preserve_unverified_changes` to keep all files\n");
+      options.avoid_flush_during_recovery = true;
+    }
+    if (options.enforce_write_buffer_manager_during_recovery) {
+      fprintf(
+          stderr,
+          "WARNING: flipping `enforce_write_buffer_manager_during_recovery` "
+          "to false for `preserve_unverified_changes` to keep all files\n");
+      options.enforce_write_buffer_manager_during_recovery = false;
+    }
+    // Together with `avoid_flush_during_recovery == true` and
+    // `enforce_write_buffer_manager_during_recovery == false`, this will
+    // prevent live files from becoming obsolete and deleted between
+    // `DB::Open()` and `DisableFileDeletions()` due to flush or compaction.
+    // We do not need to warn the user since we will reenable compaction soon.
+    options.disable_auto_compactions = true;
+  }
+
   if (FLAGS_sst_file_manager_bytes_per_sec > 0 ||
       FLAGS_sst_file_manager_bytes_per_truncate > 0) {
     Status status;
     options.sst_file_manager.reset(NewSstFileManager(
-        db_stress_env, options.info_log, "" /* trash_dir */,
+        raw_env, options.info_log, "" /* trash_dir */,
         static_cast<int64_t>(FLAGS_sst_file_manager_bytes_per_sec),
         true /* delete_existing_trash */, &status,
         0.25 /* max_trash_db_ratio */,
@@ -3366,22 +5725,23 @@ void InitializeOptionsGeneral(
     }
   }
 
-  if (FLAGS_preserve_unverified_changes) {
-    if (!options.avoid_flush_during_recovery) {
-      fprintf(stderr,
-              "WARNING: flipping `avoid_flush_during_recovery` to true for "
-              "`preserve_unverified_changes` to keep all files\n");
-      options.avoid_flush_during_recovery = true;
-    }
-    // Together with `avoid_flush_during_recovery == true`, this will prevent
-    // live files from becoming obsolete and deleted between `DB::Open()` and
-    // `DisableFileDeletions()` due to flush or compaction. We do not need to
-    // warn the user since we will reenable compaction soon.
-    options.disable_auto_compactions = true;
-  }
-
+  options.table_properties_collector_factories.clear();
   options.table_properties_collector_factories.emplace_back(
       std::make_shared<DbStressTablePropertiesCollectorFactory>());
+
+  if (sqfc_factory && !sqfc_factory->GetConfigs().IsEmptyNotFound()) {
+    options.table_properties_collector_factories.emplace_back(sqfc_factory);
+  }
+
+  // Add CompactOnDeletionCollectorFactory if enabled
+  if (FLAGS_enable_compaction_on_deletion_trigger) {
+    options.table_properties_collector_factories.emplace_back(
+        ROCKSDB_NAMESPACE::NewCompactOnDeletionCollectorFactory(
+            FLAGS_compaction_on_deletion_window_size,
+            FLAGS_compaction_on_deletion_trigger_count,
+            FLAGS_compaction_on_deletion_ratio,
+            FLAGS_compaction_on_deletion_min_file_size));
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE

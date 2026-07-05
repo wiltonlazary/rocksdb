@@ -233,8 +233,8 @@ TEST(HashTest, Hash64SmallValueSchema) {
             uint64_t{10551812464348219044u});
 }
 
-std::string Hash64TestDescriptor(const char *repeat, size_t limit) {
-  const char *mod61_encode =
+std::string Hash64TestDescriptor(const char* repeat, size_t limit) {
+  const char* mod61_encode =
       "abcdefghijklmnopqrstuvwxyz123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
   std::string input;
@@ -388,8 +388,8 @@ TEST(HashTest, Hash128Trivial) {
   }
 }
 
-std::string Hash128TestDescriptor(const char *repeat, size_t limit) {
-  const char *mod61_encode =
+std::string Hash128TestDescriptor(const char* repeat, size_t limit) {
+  const char* mod61_encode =
       "abcdefghijklmnopqrstuvwxyz123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
   std::string input;
@@ -565,6 +565,8 @@ size_t FastRange64(uint64_t hash, size_t range) {
 // Tests for math.h / math128.h (not worth a separate test binary)
 using ROCKSDB_NAMESPACE::BitParity;
 using ROCKSDB_NAMESPACE::BitsSetToOne;
+using ROCKSDB_NAMESPACE::BitwiseAnd;
+using ROCKSDB_NAMESPACE::BottomNBits;
 using ROCKSDB_NAMESPACE::ConstexprFloorLog2;
 using ROCKSDB_NAMESPACE::CountTrailingZeroBits;
 using ROCKSDB_NAMESPACE::DecodeFixed128;
@@ -579,6 +581,19 @@ using ROCKSDB_NAMESPACE::Unsigned128;
 using ROCKSDB_NAMESPACE::Upper64of128;
 
 int blah(int x) { return DownwardInvolution(x); }
+
+template <typename T1, typename T2>
+static void test_BitwiseAnd(T1 v1, T2 v2) {
+  auto a = BitwiseAnd(v1, v2);
+  // Essentially repeating the implementation :-/
+  if constexpr (sizeof(T1) < sizeof(T2)) {
+    static_assert(std::is_same_v<decltype(a), T1>);
+    EXPECT_EQ(a, static_cast<T1>(v1 & v2));
+  } else {
+    static_assert(std::is_same_v<decltype(a), T2>);
+    EXPECT_EQ(a, static_cast<T2>(v1 & v2));
+  }
+}
 
 template <typename T>
 static void test_BitOps() {
@@ -597,6 +612,34 @@ static void test_BitOps() {
     T v = T{1} << i;
     // If we could directly use arithmetic:
     // T vm1 = static_cast<T>(v - 1);
+
+    // BottomNBits
+    {
+      // build the mask the extremely slow way
+      T bottom_n_mask = 0x00;
+      for (int j = 0; j < i; j++) {
+        bottom_n_mask <<= 1;
+        bottom_n_mask |= 0x1;
+      }
+
+      // An essentially full length value
+      T x = everyOtherBit;
+      if (i > 2) {
+        // Make it slightly irregular
+        x = x ^ (T{1} << (i / 2));
+      }
+      auto a = BottomNBits(x, i);
+      auto b = BottomNBits(~x, i);
+
+      // check that a and b match the expected values
+      EXPECT_EQ(a, x & bottom_n_mask);
+      EXPECT_EQ(b, (~x) & bottom_n_mask);
+
+      EXPECT_EQ(x | a, x);
+      EXPECT_EQ(a | b, vm1);
+      EXPECT_EQ(a & b, T{0});
+      EXPECT_EQ(BottomNBits(x ^ a, i), T{0});
+    }
 
     // FloorLog2
     if (v > 0) {
@@ -707,9 +750,22 @@ static void test_BitOps() {
       }
     }
 
+    // BitwiseAnd
+    {
+      test_BitwiseAnd(vm1, static_cast<char>(0x99));
+      test_BitwiseAnd(v, static_cast<char>(0x99));
+      test_BitwiseAnd(char{0x66}, vm1);
+      test_BitwiseAnd(char{0x66}, v);
+      test_BitwiseAnd(v, int16_t{0x6699});
+      test_BitwiseAnd(v, uint16_t{0x9966});
+      test_BitwiseAnd(int64_t{0x1234234534564567}, v);
+      test_BitwiseAnd(uint64_t{0x9876876576545432}, v);
+    }
+
     vm1 = (vm1 << 1) | 1;
   }
 
+  // ConstexprFloorLog2
   EXPECT_EQ(ConstexprFloorLog2(T{1}), 0);
   EXPECT_EQ(ConstexprFloorLog2(T{2}), 1);
   EXPECT_EQ(ConstexprFloorLog2(T{3}), 1);
@@ -794,7 +850,7 @@ TEST(MathTest, Math128) {
 }
 
 TEST(MathTest, Coding128) {
-  const char *in = "_1234567890123456";
+  const char* in = "_1234567890123456";
   // Note: in + 1 is likely unaligned
   Unsigned128 decoded = DecodeFixed128(in + 1);
   EXPECT_EQ(Lower64of128(decoded), 0x3837363534333231U);
@@ -807,7 +863,7 @@ TEST(MathTest, Coding128) {
 }
 
 TEST(MathTest, CodingGeneric) {
-  const char *in = "_1234567890123456";
+  const char* in = "_1234567890123456";
   // Decode
   // Note: in + 1 is likely unaligned
   Unsigned128 decoded128 = DecodeFixedGeneric<Unsigned128>(in + 1);
@@ -843,7 +899,7 @@ TEST(MathTest, CodingGeneric) {
   EXPECT_EQ(std::string("_12"), std::string(out));
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
   fprintf(stderr, "NPHash64 id: %x\n",
           static_cast<int>(ROCKSDB_NAMESPACE::GetSliceNPHash64("RocksDB")));
   ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();

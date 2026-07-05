@@ -17,7 +17,7 @@ public class CompactionOptionsFIFO extends RocksObject {
   /**
    * Once the total sum of table files reaches this, we will delete the oldest
    * table file
-   *
+   * <p>
    * Default: 1GB
    *
    * @param maxTableFilesSize The maximum size of the table files
@@ -33,7 +33,7 @@ public class CompactionOptionsFIFO extends RocksObject {
   /**
    * Once the total sum of table files reaches this, we will delete the oldest
    * table file
-   *
+   * <p>
    * Default: 1GB
    *
    * @return max table file size in bytes
@@ -48,7 +48,7 @@ public class CompactionOptionsFIFO extends RocksObject {
    * and compaction won't trigger if average compact bytes per del file is
    * larger than options.write_buffer_size. This is to protect large files
    * from being compacted again.
-   *
+   * <p>
    * Default: false
    *
    * @param allowCompaction true to allow intra-L0 compaction
@@ -61,13 +61,12 @@ public class CompactionOptionsFIFO extends RocksObject {
     return this;
   }
 
-
   /**
    * Check if intra-L0 compaction is enabled.
    * When enabled, we try to compact smaller files into larger ones.
-   *
+   * <p>
    * See {@link #setAllowCompaction(boolean)}.
-   *
+   * <p>
    * Default: false
    *
    * @return true if intra-L0 compaction is enabled, false otherwise.
@@ -76,14 +75,65 @@ public class CompactionOptionsFIFO extends RocksObject {
     return allowCompaction(nativeHandle_);
   }
 
+  /**
+   * Combined SST + blob file size limit for FIFO compaction trimming.
+   * When non-zero, FIFO uses total_sst + total_blob for size-based dropping.
+   * When zero (default), uses max_table_files_size (SST-only).
+   *
+   * @param maxDataFilesSize the combined size limit in bytes
+   *
+   * @return the reference to the current options.
+   */
+  public CompactionOptionsFIFO setMaxDataFilesSize(final long maxDataFilesSize) {
+    setMaxDataFilesSize(nativeHandle_, maxDataFilesSize);
+    return this;
+  }
 
-  private native static long newCompactionOptionsFIFO();
-  @Override protected final native void disposeInternal(final long handle);
+  /**
+   * Get the combined SST + blob file size limit.
+   *
+   * @return max data files size in bytes, 0 means disabled
+   */
+  public long maxDataFilesSize() {
+    return maxDataFilesSize(nativeHandle_);
+  }
 
-  private native void setMaxTableFilesSize(final long handle,
-      final long maxTableFilesSize);
-  private native long maxTableFilesSize(final long handle);
-  private native void setAllowCompaction(final long handle,
-      final boolean allowCompaction);
-  private native boolean allowCompaction(final long handle);
+  /**
+   * Enable capacity-derived intra-L0 compaction using the observed key/value
+   * size ratio. Requires maxDataFilesSize &gt; 0.
+   *
+   * @param useKvRatioCompaction true to enable
+   *
+   * @return the reference to the current options.
+   */
+  public CompactionOptionsFIFO setUseKvRatioCompaction(final boolean useKvRatioCompaction) {
+    setUseKvRatioCompaction(nativeHandle_, useKvRatioCompaction);
+    return this;
+  }
+
+  /**
+   * Check if capacity-derived intra-L0 compaction is enabled.
+   *
+   * @return true if enabled
+   */
+  public boolean useKvRatioCompaction() {
+    return useKvRatioCompaction(nativeHandle_);
+  }
+
+  private static native long newCompactionOptionsFIFO();
+  @Override
+  protected final void disposeInternal(final long handle) {
+    disposeInternalJni(handle);
+  }
+  private static native void disposeInternalJni(final long handle);
+
+  private static native void setMaxTableFilesSize(final long handle, final long maxTableFilesSize);
+  private static native long maxTableFilesSize(final long handle);
+  private static native void setAllowCompaction(final long handle, final boolean allowCompaction);
+  private static native boolean allowCompaction(final long handle);
+  private static native void setMaxDataFilesSize(final long handle, final long maxDataFilesSize);
+  private static native long maxDataFilesSize(final long handle);
+  private static native void setUseKvRatioCompaction(
+      final long handle, final boolean useKvRatioCompaction);
+  private static native boolean useKvRatioCompaction(final long handle);
 }

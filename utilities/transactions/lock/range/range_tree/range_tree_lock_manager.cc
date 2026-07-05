@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-#ifndef ROCKSDB_LITE
 #ifndef OS_WIN
 
 #include "utilities/transactions/lock/range/range_tree/range_tree_lock_manager.h"
@@ -131,7 +130,7 @@ Status RangeTreeLockManager::TryLock(PessimisticTransaction* txn,
     case DB_LOCK_NOTGRANTED:
       return Status::TimedOut(Status::SubCode::kLockTimeout);
     case TOKUDB_OUT_OF_LOCKS:
-      return Status::Busy(Status::SubCode::kLockLimit);
+      return Status::LockLimit();
     case DB_LOCK_DEADLOCK: {
       std::reverse(di_path.begin(), di_path.end());
       dlock_buffer_.AddNewPath(
@@ -140,7 +139,7 @@ Status RangeTreeLockManager::TryLock(PessimisticTransaction* txn,
     }
     default:
       assert(0);
-      return Status::Busy(Status::SubCode::kLockLimit);
+      return Status::LockLimit();
   }
 
   return Status::OK();
@@ -150,7 +149,7 @@ Status RangeTreeLockManager::TryLock(PessimisticTransaction* txn,
 // the lock waits that are in progress.
 void wait_callback_for_locktree(void*, toku::lock_wait_infos* infos) {
   TEST_SYNC_POINT("RangeTreeLockManager::TryRangeLock:EnterWaitingTxn");
-  for (auto wait_info : *infos) {
+  for (const auto& wait_info : *infos) {
     // As long as we hold the lock on the locktree's pending request queue
     // this should be safe.
     auto txn = (PessimisticTransaction*)wait_info.waiter;
@@ -202,6 +201,20 @@ void RangeTreeLockManager::UnLock(PessimisticTransaction* txn,
   ((RangeTreeLockTracker*)range_tracker)->ReleaseLocks(this, txn, all_keys);
 }
 
+// Comparator for range-lock endpoints. This is intentionally
+// direction-AGNOSTIC: it orders the user-key bytes with the column family's own
+// comparator, then breaks ties on the endpoint-type suffix byte (infimum before
+// supremum), which is a positional marker independent of the CF's sort
+// direction.
+//
+// CALLER REQUIREMENT: it is the caller's responsibility to pass in a flipped
+// (swapped start/end, with negated infimum/supremum flags) range for RangeLock
+// to work on a REVERSE-ORDERED column family. The locktree requires every range
+// to satisfy left <= right, and this comparator does NOT compensate for reverse
+// ordering on the caller's behalf. MyRocks does this flip today in
+// ha_rocksdb::set_range_lock() (see its "RangeFlagsShouldBeFlippedForRevCF"
+// comment). Do not re-add reverse-awareness here (that double-corrects callers
+// like MyRocks that already flip).
 int RangeTreeLockManager::CompareDbtEndpoints(void* arg, const DBT* a_key,
                                               const DBT* b_key) {
   const char* a = (const char*)a_key->data;
@@ -215,26 +228,21 @@ int RangeTreeLockManager::CompareDbtEndpoints(void* arg, const DBT* a_key,
   // Compare the values. The first byte encodes the endpoint type, its value
   // is either SUFFIX_INFIMUM or SUFFIX_SUPREMUM.
   Comparator* cmp = (Comparator*)arg;
-  int res = cmp->Compare(Slice(a + 1, min_len - 1), Slice(b + 1, min_len - 1));
+  int res = cmp->CompareWithoutTimestamp(
+      Slice(a + 1, min_len - 1), /*a_has_ts=*/false, Slice(b + 1, min_len - 1),
+      /*b_has_ts=*/false);
   if (!res) {
+    // The user keys compared equal above, so order by the endpoint-type suffix
+    // byte (a positional boundary marker: infimum before the key, supremum
+    // after) -- direction-independent; see the function-level comment.
     if (b_len > min_len) {
-      // a is shorter;
-      if (a[0] == SUFFIX_INFIMUM) {
-        return -1;  //"a is smaller"
-      } else {
-        // a is considered padded with 0xFF:FF:FF:FF...
-        return 1;  // "a" is bigger
-      }
+      // a's user key is a prefix of b's; a is shorter.
+      return a[0] == SUFFIX_INFIMUM ? -1 : 1;
     } else if (a_len > min_len) {
-      // the opposite of the above: b is shorter.
-      if (b[0] == SUFFIX_INFIMUM) {
-        return 1;  //"b is smaller"
-      } else {
-        // b is considered padded with 0xFF:FF:FF:FF...
-        return -1;  // "b" is bigger
-      }
+      // b's user key is a prefix of a's; b is shorter.
+      return b[0] == SUFFIX_INFIMUM ? 1 : -1;
     } else {
-      // the lengths are equal (and the key values, too)
+      // Same user key: infimum sorts before supremum.
       if (a[0] < b[0]) {
         return -1;
       } else if (a[0] > b[0]) {
@@ -306,7 +314,7 @@ std::vector<DeadlockPath> RangeTreeLockManager::GetDeadlockInfoBuffer() {
       path.push_back(
           {it2->m_txn_id, it2->m_cf_id, it2->m_exclusive, it2->m_start.slice});
     }
-    res.push_back(DeadlockPath(path, it->deadlock_time));
+    res.emplace_back(path, it->deadlock_time);
   }
   return res;
 }
@@ -490,7 +498,7 @@ LockManager::RangeLockStatus RangeTreeLockManager::GetRangeLockStatus() {
   LockManager::RangeLockStatus data;
   {
     InstrumentedMutexLock l(&ltree_map_mutex_);
-    for (auto it : ltree_map_) {
+    for (const auto& it : ltree_map_) {
       LOCK_PRINT_CONTEXT ctx = {&data, it.first};
       it.second->dump_locks((void*)&ctx, push_into_lock_status_data);
     }
@@ -500,4 +508,3 @@ LockManager::RangeLockStatus RangeTreeLockManager::GetRangeLockStatus() {
 
 }  // namespace ROCKSDB_NAMESPACE
 #endif  // OS_WIN
-#endif  // ROCKSDB_LITE

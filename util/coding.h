@@ -18,9 +18,11 @@
 #pragma once
 #include <algorithm>
 #include <string>
+#include <type_traits>
 
 #include "port/port.h"
 #include "rocksdb/slice.h"
+#include "util/cast_util.h"
 #include "util/coding_lean.h"
 
 // Some processors does not allow unaligned access to memory
@@ -34,40 +36,37 @@ namespace ROCKSDB_NAMESPACE {
 const uint32_t kMaxVarint64Length = 10;
 
 // Standard Put... routines append to a string
-extern void PutFixed16(std::string* dst, uint16_t value);
-extern void PutFixed32(std::string* dst, uint32_t value);
-extern void PutFixed64(std::string* dst, uint64_t value);
-extern void PutVarint32(std::string* dst, uint32_t value);
-extern void PutVarint32Varint32(std::string* dst, uint32_t value1,
-                                uint32_t value2);
-extern void PutVarint32Varint32Varint32(std::string* dst, uint32_t value1,
-                                        uint32_t value2, uint32_t value3);
-extern void PutVarint64(std::string* dst, uint64_t value);
-extern void PutVarint64Varint64(std::string* dst, uint64_t value1,
-                                uint64_t value2);
-extern void PutVarint32Varint64(std::string* dst, uint32_t value1,
-                                uint64_t value2);
-extern void PutVarint32Varint32Varint64(std::string* dst, uint32_t value1,
-                                        uint32_t value2, uint64_t value3);
-extern void PutLengthPrefixedSlice(std::string* dst, const Slice& value);
-extern void PutLengthPrefixedSliceParts(std::string* dst,
-                                        const SliceParts& slice_parts);
-extern void PutLengthPrefixedSlicePartsWithPadding(
-    std::string* dst, const SliceParts& slice_parts, size_t pad_sz);
+void PutFixed16(std::string* dst, uint16_t value);
+void PutFixed32(std::string* dst, uint32_t value);
+void PutFixed64(std::string* dst, uint64_t value);
+
+template <typename... Args>
+void PutVarint32(std::string* dst, Args... args);
+void PutVarint64(std::string* dst, uint64_t value);
+void PutVarint64Varint64(std::string* dst, uint64_t value1, uint64_t value2);
+void PutVarint32Varint64(std::string* dst, uint32_t value1, uint64_t value2);
+void PutVarint32Varint32Varint64(std::string* dst, uint32_t value1,
+                                 uint32_t value2, uint64_t value3);
+void PutLengthPrefixedSlice(std::string* dst, const Slice& value);
+void PutLengthPrefixedSliceParts(std::string* dst,
+                                 const SliceParts& slice_parts);
+void PutLengthPrefixedSlicePartsWithPadding(std::string* dst,
+                                            const SliceParts& slice_parts,
+                                            size_t pad_sz);
 
 // Standard Get... routines parse a value from the beginning of a Slice
 // and advance the slice past the parsed value.
-extern bool GetFixed64(Slice* input, uint64_t* value);
-extern bool GetFixed32(Slice* input, uint32_t* value);
-extern bool GetFixed16(Slice* input, uint16_t* value);
-extern bool GetVarint32(Slice* input, uint32_t* value);
-extern bool GetVarint64(Slice* input, uint64_t* value);
-extern bool GetVarsignedint64(Slice* input, int64_t* value);
-extern bool GetLengthPrefixedSlice(Slice* input, Slice* result);
+bool GetFixed64(Slice* input, uint64_t* value);
+bool GetFixed32(Slice* input, uint32_t* value);
+bool GetFixed16(Slice* input, uint16_t* value);
+bool GetVarint32(Slice* input, uint32_t* value);
+bool GetVarint64(Slice* input, uint64_t* value);
+bool GetVarsignedint64(Slice* input, int64_t* value);
+bool GetLengthPrefixedSlice(Slice* input, Slice* result);
 // This function assumes data is well-formed.
-extern Slice GetLengthPrefixedSlice(const char* data);
+Slice GetLengthPrefixedSlice(const char* data);
 
-extern Slice GetSliceUntil(Slice* slice, char delimiter);
+Slice GetSliceUntil(Slice* slice, char delimiter);
 
 // Borrowed from
 // https://github.com/facebook/fbthrift/blob/449a5f77f9f9bae72c9eb5e78093247eef185c04/thrift/lib/cpp/util/VarintUtils-inl.h#L202-L208
@@ -82,10 +81,8 @@ inline int64_t zigzagToI64(uint64_t n) {
 // in *v and return a pointer just past the parsed value, or return
 // nullptr on error.  These routines only look at bytes in the range
 // [p..limit-1]
-extern const char* GetVarint32Ptr(const char* p, const char* limit,
-                                  uint32_t* v);
-extern const char* GetVarint64Ptr(const char* p, const char* limit,
-                                  uint64_t* v);
+const char* GetVarint32Ptr(const char* p, const char* limit, uint32_t* v);
+const char* GetVarint64Ptr(const char* p, const char* limit, uint64_t* v);
 inline const char* GetVarsignedint64Ptr(const char* p, const char* limit,
                                         int64_t* value) {
   uint64_t u = 0;
@@ -95,21 +92,21 @@ inline const char* GetVarsignedint64Ptr(const char* p, const char* limit,
 }
 
 // Returns the length of the varint32 or varint64 encoding of "v"
-extern int VarintLength(uint64_t v);
+uint16_t VarintLength(uint64_t v);
 
 // Lower-level versions of Put... that write directly into a character buffer
 // and return a pointer just past the last byte written.
 // REQUIRES: dst has enough space for the value being written
-extern char* EncodeVarint32(char* dst, uint32_t value);
-extern char* EncodeVarint64(char* dst, uint64_t value);
+char* EncodeVarint32(char* dst, uint32_t value);
+char* EncodeVarint64(char* dst, uint64_t value);
 
 // Internal routine for use by fallback path of GetVarint32Ptr
-extern const char* GetVarint32PtrFallback(const char* p, const char* limit,
-                                          uint32_t* value);
+const char* GetVarint32PtrFallback(const char* p, const char* limit,
+                                   uint32_t* value);
 inline const char* GetVarint32Ptr(const char* p, const char* limit,
                                   uint32_t* value) {
   if (p < limit) {
-    uint32_t result = *(reinterpret_cast<const unsigned char*>(p));
+    uint32_t result = *(lossless_cast<const unsigned char*>(p));
     if ((result & 128) == 0) {
       *value = result;
       return p + 1;
@@ -152,37 +149,26 @@ inline void PutFixed64(std::string* dst, uint64_t value) {
   }
 }
 
-inline void PutVarint32(std::string* dst, uint32_t v) {
-  char buf[5];
-  char* ptr = EncodeVarint32(buf, v);
-  dst->append(buf, static_cast<size_t>(ptr - buf));
-}
-
-inline void PutVarint32Varint32(std::string* dst, uint32_t v1, uint32_t v2) {
-  char buf[10];
-  char* ptr = EncodeVarint32(buf, v1);
-  ptr = EncodeVarint32(ptr, v2);
-  dst->append(buf, static_cast<size_t>(ptr - buf));
-}
-
-inline void PutVarint32Varint32Varint32(std::string* dst, uint32_t v1,
-                                        uint32_t v2, uint32_t v3) {
-  char buf[15];
-  char* ptr = EncodeVarint32(buf, v1);
-  ptr = EncodeVarint32(ptr, v2);
-  ptr = EncodeVarint32(ptr, v3);
+template <typename... Args>
+inline void PutVarint32(std::string* dst, Args... args) {
+  static_assert((std::is_convertible_v<Args, uint32_t> && ...),
+                "All arguments must be convertible to uint32_t");
+  constexpr size_t kMaxBytesPerVarint32 = 5;
+  char buf[sizeof...(args) * kMaxBytesPerVarint32];
+  char* ptr = buf;
+  ((ptr = EncodeVarint32(ptr, static_cast<uint32_t>(args))), ...);
   dst->append(buf, static_cast<size_t>(ptr - buf));
 }
 
 inline char* EncodeVarint64(char* dst, uint64_t v) {
   static const unsigned int B = 128;
-  unsigned char* ptr = reinterpret_cast<unsigned char*>(dst);
+  unsigned char* ptr = lossless_cast<unsigned char*>(dst);
   while (v >= B) {
     *(ptr++) = (v & (B - 1)) | B;
     v >>= 7;
   }
   *(ptr++) = static_cast<unsigned char>(v);
-  return reinterpret_cast<char*>(ptr);
+  return lossless_cast<char*>(ptr);
 }
 
 inline void PutVarint64(std::string* dst, uint64_t v) {
@@ -248,8 +234,8 @@ inline void PutLengthPrefixedSlicePartsWithPadding(
   dst->append(pad_sz, '\0');
 }
 
-inline int VarintLength(uint64_t v) {
-  int len = 1;
+inline uint16_t VarintLength(uint64_t v) {
+  uint16_t len = 1;
   while (v >= 128) {
     v >>= 7;
     len++;
@@ -358,8 +344,7 @@ __attribute__((__no_sanitize__("alignment")))
 __attribute__((__no_sanitize_undefined__))
 #endif
 #endif
-inline void
-PutUnaligned(T* memory, const T& value) {
+inline void PutUnaligned(T* memory, const T& value) {
 #if defined(PLATFORM_UNALIGNED_ACCESS_NOT_ALLOWED)
   char* nonAlignedMemory = reinterpret_cast<char*>(memory);
   memcpy(nonAlignedMemory, reinterpret_cast<const char*>(&value), sizeof(T));
@@ -376,8 +361,7 @@ __attribute__((__no_sanitize__("alignment")))
 __attribute__((__no_sanitize_undefined__))
 #endif
 #endif
-inline void
-GetUnaligned(const T* memory, T* value) {
+inline void GetUnaligned(const T* memory, T* value) {
 #if defined(PLATFORM_UNALIGNED_ACCESS_NOT_ALLOWED)
   char* nonAlignedMemory = reinterpret_cast<char*>(value);
   memcpy(nonAlignedMemory, reinterpret_cast<const char*>(memory), sizeof(T));

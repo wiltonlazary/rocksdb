@@ -146,6 +146,26 @@ public interface DBOptionsInterface<T extends DBOptionsInterface<T>> {
   boolean paranoidChecks();
 
   /**
+   * If true, SST files are opened and validated asynchronously in the
+   * background after DB::Open returns. This reduces DB open time for
+   * databases with many SST files.
+   *
+   * Default: false
+   *
+   * @param openFilesAsync true to enable async file opening.
+   * @return the reference to the current option.
+   */
+  T setOpenFilesAsync(boolean openFilesAsync);
+
+  /**
+   * If true, SST files are opened and validated asynchronously in the
+   * background after DB::Open returns.
+   *
+   * @return a boolean indicating whether async file opening is enabled.
+   */
+  boolean openFilesAsync();
+
+  /**
    * Use to control write rate of flush and compaction. Flush has higher
    * priority than compaction. Rate limiting is disabled if nullptr.
    * Default: nullptr
@@ -185,10 +205,10 @@ public interface DBOptionsInterface<T extends DBOptionsInterface<T>> {
    *
    * <p>Default: nullptr</p>
    *
-   * @param logger {@link Logger} instance.
+   * @param logger {@link LoggerInterface} instance.
    * @return the instance of the current object.
    */
-  T setLogger(Logger logger);
+  T setLogger(LoggerInterface logger);
 
   /**
    * <p>Sets the RocksDB log level. Default level is INFO</p>
@@ -615,21 +635,24 @@ public interface DBOptionsInterface<T extends DBOptionsInterface<T>> {
   int tableCacheNumshardbits();
 
   /**
-   * {@link #walTtlSeconds()} and {@link #walSizeLimitMB()} affect how archived logs
-   * will be deleted.
-   * <ol>
-   * <li>If both set to 0, logs will be deleted asap and will not get into
-   * the archive.</li>
-   * <li>If WAL_ttl_seconds is 0 and WAL_size_limit_MB is not 0,
-   *    WAL files will be checked every 10 min and if total size is greater
-   *    then WAL_size_limit_MB, they will be deleted starting with the
-   *    earliest until size_limit is met. All empty files will be deleted.</li>
-   * <li>If WAL_ttl_seconds is not 0 and WAL_size_limit_MB is 0, then
-   *    WAL files will be checked every WAL_ttl_seconds / 2 and those that
-   *    are older than WAL_ttl_seconds will be deleted.</li>
-   * <li>If both are not 0, WAL files will be checked every 10 min and both
-   *    checks will be performed with ttl being first.</li>
-   * </ol>
+   * {@link #walTtlSeconds()} and {@link #walSizeLimitMB()} affect when WALs
+   * will be archived and deleted.
+   *
+   * When both are zero, obsolete WALs will not be archived and will be deleted
+   * immediately. Otherwise, obsolete WALs will be archived prior to deletion.
+   *
+   * When `WAL_size_limit_MB` is nonzero, archived WALs starting with the
+   * earliest will be deleted until the total size of the archive falls below
+   * this limit. All empty WALs will be deleted.
+   *
+   * When `WAL_ttl_seconds` is nonzero, archived WALs older than
+   * `WAL_ttl_seconds` will be deleted.
+   *
+   * When only `WAL_ttl_seconds` is nonzero, the frequency at which archived
+   * WALs are deleted is every `WAL_ttl_seconds / 2` seconds. When only
+   * `WAL_size_limit_MB` is nonzero, the deletion frequency is every ten
+   * minutes. When both are nonzero, the deletion frequency is the minimum of
+   * those two values.
    *
    * @param walTtlSeconds the ttl seconds
    * @return the instance of the current object.
@@ -638,21 +661,24 @@ public interface DBOptionsInterface<T extends DBOptionsInterface<T>> {
   T setWalTtlSeconds(long walTtlSeconds);
 
   /**
-   * WalTtlSeconds() and walSizeLimitMB() affect how archived logs
-   * will be deleted.
-   * <ol>
-   * <li>If both set to 0, logs will be deleted asap and will not get into
-   * the archive.</li>
-   * <li>If WAL_ttl_seconds is 0 and WAL_size_limit_MB is not 0,
-   * WAL files will be checked every 10 min and if total size is greater
-   * then WAL_size_limit_MB, they will be deleted starting with the
-   * earliest until size_limit is met. All empty files will be deleted.</li>
-   * <li>If WAL_ttl_seconds is not 0 and WAL_size_limit_MB is 0, then
-   * WAL files will be checked every WAL_ttl_seconds / 2 and those that
-   * are older than WAL_ttl_seconds will be deleted.</li>
-   * <li>If both are not 0, WAL files will be checked every 10 min and both
-   * checks will be performed with ttl being first.</li>
-   * </ol>
+   * WalTtlSeconds() and walSizeLimitMB() affect when WALs will be archived and
+   * deleted.
+   *
+   * When both are zero, obsolete WALs will not be archived and will be deleted
+   * immediately. Otherwise, obsolete WALs will be archived prior to deletion.
+   *
+   * When `WAL_size_limit_MB` is nonzero, archived WALs starting with the
+   * earliest will be deleted until the total size of the archive falls below
+   * this limit. All empty WALs will be deleted.
+   *
+   * When `WAL_ttl_seconds` is nonzero, archived WALs older than
+   * `WAL_ttl_seconds` will be deleted.
+   *
+   * When only `WAL_ttl_seconds` is nonzero, the frequency at which archived
+   * WALs are deleted is every `WAL_ttl_seconds / 2` seconds. When only
+   * `WAL_size_limit_MB` is nonzero, the deletion frequency is every ten
+   * minutes. When both are nonzero, the deletion frequency is the minimum of
+   * those two values.
    *
    * @return the wal-ttl seconds
    * @see #walSizeLimitMB()
@@ -662,19 +688,22 @@ public interface DBOptionsInterface<T extends DBOptionsInterface<T>> {
   /**
    * WalTtlSeconds() and walSizeLimitMB() affect how archived logs
    * will be deleted.
-   * <ol>
-   * <li>If both set to 0, logs will be deleted asap and will not get into
-   *    the archive.</li>
-   * <li>If WAL_ttl_seconds is 0 and WAL_size_limit_MB is not 0,
-   *    WAL files will be checked every 10 min and if total size is greater
-   *    then WAL_size_limit_MB, they will be deleted starting with the
-   *    earliest until size_limit is met. All empty files will be deleted.</li>
-   * <li>If WAL_ttl_seconds is not 0 and WAL_size_limit_MB is 0, then
-   *    WAL files will be checked every WAL_ttl_secondsi / 2 and those that
-   *    are older than WAL_ttl_seconds will be deleted.</li>
-   * <li>If both are not 0, WAL files will be checked every 10 min and both
-   *    checks will be performed with ttl being first.</li>
-   * </ol>
+   *
+   * When both are zero, obsolete WALs will not be archived and will be deleted
+   * immediately. Otherwise, obsolete WALs will be archived prior to deletion.
+   *
+   * When `WAL_size_limit_MB` is nonzero, archived WALs starting with the
+   * earliest will be deleted until the total size of the archive falls below
+   * this limit. All empty WALs will be deleted.
+   *
+   * When `WAL_ttl_seconds` is nonzero, archived WALs older than
+   * `WAL_ttl_seconds` will be deleted.
+   *
+   * When only `WAL_ttl_seconds` is nonzero, the frequency at which archived
+   * WALs are deleted is every `WAL_ttl_seconds / 2` seconds. When only
+   * `WAL_size_limit_MB` is nonzero, the deletion frequency is every ten
+   * minutes. When both are nonzero, the deletion frequency is the minimum of
+   * those two values.
    *
    * @param sizeLimitMB size limit in mega-bytes.
    * @return the instance of the current object.
@@ -683,21 +712,25 @@ public interface DBOptionsInterface<T extends DBOptionsInterface<T>> {
   T setWalSizeLimitMB(long sizeLimitMB);
 
   /**
-   * {@link #walTtlSeconds()} and {@code #walSizeLimitMB()} affect how archived logs
-   * will be deleted.
-   * <ol>
-   * <li>If both set to 0, logs will be deleted asap and will not get into
-   *    the archive.</li>
-   * <li>If WAL_ttl_seconds is 0 and WAL_size_limit_MB is not 0,
-   *    WAL files will be checked every 10 min and if total size is greater
-   *    then WAL_size_limit_MB, they will be deleted starting with the
-   *    earliest until size_limit is met. All empty files will be deleted.</li>
-   * <li>If WAL_ttl_seconds is not 0 and WAL_size_limit_MB is 0, then
-   *    WAL files will be checked every WAL_ttl_seconds i / 2 and those that
-   *    are older than WAL_ttl_seconds will be deleted.</li>
-   * <li>If both are not 0, WAL files will be checked every 10 min and both
-   *    checks will be performed with ttl being first.</li>
-   * </ol>
+   * WalTtlSeconds() and walSizeLimitMB() affect when WALs will be archived and
+   * deleted.
+   *
+   * When both are zero, obsolete WALs will not be archived and will be deleted
+   * immediately. Otherwise, obsolete WALs will be archived prior to deletion.
+   *
+   * When `WAL_size_limit_MB` is nonzero, archived WALs starting with the
+   * earliest will be deleted until the total size of the archive falls below
+   * this limit. All empty WALs will be deleted.
+   *
+   * When `WAL_ttl_seconds` is nonzero, archived WALs older than
+   * `WAL_ttl_seconds` will be deleted.
+   *
+   * When only `WAL_ttl_seconds` is nonzero, the frequency at which archived
+   * WALs are deleted is every `WAL_ttl_seconds / 2` seconds. When only
+   * `WAL_size_limit_MB` is nonzero, the deletion frequency is every ten
+   * minutes. When both are nonzero, the deletion frequency is the minimum of
+   * those two values.
+   *
    * @return size limit in mega-bytes.
    * @see #walSizeLimitMB()
    */
@@ -924,76 +957,6 @@ public interface DBOptionsInterface<T extends DBOptionsInterface<T>> {
    * @return the size of the write buffer
    */
   long dbWriteBufferSize();
-
-  /**
-   * Specify the file access pattern once a compaction is started.
-   * It will be applied to all input files of a compaction.
-   *
-   * Default: {@link AccessHint#NORMAL}
-   *
-   * @param accessHint The access hint
-   *
-   * @return the reference to the current options.
-   */
-  T setAccessHintOnCompactionStart(final AccessHint accessHint);
-
-  /**
-   * Specify the file access pattern once a compaction is started.
-   * It will be applied to all input files of a compaction.
-   *
-   * Default: {@link AccessHint#NORMAL}
-   *
-   * @return The access hint
-   */
-  AccessHint accessHintOnCompactionStart();
-
-  /**
-   * This is a maximum buffer size that is used by WinMmapReadableFile in
-   * unbuffered disk I/O mode. We need to maintain an aligned buffer for
-   * reads. We allow the buffer to grow until the specified value and then
-   * for bigger requests allocate one shot buffers. In unbuffered mode we
-   * always bypass read-ahead buffer at ReadaheadRandomAccessFile
-   * When read-ahead is required we then make use of
-   * {@link MutableDBOptionsInterface#compactionReadaheadSize()} value and
-   * always try to read ahead.
-   * With read-ahead we always pre-allocate buffer to the size instead of
-   * growing it up to a limit.
-   *
-   * This option is currently honored only on Windows
-   *
-   * Default: 1 Mb
-   *
-   * Special value: 0 - means do not maintain per instance buffer. Allocate
-   *                per request buffer and avoid locking.
-   *
-   * @param randomAccessMaxBufferSize the maximum size of the random access
-   *     buffer
-   *
-   * @return the reference to the current options.
-   */
-  T setRandomAccessMaxBufferSize(long randomAccessMaxBufferSize);
-
-  /**
-   * This is a maximum buffer size that is used by WinMmapReadableFile in
-   * unbuffered disk I/O mode. We need to maintain an aligned buffer for
-   * reads. We allow the buffer to grow until the specified value and then
-   * for bigger requests allocate one shot buffers. In unbuffered mode we
-   * always bypass read-ahead buffer at ReadaheadRandomAccessFile
-   * When read-ahead is required we then make use of
-   * {@link MutableDBOptionsInterface#compactionReadaheadSize()} value and
-   * always try to read ahead. With read-ahead we always pre-allocate buffer
-   * to the size instead of growing it up to a limit.
-   *
-   * This option is currently honored only on Windows
-   *
-   * Default: 1 Mb
-   *
-   * Special value: 0 - means do not maintain per instance buffer. Allocate
-   *                per request buffer and avoid locking.
-   *
-   * @return the maximum size of the random access buffer
-   */
-  long randomAccessMaxBufferSize();
 
   /**
    * Use adaptive mutex, which spins in the user space before resorting
@@ -1270,36 +1233,6 @@ public interface DBOptionsInterface<T extends DBOptionsInterface<T>> {
    * @return true if updating stats will be skipped
    */
   boolean skipStatsUpdateOnDbOpen();
-
-  /**
-   * If true, then {@link RocksDB#open(String)} will not fetch and check sizes of all sst files.
-   * This may significantly speed up startup if there are many sst files,
-   * especially when using non-default Env with expensive GetFileSize().
-   * We'll still check that all required sst files exist.
-   * If {@code paranoid_checks} is false, this option is ignored, and sst files are
-   * not checked at all.
-   *
-   * Default: false
-   *
-   * @param skipCheckingSstFileSizesOnDbOpen if true, then SST file sizes will not be checked
-   *                                         when calling {@link RocksDB#open(String)}.
-   * @return the reference to the current options.
-   */
-  T setSkipCheckingSstFileSizesOnDbOpen(final boolean skipCheckingSstFileSizesOnDbOpen);
-
-  /**
-   * If true, then {@link RocksDB#open(String)} will not fetch and check sizes of all sst files.
-   * This may significantly speed up startup if there are many sst files,
-   * especially when using non-default Env with expensive GetFileSize().
-   * We'll still check that all required sst files exist.
-   * If {@code paranoid_checks} is false, this option is ignored, and sst files are
-   * not checked at all.
-   *
-   * Default: false
-   *
-   * @return true, if file sizes will not be checked when calling {@link RocksDB#open(String)}.
-   */
-  boolean skipCheckingSstFileSizesOnDbOpen();
 
   /**
    * Recovery mode to control the consistency while replaying WAL
@@ -1753,4 +1686,47 @@ public interface DBOptionsInterface<T extends DBOptionsInterface<T>> {
    * @return the instance of the current object.
    */
   long bgerrorResumeRetryInterval();
+
+  /**
+   * Implementing off-peak duration awareness in RocksDB. In this context,
+   * "off-peak time" signifies periods characterized by significantly less read
+   * and write activity compared to other times. By leveraging this knowledge,
+   * we can prevent low-priority tasks, such as TTL-based compactions, from
+   * competing with read and write operations during peak hours. Essentially, we
+   * preprocess these tasks during the preceding off-peak period, just before
+   * the next peak cycle begins. For example, if the TTL is configured for 25
+   * days, we may compact the files during the off-peak hours of the 24th day.
+   *
+   * Time of the day in UTC, start_time-end_time inclusive.
+   * Format - HH:mm-HH:mm (00:00-23:59)
+   * If the start time exceeds the end time, it will be considered that the time period
+   * spans to the next day (e.g., 23:30-04:00). To make an entire day off-peak,
+   * use "0:00-23:59". To make an entire day have no offpeak period, leave
+   * this field blank. Default: Empty string (no offpeak).
+   *
+   * @param offpeakTimeUTC String value from which to parse offpeak time range
+   */
+  T setDailyOffpeakTimeUTC(final String offpeakTimeUTC);
+
+  /**
+   *
+   * Implementing off-peak duration awareness in RocksDB. In this context,
+   * "off-peak time" signifies periods characterized by significantly less read
+   * and write activity compared to other times. By leveraging this knowledge,
+   * we can prevent low-priority tasks, such as TTL-based compactions, from
+   * competing with read and write operations during peak hours. Essentially, we
+   * preprocess these tasks during the preceding off-peak period, just before
+   * the next peak cycle begins. For example, if the TTL is configured for 25
+   * days, we may compact the files during the off-peak hours of the 24th day.
+   *
+   * Time of the day in UTC, start_time-end_time inclusive.
+   * Format - HH:mm-HH:mm (00:00-23:59)
+   * If the start time exceeds the end time, it will be considered that the time period
+   * spans to the next day (e.g., 23:30-04:00). To make an entire day off-peak,
+   * use "0:00-23:59". To make an entire day have no offpeak period, leave
+   * this field blank. Default: Empty string (no offpeak).
+   *
+   * @return String value of current offpeak time range, "" if none is set.
+   */
+  String dailyOffpeakTimeUTC();
 }

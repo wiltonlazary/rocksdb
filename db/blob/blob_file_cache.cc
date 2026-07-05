@@ -9,6 +9,7 @@
 #include <memory>
 
 #include "db/blob/blob_file_reader.h"
+#include "logging/logging.h"
 #include "options/cf_options.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/slice.h"
@@ -25,7 +26,7 @@ BlobFileCache::BlobFileCache(Cache* cache,
                              HistogramImpl* blob_file_read_hist,
                              const std::shared_ptr<IOTracer>& io_tracer)
     : cache_(cache),
-      mutex_(kNumberOfMutexStripes, kGetSliceNPHash64UnseededFnPtr),
+      mutex_(kNumberOfMutexStripes),
       immutable_options_(immutable_options),
       file_options_(file_options),
       column_family_id_(column_family_id),
@@ -37,29 +38,31 @@ BlobFileCache::BlobFileCache(Cache* cache,
 }
 
 Status BlobFileCache::GetBlobFileReader(
-    uint64_t blob_file_number,
-    CacheHandleGuard<BlobFileReader>* blob_file_reader) {
+    const ReadOptions& read_options, uint64_t blob_file_number,
+    CacheHandleGuard<BlobFileReader>* blob_file_reader,
+    bool allow_footer_skip_retry) {
   assert(blob_file_reader);
   assert(blob_file_reader->IsEmpty());
 
-  const Slice key = GetSlice(&blob_file_number);
+  // NOTE: sharing same Cache with table_cache
+  const Slice key = GetSliceForKey(&blob_file_number);
 
   assert(cache_);
 
-  Cache::Handle* handle = cache_->Lookup(key);
+  TypedHandle* handle = cache_.Lookup(key);
   if (handle) {
-    *blob_file_reader = CacheHandleGuard<BlobFileReader>(cache_, handle);
+    *blob_file_reader = cache_.Guard(handle);
     return Status::OK();
   }
 
   TEST_SYNC_POINT("BlobFileCache::GetBlobFileReader:DoubleCheck");
 
   // Check again while holding mutex
-  MutexLock lock(mutex_.get(key));
+  MutexLock lock(&mutex_.Get(key));
 
-  handle = cache_->Lookup(key);
+  handle = cache_.Lookup(key);
   if (handle) {
-    *blob_file_reader = CacheHandleGuard<BlobFileReader>(cache_, handle);
+    *blob_file_reader = cache_.Guard(handle);
     return Status::OK();
   }
 
@@ -72,10 +75,22 @@ Status BlobFileCache::GetBlobFileReader(
 
   {
     assert(file_options_);
-    const Status s = BlobFileReader::Create(
-        *immutable_options_, *file_options_, column_family_id_,
-        blob_file_read_hist_, blob_file_number, io_tracer_, &reader);
+    Status s = BlobFileReader::Create(
+        *immutable_options_, read_options, *file_options_, column_family_id_,
+        blob_file_read_hist_, blob_file_number, io_tracer_,
+        /*skip_footer_validation=*/false, &reader);
+    if (!s.ok() && s.IsCorruption() && allow_footer_skip_retry) {
+      reader.reset();
+      s = BlobFileReader::Create(
+          *immutable_options_, read_options, *file_options_, column_family_id_,
+          blob_file_read_hist_, blob_file_number, io_tracer_,
+          /*skip_footer_validation=*/true, &reader);
+    }
     if (!s.ok()) {
+      ROCKS_LOG_WARN(immutable_options_->logger,
+                     "BlobFileCache open failed for blob file %" PRIu64
+                     " in CF %u: %s",
+                     blob_file_number, column_family_id_, s.ToString().c_str());
       RecordTick(statistics, NO_FILE_ERRORS);
       return s;
     }
@@ -84,8 +99,7 @@ Status BlobFileCache::GetBlobFileReader(
   {
     constexpr size_t charge = 1;
 
-    const Status s = cache_->Insert(key, reader.get(), charge,
-                                    &DeleteCacheEntry<BlobFileReader>, &handle);
+    const Status s = cache_.Insert(key, reader.get(), charge, &handle);
     if (!s.ok()) {
       RecordTick(statistics, NO_FILE_ERRORS);
       return s;
@@ -94,9 +108,127 @@ Status BlobFileCache::GetBlobFileReader(
 
   reader.release();
 
-  *blob_file_reader = CacheHandleGuard<BlobFileReader>(cache_, handle);
+  *blob_file_reader = cache_.Guard(handle);
 
   return Status::OK();
+}
+
+Status BlobFileCache::OpenBlobFileReaderUncached(
+    const ReadOptions& read_options, uint64_t blob_file_number,
+    std::unique_ptr<BlobFileReader>* blob_file_reader,
+    bool allow_footer_skip_retry) {
+  assert(blob_file_reader);
+  assert(!*blob_file_reader);
+
+  Statistics* const statistics = immutable_options_->stats;
+  RecordTick(statistics, NO_FILE_OPENS);
+
+  assert(file_options_);
+  Status s = BlobFileReader::Create(
+      *immutable_options_, read_options, *file_options_, column_family_id_,
+      blob_file_read_hist_, blob_file_number, io_tracer_,
+      /*skip_footer_validation=*/false, blob_file_reader);
+  if (!s.ok() && s.IsCorruption() && allow_footer_skip_retry) {
+    blob_file_reader->reset();
+    s = BlobFileReader::Create(
+        *immutable_options_, read_options, *file_options_, column_family_id_,
+        blob_file_read_hist_, blob_file_number, io_tracer_,
+        /*skip_footer_validation=*/true, blob_file_reader);
+  }
+  if (!s.ok()) {
+    RecordTick(statistics, NO_FILE_ERRORS);
+  }
+  return s;
+}
+
+Status BlobFileCache::InsertBlobFileReader(
+    uint64_t blob_file_number,
+    std::unique_ptr<BlobFileReader>* blob_file_reader,
+    CacheHandleGuard<BlobFileReader>* cached_blob_file_reader) {
+  assert(blob_file_reader);
+  assert(*blob_file_reader);
+  assert(cached_blob_file_reader);
+  assert(cached_blob_file_reader->IsEmpty());
+
+  const Slice key = GetSliceForKey(&blob_file_number);
+  // Serialize refreshes for the same blob file. The cache API does not expose
+  // a conditional replace, so refresh is intentionally modeled as
+  // Lookup/optional Erase/Insert under this per-key mutex.
+  MutexLock lock(&mutex_.Get(key));
+
+  TypedHandle* handle = cache_.Lookup(key);
+  if (handle) {
+    *cached_blob_file_reader = cache_.Guard(handle);
+    blob_file_reader->reset();
+    return Status::OK();
+  }
+
+  constexpr size_t charge = 1;
+  Status s = cache_.Insert(key, blob_file_reader->get(), charge, &handle);
+  if (!s.ok()) {
+    RecordTick(immutable_options_->stats, NO_FILE_ERRORS);
+    return s;
+  }
+
+  // Ownership transferred to the cache.
+  [[maybe_unused]] BlobFileReader* released_reader =
+      blob_file_reader->release();
+  *cached_blob_file_reader = cache_.Guard(handle);
+  return Status::OK();
+}
+
+Status BlobFileCache::RefreshBlobFileReader(
+    uint64_t blob_file_number,
+    std::unique_ptr<BlobFileReader>* blob_file_reader,
+    CacheHandleGuard<BlobFileReader>* cached_blob_file_reader) {
+  assert(blob_file_reader);
+  assert(*blob_file_reader);
+  assert(cached_blob_file_reader);
+  assert(cached_blob_file_reader->IsEmpty());
+
+  const Slice key = GetSliceForKey(&blob_file_number);
+  MutexLock lock(&mutex_.Get(key));
+
+  TypedHandle* handle = cache_.Lookup(key);
+  if (handle) {
+    BlobFileReader* const cached_reader = cache_.Value(handle);
+    assert(cached_reader != nullptr);
+
+    // Active direct-write blob files can grow between refresh attempts. Keep
+    // whichever reader observed the larger on-disk size so an older refresh
+    // cannot overwrite a newer one that another thread already installed.
+    if (cached_reader->GetFileSize() >= (*blob_file_reader)->GetFileSize()) {
+      *cached_blob_file_reader = cache_.Guard(handle);
+      blob_file_reader->reset();
+      return Status::OK();
+    }
+
+    cache_.Release(handle);
+    cache_.get()->Erase(key);
+  }
+
+  constexpr size_t charge = 1;
+  Status s = cache_.Insert(key, blob_file_reader->get(), charge, &handle);
+  if (!s.ok()) {
+    RecordTick(immutable_options_->stats, NO_FILE_ERRORS);
+    return s;
+  }
+
+  // Ownership transferred to the cache.
+  [[maybe_unused]] BlobFileReader* released_reader =
+      blob_file_reader->release();
+  *cached_blob_file_reader = cache_.Guard(handle);
+  return Status::OK();
+}
+
+void BlobFileCache::Evict(uint64_t blob_file_number) {
+  // NOTE: sharing same Cache with table_cache
+  const Slice key = GetSliceForKey(&blob_file_number);
+
+  assert(cache_);
+
+  MutexLock lock(&mutex_.Get(key));
+  cache_.get()->Erase(key);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -17,16 +17,6 @@
 #include "table/internal_iterator.h"
 
 namespace ROCKSDB_NAMESPACE {
-struct FragmentedRangeTombstoneList;
-
-struct FragmentedRangeTombstoneListCache {
-  // ensure only the first reader needs to initialize l
-  std::mutex reader_mutex;
-  std::unique_ptr<FragmentedRangeTombstoneList> tombstones = nullptr;
-  // readers will first check this bool to avoid
-  std::atomic<bool> initialized = false;
-};
-
 struct FragmentedRangeTombstoneList {
  public:
   // A compact representation of a "stack" of range tombstone fragments, which
@@ -54,7 +44,8 @@ struct FragmentedRangeTombstoneList {
   FragmentedRangeTombstoneList(
       std::unique_ptr<InternalIterator> unfragmented_tombstones,
       const InternalKeyComparator& icmp, bool for_compaction = false,
-      const std::vector<SequenceNumber>& snapshots = {});
+      const std::vector<SequenceNumber>& snapshots = {},
+      const bool tombstone_end_include_ts = true);
 
   std::vector<RangeTombstoneStack>::const_iterator begin() const {
     return tombstones_.begin();
@@ -123,6 +114,14 @@ struct FragmentedRangeTombstoneList {
   uint64_t total_tombstone_payload_bytes_;
 };
 
+struct FragmentedRangeTombstoneListCache {
+  // ensure only the first reader needs to initialize l
+  std::mutex reader_mutex;
+  std::unique_ptr<FragmentedRangeTombstoneList> tombstones = nullptr;
+  // readers will first check this bool to avoid
+  std::atomic<bool> initialized = false;
+};
+
 // FragmentedRangeTombstoneIterator converts an InternalIterator of a range-del
 // meta block into an iterator over non-overlapping tombstone fragments. The
 // tombstone fragmentation process should be more efficient than the range
@@ -147,6 +146,10 @@ class FragmentedRangeTombstoneIterator : public InternalIterator {
       const std::shared_ptr<FragmentedRangeTombstoneListCache>& tombstones,
       const InternalKeyComparator& icmp, SequenceNumber upper_bound,
       const Slice* ts_upper_bound = nullptr, SequenceNumber lower_bound = 0);
+
+  void SetRangeDelReadSeqno(SequenceNumber read_seqno) override {
+    upper_bound_ = read_seqno;
+  }
 
   void SeekToFirst() override;
   void SeekToLast() override;
@@ -196,11 +199,14 @@ class FragmentedRangeTombstoneIterator : public InternalIterator {
 
   RangeTombstone Tombstone() const {
     assert(Valid());
-    if (icmp_->user_comparator()->timestamp_size()) {
+    // Use ucmp_ (long-lived; see the icmp_ note below) rather than
+    // icmp_->user_comparator(). They are equal for all constructors.
+    if (ucmp_->timestamp_size()) {
       return RangeTombstone(start_key(), end_key(), seq(), timestamp());
     }
     return RangeTombstone(start_key(), end_key(), seq());
   }
+
   // Note that start_key() and end_key() are not guaranteed to have the
   // correct timestamp. User can call timestamp() to get the correct
   // timestamp().
@@ -218,8 +224,7 @@ class FragmentedRangeTombstoneIterator : public InternalIterator {
   }
 
   ParsedInternalKey parsed_start_key() const {
-    return ParsedInternalKey(pos_->start_key, kMaxSequenceNumber,
-                             kTypeRangeDeletion);
+    return ParsedInternalKey(pos_->start_key, seq(), kTypeRangeDeletion);
   }
   ParsedInternalKey parsed_end_key() const {
     return ParsedInternalKey(pos_->end_key, kMaxSequenceNumber,
@@ -313,6 +318,12 @@ class FragmentedRangeTombstoneIterator : public InternalIterator {
 
   const RangeTombstoneStackStartComparator tombstone_start_cmp_;
   const RangeTombstoneStackEndComparator tombstone_end_cmp_;
+  // icmp_ is a borrowed pointer and is not guaranteed to outlive this iterator:
+  // it may be built from a comparator with a shorter lifetime than an iterator
+  // some owner keeps alive. Only dereference it during construction-time work
+  // (e.g. SplitBySnapshot), when the referent is known alive. Post-construction
+  // navigation must use ucmp_ (the long-lived user comparator) and tombstones_;
+  // do not add new icmp_ dereferences in Next()/Seek()/Tombstone().
   const InternalKeyComparator* icmp_;
   const Comparator* ucmp_;
   std::shared_ptr<FragmentedRangeTombstoneList> tombstones_ref_;

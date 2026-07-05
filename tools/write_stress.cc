@@ -145,13 +145,11 @@ class WriteStress {
     }
 
     // open DB
-    DB* db;
-    Status s = DB::Open(options, FLAGS_db, &db);
+    Status s = DB::Open(options, FLAGS_db, &db_);
     if (!s.ok()) {
       fprintf(stderr, "Can't open database: %s\n", s.ToString().c_str());
       std::abort();
     }
-    db_.reset(db);
   }
 
   void WriteThread() {
@@ -243,9 +241,6 @@ class WriteStress {
     }
     threads_.clear();
 
-// Skip checking for leaked files in ROCKSDB_LITE since we don't have access to
-// function GetLiveFilesMetaData
-#ifndef ROCKSDB_LITE
     // let's see if we leaked some files
     db_->PauseBackgroundWork();
     std::vector<LiveFileMetaData> metadata;
@@ -281,7 +276,6 @@ class WriteStress {
       }
     }
     db_->ContinueBackgroundWork();
-#endif  // !ROCKSDB_LITE
 
     return 0;
   }

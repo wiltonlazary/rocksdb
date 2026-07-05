@@ -5,8 +5,6 @@
 
 #pragma once
 
-#ifndef ROCKSDB_LITE
-
 #include <utility>
 
 #include "rocksdb/file_system.h"
@@ -66,6 +64,11 @@ class RemapFileSystem : public FileSystemWrapper {
                            std::unique_ptr<FSWritableFile>* result,
                            IODebugContext* dbg) override;
 
+  IOStatus ReopenWritableFile(const std::string& fname,
+                              const FileOptions& options,
+                              std::unique_ptr<FSWritableFile>* result,
+                              IODebugContext* dbg) override;
+
   IOStatus ReuseWritableFile(const std::string& fname,
                              const std::string& old_fname,
                              const FileOptions& options,
@@ -122,6 +125,10 @@ class RemapFileSystem : public FileSystemWrapper {
   IOStatus LinkFile(const std::string& src, const std::string& dest,
                     const IOOptions& options, IODebugContext* dbg) override;
 
+  IOStatus SyncFile(const std::string& fname, const FileOptions& file_opts,
+                    const IOOptions& io_opts, bool use_fsync,
+                    IODebugContext* dbg) override;
+
   IOStatus LockFile(const std::string& fname, const IOOptions& options,
                     FileLock** lock, IODebugContext* dbg) override;
 
@@ -135,5 +142,3 @@ class RemapFileSystem : public FileSystemWrapper {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-
-#endif  // ROCKSDB_LITE

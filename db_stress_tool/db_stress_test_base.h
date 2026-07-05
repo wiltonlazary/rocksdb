@@ -7,25 +7,69 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include "rocksdb/io_status.h"
 #ifdef GFLAGS
 #pragma once
 
 #include "db_stress_tool/db_stress_common.h"
 #include "db_stress_tool/db_stress_shared_state.h"
+#include "env/composite_env_wrapper.h"
+#include "rocksdb/experimental.h"
+#include "rocksdb/user_defined_index.h"
+#include "utilities/fault_injection_fs.h"
 
 namespace ROCKSDB_NAMESPACE {
 class SystemClock;
 class Transaction;
 class TransactionDB;
+class OptimisticTransactionDB;
+class DbStressFSWrapper;
 struct TransactionDBOptions;
+using experimental::SstQueryFilterConfigsManager;
 
 class StressTest {
  public:
-  StressTest();
+  static bool IsErrorInjectedAndRetryable(const Status& error_s) {
+    assert(!error_s.ok());
+    return error_s.getState() &&
+           FaultInjectionTestFS::IsInjectedError(error_s) &&
+           !status_to_io_status(Status(error_s)).GetDataLoss();
+  }
 
-  virtual ~StressTest();
+  static bool IsTolerableCompactionFailure(const Status& s) {
+    // TOOD (hx235): allow an exact list of tolerable failures under stress
+    // test
+    return s.IsManualCompactionPaused() || s.IsCompactionAborted() ||
+           IsErrorInjectedAndRetryable(s) || s.IsAborted() ||
+           s.IsInvalidArgument() || s.IsNotSupported();
+  }
 
-  std::shared_ptr<Cache> NewCache(size_t capacity, int32_t num_shard_bits);
+  // Returns true if the status is an expected transactional error, including
+  // lock conflicts (deadlock or timeout) from MaybeAddKeyToTxnForRYW writing
+  // to the same key space without the stress-test-level mutex, and TryAgain
+  // from optimistic transactions when conflict detection retries are exhausted.
+  static bool IsExpectedTxnError(const Status& s);
+
+  StressTest(int db_index, const std::string& db_path,
+             const std::string& ev_path, const std::string& sec_path);
+
+  virtual ~StressTest() {}
+
+  const std::string& GetDbLabel() const;
+  const std::string& GetDbPath() const;
+  const std::string& GetExpectedValuesDir() const;
+  const std::string& GetSecondariesBase() const;
+
+  // See db_fault_injection_fs_ member.
+  std::shared_ptr<FaultInjectionTestFS> GetDbFaultInjectionFs() const {
+    return db_fault_injection_fs_;
+  }
+
+  // See db_env_ member.
+  Env* GetDbEnv() const;
+
+  static std::shared_ptr<Cache> NewCache(size_t capacity,
+                                         int32_t num_shard_bits);
 
   static std::vector<std::string> GetBlobCompressionTags();
 
@@ -40,8 +84,84 @@ class StressTest {
   virtual void VerifyDb(ThreadState* thread) const = 0;
   virtual void ContinuouslyVerifyDb(ThreadState* /*thread*/) const = 0;
   void PrintStatistics();
+  bool MightHaveUnsyncedDataLoss() {
+    return FLAGS_sync_fault_injection || FLAGS_disable_wal ||
+           FLAGS_manual_wal_flush_one_in > 0;
+  }
+  Status EnableAutoCompaction() {
+    assert(options_.disable_auto_compactions);
+    Status s = db_->EnableAutoCompaction(column_families_);
+    return s;
+  }
+  Options GetOptions(int cf_id);
+  void CleanUp();
+
+ private:
+  void InitializeListenersForOpen(
+      SharedState* shared,
+      const std::vector<ColumnFamilyDescriptor>& cf_descriptors);
 
  protected:
+  static int GetMinInjectedErrorCount(int error_count_1, int error_count_2) {
+    if (error_count_1 > 0 && error_count_2 > 0) {
+      return std::min(error_count_1, error_count_2);
+    } else if (error_count_1 > 0) {
+      return error_count_1;
+    } else if (error_count_2 > 0) {
+      return error_count_2;
+    } else {
+      return 0;
+    }
+  }
+
+  void UpdateIfInitialWriteFails(Env* env, const Status& write_s,
+                                 Status* initial_write_s,
+                                 bool* initial_wal_write_may_succeed,
+                                 uint64_t* wait_for_recover_start_time,
+                                 bool commit_bypass_memtable = false) {
+    assert(env && initial_write_s && initial_wal_write_may_succeed &&
+           wait_for_recover_start_time);
+    if (!write_s.ok() && (*initial_write_s).ok()) {
+      *initial_write_s = write_s;
+      *initial_wal_write_may_succeed =
+          commit_bypass_memtable ||
+          !FaultInjectionTestFS::IsFailedToWriteToWALError(*initial_write_s);
+      *wait_for_recover_start_time = env->NowMicros();
+    }
+  }
+
+  void PrintWriteRecoveryWaitTimeIfNeeded(Env* env,
+                                          const Status& initial_write_s,
+                                          bool initial_wal_write_may_succeed,
+                                          uint64_t wait_for_recover_start_time,
+                                          const std::string& thread_name) {
+    assert(env);
+    bool waited_for_recovery = !initial_write_s.ok() &&
+                               IsErrorInjectedAndRetryable(initial_write_s) &&
+                               initial_wal_write_may_succeed;
+    if (waited_for_recovery) {
+      uint64_t elapsed_sec =
+          (env->NowMicros() - wait_for_recover_start_time) / 1000000;
+      if (elapsed_sec > 10) {
+        fprintf(stdout,
+                "%s thread slept to wait for write recovery for "
+                "%" PRIu64 " seconds\n",
+                thread_name.c_str(), elapsed_sec);
+      }
+    }
+  }
+  void GetDeleteRangeKeyLocks(
+      ThreadState* thread, int rand_column_family, int64_t rand_key,
+      std::vector<std::unique_ptr<MutexLock>>* range_locks) {
+    for (int j = 0; j < FLAGS_range_deletion_width; ++j) {
+      if (j == 0 ||
+          ((rand_key + j) & ((1 << FLAGS_log2_keys_per_lock) - 1)) == 0) {
+        range_locks->emplace_back(new MutexLock(
+            thread->shared->GetMutexForKey(rand_column_family, rand_key + j)));
+      }
+    }
+  }
+
   Status AssertSame(DB* db, ColumnFamilyHandle* cf,
                     ThreadState::SnapshotState& snap_state);
 
@@ -51,7 +171,6 @@ class StressTest {
 
   Status SetOptions(ThreadState* thread);
 
-#ifndef ROCKSDB_LITE
   // For transactionsDB, there can be txns prepared but not yet committeed
   // right before previous stress run crash.
   // They will be recovered and processed through
@@ -64,12 +183,20 @@ class StressTest {
   virtual void ProcessRecoveredPreparedTxnsHelper(Transaction* txn,
                                                   SharedState* shared);
 
-  Status NewTxn(WriteOptions& write_opts, Transaction** txn);
+  // ExecuteTransaction is recommended instead
+  // @param commit_bypass_memtable Whether commit_bypass_memtable is set to
+  // true in transaction options.
+  Status NewTxn(WriteOptions& write_opts, ThreadState* thread,
+                std::unique_ptr<Transaction>* out_txn,
+                bool* commit_bypass_memtable = nullptr);
+  Status CommitTxn(Transaction& txn, ThreadState* thread = nullptr);
 
-  Status CommitTxn(Transaction* txn, ThreadState* thread = nullptr);
-
-  Status RollbackTxn(Transaction* txn);
-#endif
+  // Creates a transaction, executes `ops`, and tries to commit
+  // @param commit_bypass_memtable Whether commit_bypass_memtable is set to
+  // true in transaction options.
+  Status ExecuteTransaction(WriteOptions& write_opts, ThreadState* thread,
+                            std::function<Status(Transaction&)>&& ops,
+                            bool* commit_bypass_memtable = nullptr);
 
   virtual void MaybeClearOneColumnFamily(ThreadState* /* thread */) {}
 
@@ -87,6 +214,10 @@ class StressTest {
     return {rand_key};
   }
 
+  virtual void TestKeyMayExist(ThreadState*, const ReadOptions&,
+                               const std::vector<int>&,
+                               const std::vector<int64_t>&) {}
+
   virtual Status TestGet(ThreadState* thread, const ReadOptions& read_opts,
                          const std::vector<int>& rand_column_families,
                          const std::vector<int64_t>& rand_keys) = 0;
@@ -95,6 +226,15 @@ class StressTest {
       ThreadState* thread, const ReadOptions& read_opts,
       const std::vector<int>& rand_column_families,
       const std::vector<int64_t>& rand_keys) = 0;
+
+  virtual void TestGetEntity(ThreadState* thread, const ReadOptions& read_opts,
+                             const std::vector<int>& rand_column_families,
+                             const std::vector<int64_t>& rand_keys) = 0;
+
+  virtual void TestMultiGetEntity(ThreadState* thread,
+                                  const ReadOptions& read_opts,
+                                  const std::vector<int>& rand_column_families,
+                                  const std::vector<int64_t>& rand_keys) = 0;
 
   virtual Status TestPrefixScan(ThreadState* thread,
                                 const ReadOptions& read_opts,
@@ -125,6 +265,9 @@ class StressTest {
                                 const Slice& start_key,
                                 ColumnFamilyHandle* column_family);
 
+  virtual void TestPromoteL0(ThreadState* thread,
+                             ColumnFamilyHandle* column_family);
+
   // Calculate a hash value for all keys in range [start_key, end_key]
   // at a certain snapshot.
   uint32_t GetRangeHash(ThreadState* thread, const Snapshot* snapshot,
@@ -139,19 +282,11 @@ class StressTest {
     return column_families_[column_family_id];
   }
 
-#ifndef ROCKSDB_LITE
   // Generated a list of keys that close to boundaries of SST keys.
   // If there isn't any SST file in the DB, return empty list.
   std::vector<std::string> GetWhiteBoxKeys(ThreadState* thread, DB* db,
                                            ColumnFamilyHandle* cfh,
                                            size_t num_keys);
-#else   // !ROCKSDB_LITE
-  std::vector<std::string> GetWhiteBoxKeys(ThreadState*, DB*,
-                                           ColumnFamilyHandle*, size_t) {
-    // Not supported in LITE mode.
-    return {};
-  }
-#endif  // !ROCKSDB_LITE
 
   // Given a key K, this creates an iterator which scans to K and then
   // does a random sequence of Next/Prev operations.
@@ -159,12 +294,30 @@ class StressTest {
                              const std::vector<int>& rand_column_families,
                              const std::vector<int64_t>& rand_keys);
 
+  // Given a key K, this creates an attribute group iterator which scans to K
+  // and then does a random sequence of Next/Prev operations. Called only when
+  // use_attribute_group=1
+  virtual Status TestIterateAttributeGroups(
+      ThreadState* thread, const ReadOptions& read_opts,
+      const std::vector<int>& rand_column_families,
+      const std::vector<int64_t>& rand_keys);
+
+  template <typename IterType, typename NewIterFunc, typename VerifyFunc>
+  Status TestIterateImpl(ThreadState* thread, const ReadOptions& read_opts,
+                         const std::vector<int>& rand_column_families,
+                         const std::vector<int64_t>& rand_keys,
+                         NewIterFunc new_iter_func, VerifyFunc verify_func);
+
   virtual Status TestIterateAgainstExpected(
       ThreadState* /* thread */, const ReadOptions& /* read_opts */,
       const std::vector<int>& /* rand_column_families */,
       const std::vector<int64_t>& /* rand_keys */) {
     return Status::NotSupported();
   }
+
+  Status TestMultiScan(ThreadState* thread, const ReadOptions& read_opts,
+                       const std::vector<int>& rand_column_families,
+                       const std::vector<int64_t>& rand_keys);
 
   // Enum used by VerifyIterator() to identify the mode to validate.
   enum LastIterateOp {
@@ -175,6 +328,35 @@ class StressTest {
     kLastOpSeekToLast
   };
 
+  // Enum used to track MANIFEST verification mode during DB reopen
+  enum ManifestVerifyMode {
+    MANIFEST_VERIFY_NONE,
+    // MANIFEST file should be reused (same file number), CURRENT should not
+    // change. Used when reuse_manifest_on_open=1. Warnings are logged on
+    // failure but test continues.
+    MANIFEST_VERIFY_REUSE,
+    // MANIFEST file should be reused AND no recovery writes should occur.
+    // Used when both reuse_manifest_on_open=1 and
+    // optimize_manifest_for_recovery=1. Warnings are logged on failure but test
+    // continues.
+    MANIFEST_VERIFY_NO_WRITE,
+    // Strict verification: MANIFEST file must be reused with ZERO writes
+    // (complete avoidance). Used when ALL conditions for complete avoidance
+    // are met. Failures are FATAL and will terminate the test.
+    // Conditions for STRICT mode:
+    // - Both reuse_manifest_on_open=1 and optimize_manifest_for_recovery=1
+    // - Not in best_efforts_recovery mode
+    // - avoid_flush_during_recovery=true (no flush during recovery)
+    // - write_dbid_to_manifest=0 (no DB_ID write on open)
+    // - metadata_write_fault_one_in=0 (no fault injection)
+    // - open_metadata_write_fault_one_in=0 (no fault injection)
+    // - MANIFEST not corrupted, not at size limit
+    // Note: avoid_flush_during_shutdown is NOT required. If it leaves data
+    // in WAL but avoid_flush_during_recovery=true prevents flushing it,
+    // MANIFEST still won't be written.
+    MANIFEST_VERIFY_STRICT
+  };
+
   // Compare the two iterator, iter and cmp_iter are in the same position,
   // unless iter might be made invalidate or undefined because of
   // upper or lower bounds, or prefix extractor.
@@ -182,14 +364,23 @@ class StressTest {
   // diverged = true if the two iterator is already diverged.
   // True if verification passed, false if not.
   // op_logs is the information to print when validation fails.
+  template <typename IterType, typename VerifyFuncType>
   void VerifyIterator(ThreadState* thread, ColumnFamilyHandle* cmp_cfh,
-                      const ReadOptions& ro, Iterator* iter, Iterator* cmp_iter,
+                      const ReadOptions& ro, IterType* iter, Iterator* cmp_iter,
                       LastIterateOp op, const Slice& seek_key,
-                      const std::string& op_logs, bool* diverged);
+                      const std::vector<int>& rand_column_families,
+                      const std::string& op_logs, VerifyFuncType verifyFunc,
+                      bool* diverged);
+
+  void DumpIteratorDivergenceDiagnostics(
+      ColumnFamilyHandle* cmp_cfh, const ReadOptions& ro, const Slice& seek_key,
+      const std::vector<int>& rand_column_families) const;
 
   virtual Status TestBackupRestore(ThreadState* thread,
                                    const std::vector<int>& rand_column_families,
                                    const std::vector<int64_t>& rand_keys);
+
+  virtual Status PrepareOptionsForRestoredDB(Options* options);
 
   virtual Status TestCheckpoint(ThreadState* thread,
                                 const std::vector<int>& rand_column_families,
@@ -197,25 +388,38 @@ class StressTest {
 
   void TestCompactFiles(ThreadState* thread, ColumnFamilyHandle* column_family);
 
-  Status TestFlush(const std::vector<int>& rand_column_families);
+  void TestFlush(ThreadState* thread,
+                 const std::vector<int>& rand_column_families);
+
+  Status TestResetStats();
 
   Status TestPauseBackground(ThreadState* thread);
+
+  Status TestDisableFileDeletions(ThreadState* thread);
+
+  Status TestDisableManualCompaction(ThreadState* thread);
+
+  Status TestAbortAndResumeCompactions(ThreadState* thread);
 
   void TestAcquireSnapshot(ThreadState* thread, int rand_column_family,
                            const std::string& keystr, uint64_t i);
 
   Status MaybeReleaseSnapshots(ThreadState* thread, uint64_t i);
-#ifndef ROCKSDB_LITE
-  Status VerifyGetLiveFiles() const;
-  Status VerifyGetSortedWalFiles() const;
-  Status VerifyGetCurrentWalFile() const;
+
+  Status TestGetLiveFiles() const;
+  Status TestGetLiveFilesMetaData() const;
+  Status TestGetLiveFilesStorageInfo() const;
+  Status TestGetAllColumnFamilyMetaData() const;
+
+  Status TestGetSortedWalFiles() const;
+  Status TestGetCurrentWalFile() const;
   void TestGetProperty(ThreadState* thread) const;
+  Status TestGetPropertiesOfAllTables() const;
 
   virtual Status TestApproximateSize(
       ThreadState* thread, uint64_t iteration,
       const std::vector<int>& rand_column_families,
       const std::vector<int64_t>& rand_keys);
-#endif  // !ROCKSDB_LITE
 
   virtual Status TestCustomOperations(
       ThreadState* /*thread*/,
@@ -223,7 +427,10 @@ class StressTest {
     return Status::NotSupported("TestCustomOperations() must be overridden");
   }
 
-  void VerificationAbort(SharedState* shared, std::string msg, Status s) const;
+  void ProcessStatus(SharedState* shared, std::string msg, const Status& s,
+                     bool ignore_injected_error = true) const;
+
+  void VerificationAbort(SharedState* shared, std::string msg) const;
 
   void VerificationAbort(SharedState* shared, std::string msg, int cf,
                          int64_t key) const;
@@ -233,24 +440,29 @@ class StressTest {
                          Slice value_from_expected) const;
 
   void VerificationAbort(SharedState* shared, int cf, int64_t key,
-                         const Slice& value, const WideColumns& columns,
-                         const WideColumns& expected_columns) const;
+                         const Slice& value, const WideColumns& columns) const;
 
-  static std::string DebugString(const Slice& value, const WideColumns& columns,
-                                 const WideColumns& expected_columns);
+  // Under --verify_cpu_corruption_dir, verifies the just-run op (named by
+  // `op_label`, e.g. "put"/"flush"/"compactrange") for a returned/read-back
+  // corruption or a silent data corruption. A no-op when the flag is empty. See
+  // the definition in db_stress_test_base.cc for the full behavior, startup
+  // requirements, performance cost, and result-file contract.
+  void MaybeVerifyCpuCorruption(ThreadState* thread, const char* op_label,
+                                const Status& op_status);
+
+  static std::string DebugString(const Slice& value,
+                                 const WideColumns& columns);
 
   void PrintEnv() const;
 
-  void Open(SharedState* shared);
+  void Open(SharedState* shared, bool reopen = false);
 
   void Reopen(ThreadState* thread);
 
   virtual void RegisterAdditionalListeners() {}
 
-#ifndef ROCKSDB_LITE
   virtual void PrepareTxnDbOptions(SharedState* /*shared*/,
                                    TransactionDBOptions& /*txn_db_opts*/) {}
-#endif
 
   // Returns whether the timestamp of read_opts is updated.
   bool MaybeUseOlderTimestampForPointLookup(ThreadState* thread,
@@ -262,13 +474,28 @@ class StressTest {
                                           std::string& ts_str, Slice& ts_slice,
                                           ReadOptions& read_opts);
 
-  std::shared_ptr<Cache> cache_;
+  void CleanUpColumnFamilies();
+
+  void RecordManifestStateBeforeReopen();
+  void VerifyManifestNotRewritten();
+
+  int db_index_;
+  std::string db_label_;
+  std::string db_path_;
+  std::string expected_values_path_;
+  std::string secondaries_path_;
+  // Wraps raw_env->GetFileSystem(). See DbStressFSWrapper.
+  std::shared_ptr<DbStressFSWrapper> db_stress_fs_;
+  // Wraps db_stress_fs_ when NeedsFaultInjection(). Null otherwise.
+  std::shared_ptr<FaultInjectionTestFS> db_fault_injection_fs_;
+  // Wraps the outermost FS above. Set as options_.env for all DB I/O.
+  std::unique_ptr<CompositeEnvWrapper> db_env_;
   std::shared_ptr<Cache> compressed_cache_;
   std::shared_ptr<const FilterPolicy> filter_policy_;
+  std::unique_ptr<DB> db_owner_;
   DB* db_;
-#ifndef ROCKSDB_LITE
   TransactionDB* txn_db_;
-#endif
+  OptimisticTransactionDB* optimistic_txn_db_;
 
   // Currently only used in MultiOpsTxnsStressTest
   std::atomic<DB*> db_aptr_;
@@ -282,31 +509,39 @@ class StressTest {
   std::unordered_map<std::string, std::vector<std::string>> options_table_;
   std::vector<std::string> options_index_;
   std::atomic<bool> db_preload_finished_;
+  std::shared_ptr<SstQueryFilterConfigsManager::Factory> sqfc_factory_;
+  std::shared_ptr<UserDefinedIndexFactory> udi_factory_;
 
-  // Fields used for continuous verification from another thread
-  DB* cmp_db_;
-  std::vector<ColumnFamilyHandle*> cmp_cfhs_;
+  std::unique_ptr<DB> secondary_db_;
+  std::vector<ColumnFamilyHandle*> secondary_cfhs_;
   bool is_db_stopped_;
+
+  // MANIFEST verification state for reopen
+  ManifestVerifyMode manifest_verify_mode_;
+  uint64_t manifest_file_number_before_reopen_;
+  uint64_t manifest_file_size_before_reopen_;
+  std::string current_file_content_before_reopen_;
 };
 
 // Load options from OPTIONS file and populate `options`.
-extern bool InitializeOptionsFromFile(Options& options);
+bool InitializeOptionsFromFile(Options& options);
 
 // Initialize `options` using command line arguments.
 // When this function is called, `cache`, `block_cache_compressed`,
 // `filter_policy` have all been initialized. Therefore, we just pass them as
 // input arguments.
-extern void InitializeOptionsFromFlags(
+void InitializeOptionsFromFlags(
     const std::shared_ptr<Cache>& cache,
-    const std::shared_ptr<Cache>& block_cache_compressed,
-    const std::shared_ptr<const FilterPolicy>& filter_policy, Options& options);
+    const std::shared_ptr<const FilterPolicy>& filter_policy,
+    const std::shared_ptr<UserDefinedIndexFactory>& udi_factory,
+    Options& options);
 
 // Initialize `options` on which `InitializeOptionsFromFile()` and
 // `InitializeOptionsFromFlags()` have both been called already.
 // There are two cases.
 // Case 1: OPTIONS file is not specified. Command line arguments have been used
 //         to initialize `options`. InitializeOptionsGeneral() will use
-//         `cache`, `block_cache_compressed` and `filter_policy` to initialize
+//         `cache` and `filter_policy` to initialize
 //         corresponding fields of `options`. InitializeOptionsGeneral() will
 //         also set up other fields of `options` so that stress test can run.
 //         Examples include `create_if_missing` and
@@ -317,21 +552,23 @@ extern void InitializeOptionsFromFlags(
 //         case, if command line arguments indicate that the user wants to set
 //         up such shared objects, e.g. block cache, compressed block cache,
 //         row cache, filter policy, then InitializeOptionsGeneral() will honor
-//         the user's choice, thus passing `cache`, `block_cache_compressed`,
+//         the user's choice, thus passing `cache`,
 //         `filter_policy` as input arguments.
 //
 // InitializeOptionsGeneral() must not overwrite fields of `options` loaded
 // from OPTIONS file.
-extern void InitializeOptionsGeneral(
+void InitializeOptionsGeneral(
     const std::shared_ptr<Cache>& cache,
-    const std::shared_ptr<Cache>& block_cache_compressed,
-    const std::shared_ptr<const FilterPolicy>& filter_policy, Options& options);
+    const std::shared_ptr<const FilterPolicy>& filter_policy,
+    const std::shared_ptr<SstQueryFilterConfigsManager::Factory>& sqfc_factory,
+    Options& options);
 
 // If no OPTIONS file is specified, set up `options` so that we can test
 // user-defined timestamp which requires `-user_timestamp_size=8`.
 // This function also checks for known (currently) incompatible features with
 // user-defined timestamp.
-extern void CheckAndSetOptionsForUserTimestamp(Options& options);
+void CheckAndSetOptionsForUserTimestamp(Options& options);
 
+bool ShouldDisableAutoCompactionsBeforeVerifyDb();
 }  // namespace ROCKSDB_NAMESPACE
 #endif  // GFLAGS

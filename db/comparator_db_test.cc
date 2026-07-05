@@ -17,7 +17,6 @@
 #include "util/string_util.h"
 #include "utilities/merge_operators.h"
 
-
 namespace ROCKSDB_NAMESPACE {
 namespace {
 
@@ -78,7 +77,7 @@ void DoRandomIteraratorTest(DB* db, std::vector<std::string> source_strings,
 
   for (int i = 0; i < num_writes; i++) {
     if (num_trigger_flush > 0 && i != 0 && i % num_trigger_flush == 0) {
-      db->Flush(FlushOptions());
+      ASSERT_OK(db->Flush(FlushOptions()));
     }
 
     int type = rnd->Uniform(2);
@@ -157,6 +156,7 @@ void DoRandomIteraratorTest(DB* db, std::vector<std::string> source_strings,
         if (map.find(key) == map.end()) {
           ASSERT_TRUE(status.IsNotFound());
         } else {
+          ASSERT_OK(status);
           ASSERT_EQ(map[key], result);
         }
         break;
@@ -165,11 +165,12 @@ void DoRandomIteraratorTest(DB* db, std::vector<std::string> source_strings,
     AssertItersEqual(iter.get(), result_iter.get());
     is_valid = iter->Valid();
   }
+  ASSERT_OK(iter->status());
 }
 
 class DoubleComparator : public Comparator {
  public:
-  DoubleComparator() {}
+  DoubleComparator() = default;
 
   const char* Name() const override { return "DoubleComparator"; }
 
@@ -197,7 +198,7 @@ class DoubleComparator : public Comparator {
 
 class HashComparator : public Comparator {
  public:
-  HashComparator() {}
+  HashComparator() = default;
 
   const char* Name() const override { return "HashComparator"; }
 
@@ -220,7 +221,7 @@ class HashComparator : public Comparator {
 
 class TwoStrComparator : public Comparator {
  public:
-  TwoStrComparator() {}
+  TwoStrComparator() = default;
 
   const char* Name() const override { return "TwoStrComparator"; }
 
@@ -249,7 +250,7 @@ class TwoStrComparator : public Comparator {
 
   void FindShortSuccessor(std::string* /*key*/) const override {}
 };
-}  // namespace
+}  // anonymous namespace
 
 class ComparatorDBTest
     : public testing::Test,
@@ -257,12 +258,12 @@ class ComparatorDBTest
  private:
   std::string dbname_;
   Env* env_;
-  DB* db_;
+  std::unique_ptr<DB> db_;
   Options last_options_;
   std::unique_ptr<const Comparator> comparator_guard;
 
  public:
-  ComparatorDBTest() : env_(Env::Default()), db_(nullptr) {
+  ComparatorDBTest() : env_(Env::Default()) {
     kTestComparator = BytewiseComparator();
     dbname_ = test::PerThreadDBPath("comparator_db_test");
     BlockBasedTableOptions toptions;
@@ -273,12 +274,12 @@ class ComparatorDBTest
   }
 
   ~ComparatorDBTest() override {
-    delete db_;
+    db_.reset();
     EXPECT_OK(DestroyDB(dbname_, last_options_));
     kTestComparator = BytewiseComparator();
   }
 
-  DB* GetDB() { return db_; }
+  DB* GetDB() { return db_.get(); }
 
   void SetOwnedComparator(const Comparator* cmp, bool owner = true) {
     if (owner) {
@@ -300,14 +301,12 @@ class ComparatorDBTest
   }
 
   void Destroy() {
-    delete db_;
-    db_ = nullptr;
+    db_.reset();
     ASSERT_OK(DestroyDB(dbname_, last_options_));
   }
 
   Status TryReopen() {
-    delete db_;
-    db_ = nullptr;
+    db_.reset();
     last_options_.create_if_missing = true;
 
     return DB::Open(last_options_, dbname_, &db_);
@@ -317,7 +316,7 @@ class ComparatorDBTest
 INSTANTIATE_TEST_CASE_P(FormatDef, ComparatorDBTest,
                         testing::Values(test::kDefaultFormatVersion));
 INSTANTIATE_TEST_CASE_P(FormatLatest, ComparatorDBTest,
-                        testing::Values(kLatestFormatVersion));
+                        testing::Values(kLatestBbtFormatVersion));
 
 TEST_P(ComparatorDBTest, Bytewise) {
   for (int rand_seed = 301; rand_seed < 306; rand_seed++) {
@@ -371,7 +370,7 @@ TEST_P(ComparatorDBTest, Uint64Comparator) {
       uint64_t r = rnd64.Next();
       std::string str;
       str.resize(8);
-      memcpy(&str[0], static_cast<void*>(&r), 8);
+      memcpy(str.data(), static_cast<void*>(&r), 8);
       source_strings.push_back(str);
     }
 
@@ -470,7 +469,7 @@ void VerifySuccessor(const Slice& s, const Slice& t) {
   ASSERT_FALSE(rbc->IsSameLengthImmediateSuccessor(t, s));
 }
 
-}  // namespace
+}  // anonymous namespace
 
 TEST_P(ComparatorDBTest, IsSameLengthImmediateSuccessor) {
   {

@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-#ifndef ROCKSDB_LITE
 #ifndef GFLAGS
 #include <cstdio>
 int main() {
@@ -55,7 +54,7 @@ struct DataPumpThread {
 };
 
 static void DataPumpThreadBody(void* arg) {
-  DataPumpThread* t = reinterpret_cast<DataPumpThread*>(arg);
+  DataPumpThread* t = static_cast<DataPumpThread*>(arg);
   DB* db = t->db;
   Random rnd(301);
   uint64_t i = 0;
@@ -84,7 +83,7 @@ int main(int argc, const char** argv) {
   options.create_if_missing = true;
   options.WAL_ttl_seconds = FLAGS_wal_ttl_seconds;
   options.WAL_size_limit_MB = FLAGS_wal_size_limit_MB;
-  DB* db;
+  std::unique_ptr<DB> db;
   DestroyDB(default_db_path, options);
 
   Status s = DB::Open(options, default_db_path, &db);
@@ -95,7 +94,7 @@ int main(int argc, const char** argv) {
   }
 
   DataPumpThread dataPump;
-  dataPump.db = db;
+  dataPump.db = db.get();
   env->StartThread(DataPumpThreadBody, &dataPump);
 
   std::unique_ptr<TransactionLogIterator> iter;
@@ -130,11 +129,3 @@ int main(int argc, const char** argv) {
 }
 
 #endif  // GFLAGS
-
-#else  // ROCKSDB_LITE
-#include <stdio.h>
-int main(int /*argc*/, char** /*argv*/) {
-  fprintf(stderr, "Not supported in lite mode.\n");
-  return 1;
-}
-#endif  // ROCKSDB_LITE

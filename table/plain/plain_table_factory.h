@@ -5,7 +5,6 @@
 
 #pragma once
 
-#ifndef ROCKSDB_LITE
 #include <stdint.h>
 
 #include <memory>
@@ -174,9 +173,12 @@ class PlainTableFactory : public TableFactory {
   std::string GetPrintableOptions() const override;
   static const char kValueTypeSeqId0 = char(~0);
 
+  std::unique_ptr<TableFactory> Clone() const override {
+    return std::make_unique<PlainTableFactory>(*this);
+  }
+
  private:
   PlainTableOptions table_options_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-#endif  // ROCKSDB_LITE

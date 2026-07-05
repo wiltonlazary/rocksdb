@@ -19,7 +19,7 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-#ifdef ROCKSDB_USING_THREAD_STATUS
+#ifndef NROCKSDB_THREAD_STATUS
 
 // The structure that describes a major thread operation.
 struct OperationInfo {
@@ -38,7 +38,19 @@ struct OperationInfo {
 static OperationInfo global_operation_table[] = {
     {ThreadStatus::OP_UNKNOWN, ""},
     {ThreadStatus::OP_COMPACTION, "Compaction"},
-    {ThreadStatus::OP_FLUSH, "Flush"}};
+    {ThreadStatus::OP_FLUSH, "Flush"},
+    {ThreadStatus::OP_DBOPEN, "DBOpen"},
+    {ThreadStatus::OP_GET, "Get"},
+    {ThreadStatus::OP_MULTIGET, "MultiGet"},
+    {ThreadStatus::OP_DBITERATOR, "DBIterator"},
+    {ThreadStatus::OP_VERIFY_DB_CHECKSUM, "VerifyDBChecksum"},
+    {ThreadStatus::OP_VERIFY_FILE_CHECKSUMS, "VerifyFileChecksums"},
+    {ThreadStatus::OP_GETENTITY, "GetEntity"},
+    {ThreadStatus::OP_MULTIGETENTITY, "MultiGetEntity"},
+    {ThreadStatus::OP_GET_FILE_CHECKSUMS_FROM_CURRENT_MANIFEST,
+     "GetFileChecksumsFromCurrentManifest"},
+
+};
 
 struct OperationStageInfo {
   const ThreadStatus::OperationStage stage;
@@ -108,5 +120,5 @@ struct OperationInfo {};
 
 struct StateInfo {};
 
-#endif  // ROCKSDB_USING_THREAD_STATUS
+#endif  // !NROCKSDB_THREAD_STATUS
 }  // namespace ROCKSDB_NAMESPACE

@@ -2,7 +2,6 @@
 """
 This module keeps commonly used components.
 """
-from __future__ import absolute_import, division, print_function, unicode_literals
 
 try:
     from builtins import object
@@ -14,7 +13,7 @@ import sys
 import time
 
 
-class ColorString(object):
+class ColorString:
     """Generate colorful strings on terminal"""
 
     HEADER = "\033[95m"

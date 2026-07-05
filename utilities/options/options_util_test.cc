@@ -3,8 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-#ifndef ROCKSDB_LITE
-
 #include "rocksdb/utilities/options_util.h"
 
 #include <cctype>
@@ -58,12 +56,16 @@ TEST_F(OptionsUtilTest, SaveAndLoad) {
   }
 
   const std::string kFileName = "OPTIONS-123456";
-  ASSERT_OK(PersistRocksDBOptions(db_opt, cf_names, cf_opts, kFileName,
-                                  env_->GetFileSystem().get()));
+  ASSERT_OK(PersistRocksDBOptions(WriteOptions(), db_opt, cf_names, cf_opts,
+                                  kFileName, env_->GetFileSystem().get()));
 
   DBOptions loaded_db_opt;
   std::vector<ColumnFamilyDescriptor> loaded_cf_descs;
-  ASSERT_OK(LoadOptionsFromFile(kFileName, env_.get(), &loaded_db_opt,
+  ConfigOptions config_options;
+  config_options.ignore_unknown_options = false;
+  config_options.input_strings_escaped = true;
+  config_options.env = env_.get();
+  ASSERT_OK(LoadOptionsFromFile(config_options, kFileName, &loaded_db_opt,
                                 &loaded_cf_descs));
   ConfigOptions exact;
   exact.sanity_level = ConfigOptions::kSanityLevelExactMatch;
@@ -118,12 +120,12 @@ TEST_F(OptionsUtilTest, SaveAndLoadWithCacheCheck) {
 
   std::vector<std::string> cf_names;
   cf_names.push_back(kDefaultColumnFamilyName);
-  cf_names.push_back("cf_sample");
-  cf_names.push_back("cf_plain_table_sample");
+  cf_names.emplace_back("cf_sample");
+  cf_names.emplace_back("cf_plain_table_sample");
   // Saving DB in file
   const std::string kFileName = "OPTIONS-LOAD_CACHE_123456";
-  ASSERT_OK(PersistRocksDBOptions(db_opt, cf_names, cf_opts, kFileName,
-                                  env_->GetFileSystem().get()));
+  ASSERT_OK(PersistRocksDBOptions(WriteOptions(), db_opt, cf_names, cf_opts,
+                                  kFileName, env_->GetFileSystem().get()));
   DBOptions loaded_db_opt;
   std::vector<ColumnFamilyDescriptor> loaded_cf_descs;
 
@@ -142,27 +144,14 @@ TEST_F(OptionsUtilTest, SaveAndLoadWithCacheCheck) {
       ASSERT_EQ(loaded_bbt_opt->block_cache.get(), cache.get());
     }
   }
-
-  // Test the old interface
-  ASSERT_OK(LoadOptionsFromFile(kFileName, env_.get(), &loaded_db_opt,
-                                &loaded_cf_descs, false, &cache));
-  for (size_t i = 0; i < loaded_cf_descs.size(); i++) {
-    auto* loaded_bbt_opt =
-        loaded_cf_descs[i]
-            .options.table_factory->GetOptions<BlockBasedTableOptions>();
-    // Expect the same cache will be loaded
-    if (loaded_bbt_opt != nullptr) {
-      ASSERT_EQ(loaded_bbt_opt->block_cache.get(), cache.get());
-    }
-  }
   ASSERT_OK(DestroyDB(dbname_, Options(loaded_db_opt, cf_opts[0])));
 }
 
 namespace {
 class DummyTableFactory : public TableFactory {
  public:
-  DummyTableFactory() {}
-  ~DummyTableFactory() override {}
+  DummyTableFactory() = default;
+  ~DummyTableFactory() override = default;
 
   const char* Name() const override { return "DummyTableFactory"; }
 
@@ -189,12 +178,14 @@ class DummyTableFactory : public TableFactory {
   }
 
   std::string GetPrintableOptions() const override { return ""; }
+
+  std::unique_ptr<TableFactory> Clone() const override { return nullptr; }
 };
 
 class DummyMergeOperator : public MergeOperator {
  public:
-  DummyMergeOperator() {}
-  ~DummyMergeOperator() override {}
+  DummyMergeOperator() = default;
+  ~DummyMergeOperator() override = default;
 
   bool FullMergeV2(const MergeOperationInput& /*merge_in*/,
                    MergeOperationOutput* /*merge_out*/) const override {
@@ -213,8 +204,8 @@ class DummyMergeOperator : public MergeOperator {
 
 class DummySliceTransform : public SliceTransform {
  public:
-  DummySliceTransform() {}
-  ~DummySliceTransform() override {}
+  DummySliceTransform() = default;
+  ~DummySliceTransform() override = default;
 
   // Return the name of this transformation.
   const char* Name() const override { return "DummySliceTransform"; }
@@ -225,8 +216,6 @@ class DummySliceTransform : public SliceTransform {
   // determine whether this is a valid src upon the function applies
   bool InDomain(const Slice& /*src*/) const override { return false; }
 
-  // determine whether dst=Transform(src) for some src
-  bool InRange(const Slice& /*dst*/) const override { return false; }
 };
 
 }  // namespace
@@ -252,7 +241,7 @@ TEST_F(OptionsUtilTest, SanityCheck) {
   db_opt.create_if_missing = true;
 
   ASSERT_OK(DestroyDB(dbname_, Options(db_opt, cf_descs[0].options)));
-  DB* db;
+  std::unique_ptr<DB> db;
   std::vector<ColumnFamilyHandle*> handles;
   // open and persist the options
   ASSERT_OK(DB::Open(db_opt, dbname_, cf_descs, &handles, &db));
@@ -261,7 +250,7 @@ TEST_F(OptionsUtilTest, SanityCheck) {
   for (auto* handle : handles) {
     delete handle;
   }
-  delete db;
+  db.reset();
 
   ConfigOptions config_options;
   config_options.ignore_unknown_options = false;
@@ -360,6 +349,21 @@ TEST_F(OptionsUtilTest, SanityCheck) {
     ASSERT_OK(
         CheckOptionsCompatibility(config_options, dbname_, db_opt, cf_descs));
   }
+
+  // persist_user_defined_timestamps
+  {
+    bool prev_persist_user_defined_timestamps =
+        cf_descs[2].options.persist_user_defined_timestamps;
+    cf_descs[2].options.persist_user_defined_timestamps = false;
+    ASSERT_NOK(
+        CheckOptionsCompatibility(config_options, dbname_, db_opt, cf_descs));
+
+    cf_descs[2].options.persist_user_defined_timestamps =
+        prev_persist_user_defined_timestamps;
+    ASSERT_OK(
+        CheckOptionsCompatibility(config_options, dbname_, db_opt, cf_descs));
+  }
+
   ASSERT_OK(DestroyDB(dbname_, Options(db_opt, cf_descs[0].options)));
 }
 
@@ -386,11 +390,8 @@ TEST_F(OptionsUtilTest, LatestOptionsNotFound) {
   ASSERT_TRUE(s.IsNotFound());
   ASSERT_TRUE(s.IsPathNotFound());
 
-  s = LoadLatestOptions(dbname_, options.env, &options, &cf_descs);
-  ASSERT_TRUE(s.IsNotFound());
-  ASSERT_TRUE(s.IsPathNotFound());
-
   s = LoadLatestOptions(config_opts, dbname_, &options, &cf_descs);
+  ASSERT_TRUE(s.IsNotFound());
   ASSERT_TRUE(s.IsPathNotFound());
 
   s = GetLatestOptionsFileName(dbname_, options.env, &options_file_name);
@@ -404,7 +405,7 @@ TEST_F(OptionsUtilTest, LatestOptionsNotFound) {
   ASSERT_TRUE(s.IsNotFound());
   ASSERT_TRUE(s.IsPathNotFound());
 
-  s = LoadLatestOptions(dbname_, options.env, &options, &cf_descs);
+  s = LoadLatestOptions(config_opts, dbname_, &options, &cf_descs);
   ASSERT_TRUE(s.IsNotFound());
   ASSERT_TRUE(s.IsPathNotFound());
 
@@ -432,7 +433,7 @@ TEST_F(OptionsUtilTest, LoadLatestOptions) {
   DBOptions db_opts;
   std::vector<ColumnFamilyDescriptor> cf_descs;
   std::vector<ColumnFamilyHandle*> handles;
-  DB* db;
+  std::unique_ptr<DB> db;
   options.create_if_missing = true;
 
   ASSERT_OK(DestroyDB(dbname_, options));
@@ -492,7 +493,7 @@ TEST_F(OptionsUtilTest, LoadLatestOptions) {
   for (auto* handle : handles) {
     delete handle;
   }
-  delete db;
+  db.reset();
   ASSERT_OK(DestroyDB(dbname_, options, cf_descs));
 }
 
@@ -636,22 +637,25 @@ TEST_F(OptionsUtilTest, BadLatestOptions) {
 }
 
 TEST_F(OptionsUtilTest, RenameDatabaseDirectory) {
-  DB* db;
+  std::unique_ptr<DB> db;
   Options options;
   DBOptions db_opts;
   std::vector<ColumnFamilyDescriptor> cf_descs;
   std::vector<ColumnFamilyHandle*> handles;
+  ConfigOptions ignore_opts;
+  ignore_opts.ignore_unknown_options = false;
+  ignore_opts.env = options.env;
 
   options.create_if_missing = true;
 
   ASSERT_OK(DB::Open(options, dbname_, &db));
   ASSERT_OK(db->Put(WriteOptions(), "foo", "value0"));
-  delete db;
+  db.reset();
 
   auto new_dbname = dbname_ + "_2";
 
   ASSERT_OK(options.env->RenameFile(dbname_, new_dbname));
-  ASSERT_OK(LoadLatestOptions(new_dbname, options.env, &db_opts, &cf_descs));
+  ASSERT_OK(LoadLatestOptions(ignore_opts, new_dbname, &db_opts, &cf_descs));
   ASSERT_EQ(cf_descs.size(), 1U);
 
   db_opts.create_if_missing = false;
@@ -663,32 +667,35 @@ TEST_F(OptionsUtilTest, RenameDatabaseDirectory) {
   for (auto* handle : handles) {
     delete handle;
   }
-  delete db;
+  db.reset();
   Options new_options(db_opts, cf_descs[0].options);
   ASSERT_OK(DestroyDB(new_dbname, new_options, cf_descs));
   ASSERT_OK(DestroyDB(dbname_, options));
 }
 
 TEST_F(OptionsUtilTest, WalDirSettings) {
-  DB* db;
+  std::unique_ptr<DB> db;
   Options options;
   DBOptions db_opts;
   std::vector<ColumnFamilyDescriptor> cf_descs;
   std::vector<ColumnFamilyHandle*> handles;
+  ConfigOptions ignore_opts;
+  ignore_opts.ignore_unknown_options = false;
+  ignore_opts.env = options.env;
 
   options.create_if_missing = true;
 
   // Open a DB with no wal dir set.  The wal_dir should stay empty
   ASSERT_OK(DB::Open(options, dbname_, &db));
-  delete db;
-  ASSERT_OK(LoadLatestOptions(dbname_, options.env, &db_opts, &cf_descs));
+  db.reset();
+  ASSERT_OK(LoadLatestOptions(ignore_opts, dbname_, &db_opts, &cf_descs));
   ASSERT_EQ(db_opts.wal_dir, "");
 
   // Open a DB with wal_dir == dbname.  The wal_dir should be set to empty
   options.wal_dir = dbname_;
   ASSERT_OK(DB::Open(options, dbname_, &db));
-  delete db;
-  ASSERT_OK(LoadLatestOptions(dbname_, options.env, &db_opts, &cf_descs));
+  db.reset();
+  ASSERT_OK(LoadLatestOptions(ignore_opts, dbname_, &db_opts, &cf_descs));
   ASSERT_EQ(db_opts.wal_dir, "");
 
   // Open a DB with no wal_dir but a db_path==dbname_.  The wal_dir should be
@@ -696,8 +703,8 @@ TEST_F(OptionsUtilTest, WalDirSettings) {
   options.wal_dir = "";
   options.db_paths.emplace_back(dbname_, std::numeric_limits<uint64_t>::max());
   ASSERT_OK(DB::Open(options, dbname_, &db));
-  delete db;
-  ASSERT_OK(LoadLatestOptions(dbname_, options.env, &db_opts, &cf_descs));
+  db.reset();
+  ASSERT_OK(LoadLatestOptions(ignore_opts, dbname_, &db_opts, &cf_descs));
   ASSERT_EQ(db_opts.wal_dir, "");
 
   // Open a DB with no wal_dir==dbname_ and db_path==dbname_.  The wal_dir
@@ -705,8 +712,8 @@ TEST_F(OptionsUtilTest, WalDirSettings) {
   options.wal_dir = dbname_ + "/";
   options.db_paths.emplace_back(dbname_, std::numeric_limits<uint64_t>::max());
   ASSERT_OK(DB::Open(options, dbname_, &db));
-  delete db;
-  ASSERT_OK(LoadLatestOptions(dbname_, options.env, &db_opts, &cf_descs));
+  db.reset();
+  ASSERT_OK(LoadLatestOptions(ignore_opts, dbname_, &db_opts, &cf_descs));
   ASSERT_EQ(db_opts.wal_dir, "");
   ASSERT_OK(DestroyDB(dbname_, options));
 
@@ -716,8 +723,8 @@ TEST_F(OptionsUtilTest, WalDirSettings) {
   options.db_paths.emplace_back(dbname_ + "_0",
                                 std::numeric_limits<uint64_t>::max());
   ASSERT_OK(DB::Open(options, dbname_, &db));
-  delete db;
-  ASSERT_OK(LoadLatestOptions(dbname_, options.env, &db_opts, &cf_descs));
+  db.reset();
+  ASSERT_OK(LoadLatestOptions(ignore_opts, dbname_, &db_opts, &cf_descs));
   ASSERT_EQ(db_opts.wal_dir, dbname_);
   ASSERT_OK(DestroyDB(dbname_, options));
 
@@ -725,37 +732,40 @@ TEST_F(OptionsUtilTest, WalDirSettings) {
   options.wal_dir = dbname_ + "/wal";
   options.db_paths.clear();
   ASSERT_OK(DB::Open(options, dbname_, &db));
-  delete db;
-  ASSERT_OK(LoadLatestOptions(dbname_, options.env, &db_opts, &cf_descs));
+  db.reset();
+  ASSERT_OK(LoadLatestOptions(ignore_opts, dbname_, &db_opts, &cf_descs));
   ASSERT_EQ(db_opts.wal_dir, dbname_ + "/wal");
   ASSERT_OK(DestroyDB(dbname_, options));
 }
 
 TEST_F(OptionsUtilTest, WalDirInOptins) {
-  DB* db;
+  std::unique_ptr<DB> db;
   Options options;
   DBOptions db_opts;
   std::vector<ColumnFamilyDescriptor> cf_descs;
   std::vector<ColumnFamilyHandle*> handles;
+  ConfigOptions ignore_opts;
+  ignore_opts.ignore_unknown_options = false;
+  ignore_opts.env = options.env;
 
   // Store an options file with wal_dir=dbname_ and make sure it still loads
   // when the input wal_dir is empty
   options.create_if_missing = true;
   options.wal_dir = "";
   ASSERT_OK(DB::Open(options, dbname_, &db));
-  delete db;
+  db.reset();
   options.wal_dir = dbname_;
   std::string options_file;
   ASSERT_OK(GetLatestOptionsFileName(dbname_, options.env, &options_file));
-  ASSERT_OK(PersistRocksDBOptions(options, {"default"}, {options},
-                                  dbname_ + "/" + options_file,
+  ASSERT_OK(PersistRocksDBOptions(WriteOptions(), options, {"default"},
+                                  {options}, dbname_ + "/" + options_file,
                                   options.env->GetFileSystem().get()));
-  ASSERT_OK(LoadLatestOptions(dbname_, options.env, &db_opts, &cf_descs));
+  ASSERT_OK(LoadLatestOptions(ignore_opts, dbname_, &db_opts, &cf_descs));
   ASSERT_EQ(db_opts.wal_dir, dbname_);
   options.wal_dir = "";
   ASSERT_OK(DB::Open(options, dbname_, &db));
-  delete db;
-  ASSERT_OK(LoadLatestOptions(dbname_, options.env, &db_opts, &cf_descs));
+  db.reset();
+  ASSERT_OK(LoadLatestOptions(ignore_opts, dbname_, &db_opts, &cf_descs));
   ASSERT_EQ(db_opts.wal_dir, "");
 }
 }  // namespace ROCKSDB_NAMESPACE
@@ -768,12 +778,3 @@ int main(int argc, char** argv) {
 #endif  // GFLAGS
   return RUN_ALL_TESTS();
 }
-
-#else
-#include <cstdio>
-
-int main(int /*argc*/, char** /*argv*/) {
-  printf("Skipped in RocksDBLite as utilities are not supported.\n");
-  return 0;
-}
-#endif  // !ROCKSDB_LITE

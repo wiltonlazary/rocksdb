@@ -5,8 +5,6 @@
 
 #pragma once
 
-#ifndef ROCKSDB_LITE
-
 #include <algorithm>
 #include <atomic>
 #include <mutex>
@@ -38,6 +36,97 @@ class WritePreparedTxnDB;
 // committed data from uncommitted data. Uncommitted data could be after the
 // Prepare phase in 2PC (WritePreparedTxn) or before that
 // (WriteUnpreparedTxnImpl).
+//
+// == Concrete example: WritePrepared 2PC transaction ==
+//
+// User code:
+//
+//   Transaction* txn = db->BeginTransaction(write_opts, txn_opts);
+//   txn->SetName("txn1");
+//   txn->Put("key1", "value1");   // buffered in WriteBatch, nothing written
+//   yet txn->Prepare();               // Phase 1 txn->Commit(); // Phase 2
+//
+// -- Phase 1: Prepare (PrepareInternal) --
+//
+// The Prepare call (write_prepared_txn.cc PrepareInternal) calls:
+//
+//   db_impl_->WriteImpl(write_options, GetWriteBatch(),
+//                       ..., !DISABLE_MEMTABLE, ...);
+//
+// !DISABLE_MEMTABLE is false -- memtable is enabled. This is the defining
+// characteristic of "WritePrepared": the actual data (Put("key1", "value1"))
+// is written to the memtable at Prepare time.
+//
+// Because disable_memtable == false, the routing check at
+// db_impl_write.cc:502 is not taken. The write goes through the main write
+// queue (write_thread_), which handles both WAL and memtable:
+//
+//   Destination | What gets written                          | Sequence
+//   ------------|--------------------------------------------|-----------
+//   WAL         | Put(key1, value1) + EndPrepare(txn1)       | prepare_seq
+//   Memtable    | Put(key1, value1)                          | prepare_seq
+//
+// The data is now durable (WAL) and in the memtable, but not yet visible
+// to readers. Readers use GetLastPublishedSequence() which consults a
+// commit map -- since prepare_seq is in the PreparedHeap but not yet in the
+// CommitCache, readers know this data is uncommitted and skip it.
+//
+// -- Phase 2: Commit (CommitInternal) --
+//
+// The Commit call (write_prepared_txn.cc CommitInternal) calls:
+//
+//   db_impl_->WriteImpl(write_options_, working_batch,
+//                       ..., disable_memtable, ...);
+//
+// In the typical case (do_one_write == true, i.e., the commit-time batch
+// is empty or has no data), disable_memtable is true. Now the routing
+// check at db_impl_write.cc:502 is taken:
+//
+//   if (two_write_queues_ && disable_memtable) {
+//       return WriteImplWALOnly(&nonmem_write_thread_, ...);
+//   }
+//
+// The commit goes through the second write queue (nonmem_write_thread_),
+// WAL only:
+//
+//   Destination | What gets written   | Sequence
+//   ------------|---------------------|-----------
+//   WAL         | Commit(txn1) marker | commit_seq
+//   Memtable    | Nothing             | --
+//
+// The PreReleaseCallback (WritePreparedCommitEntryPreReleaseCallback)
+// updates the CommitCache to record that prepare_seq was committed at
+// commit_seq. After this, readers consulting the commit map will see that
+// the data at prepare_seq is committed and therefore visible.
+//
+// -- Why two queues help --
+//
+// The Commit phase doesn't touch the memtable -- it only writes a small
+// marker to WAL and updates an in-memory commit map. By routing this
+// through a separate queue, Commit writes don't have to wait behind other
+// transactions' Prepare writes (which do the expensive memtable insertion
+// on the main queue). This is the optimization mentioned in the options
+// comment about MySQL 2PC where commits are serial.
+//
+// -- Sequence number flow --
+//
+//                            last_sequence_ | last_allocated_seq |
+//                            last_published_seq
+//                            ---------------|--------------------|-------------------
+//   Before Prepare:                  9      |         9          |        9
+//
+//   Prepare (main queue):
+//     FetchAdd alloc seq             9      |        10          |        9
+//     Write WAL + memtable
+//     SetLastSequence               10      |        10          |        9
+//     (published_seq not advanced yet -- data is uncommitted)
+//
+//   Commit (2nd queue):
+//     FetchAdd alloc seq            10      |        11          |        9
+//     Write WAL only
+//     Update CommitCache
+//     SetLastPublishedSeq           10      |        11          |       11
+//
 class WritePreparedTxn : public PessimisticTransaction {
  public:
   WritePreparedTxn(WritePreparedTxnDB* db, const WriteOptions& write_options,
@@ -52,16 +141,15 @@ class WritePreparedTxn : public PessimisticTransaction {
   // seq in the WAL that is also published, LastPublishedSequence, as opposed to
   // the last seq in the memtable.
   using Transaction::Get;
-  virtual Status Get(const ReadOptions& options,
-                     ColumnFamilyHandle* column_family, const Slice& key,
-                     PinnableSlice* value) override;
+  Status Get(const ReadOptions& _read_options,
+             ColumnFamilyHandle* column_family, const Slice& key,
+             PinnableSlice* value) override;
 
   using Transaction::MultiGet;
-  virtual void MultiGet(const ReadOptions& options,
-                        ColumnFamilyHandle* column_family,
-                        const size_t num_keys, const Slice* keys,
-                        PinnableSlice* values, Status* statuses,
-                        const bool sorted_input = false) override;
+  void MultiGet(const ReadOptions& _read_options,
+                ColumnFamilyHandle* column_family, const size_t num_keys,
+                const Slice* keys, PinnableSlice* values, Status* statuses,
+                const bool sorted_input = false) override;
 
   // Note: The behavior is undefined in presence of interleaved writes to the
   // same transaction.
@@ -69,11 +157,19 @@ class WritePreparedTxn : public PessimisticTransaction {
   // based on the last seq in the WAL that is also published,
   // LastPublishedSequence, as opposed to the last seq in the memtable.
   using Transaction::GetIterator;
-  virtual Iterator* GetIterator(const ReadOptions& options) override;
-  virtual Iterator* GetIterator(const ReadOptions& options,
-                                ColumnFamilyHandle* column_family) override;
+  Iterator* GetIterator(const ReadOptions& options) override;
+  Iterator* GetIterator(const ReadOptions& options,
+                        ColumnFamilyHandle* column_family) override;
 
-  virtual void SetSnapshot() override;
+  std::unique_ptr<Iterator> GetCoalescingIterator(
+      const ReadOptions& read_options,
+      const std::vector<ColumnFamilyHandle*>& column_families) override;
+
+  std::unique_ptr<AttributeGroupIterator> GetAttributeGroupIterator(
+      const ReadOptions& read_options,
+      const std::vector<ColumnFamilyHandle*>& column_families) override;
+
+  void SetSnapshot() override;
 
  protected:
   void Initialize(const TransactionOptions& txn_options) override;
@@ -86,6 +182,10 @@ class WritePreparedTxn : public PessimisticTransaction {
   friend class WritePreparedTxnDB;
   friend class WriteUnpreparedTxnDB;
   friend class WriteUnpreparedTxn;
+
+  using Transaction::GetImpl;
+  Status GetImpl(const ReadOptions& options, ColumnFamilyHandle* column_family,
+                 const Slice& key, PinnableSlice* value) override;
 
   Status PrepareInternal() override;
 
@@ -103,11 +203,10 @@ class WritePreparedTxn : public PessimisticTransaction {
 
   Status RollbackInternal() override;
 
-  virtual Status ValidateSnapshot(ColumnFamilyHandle* column_family,
-                                  const Slice& key,
-                                  SequenceNumber* tracked_at_seq) override;
+  Status ValidateSnapshot(ColumnFamilyHandle* column_family, const Slice& key,
+                          SequenceNumber* tracked_at_seq) override;
 
-  virtual Status RebuildFromWriteBatch(WriteBatch* src_batch) override;
+  Status RebuildFromWriteBatch(WriteBatch* src_batch) override;
 
   WritePreparedTxnDB* wpt_db_;
   // Number of sub-batches in prepare
@@ -115,5 +214,3 @@ class WritePreparedTxn : public PessimisticTransaction {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-
-#endif  // ROCKSDB_LITE

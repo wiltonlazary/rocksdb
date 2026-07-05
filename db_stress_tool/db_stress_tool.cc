@@ -21,18 +21,97 @@
 // different behavior. See comment of the flag for details.
 
 #ifdef GFLAGS
+#include <iostream>
+#include <thread>
+
 #include "db_stress_tool/db_stress_common.h"
 #include "db_stress_tool/db_stress_driver.h"
+#include "db_stress_tool/db_stress_shared_state.h"
+#include "port/stack_trace.h"
 #include "rocksdb/convenience.h"
 #include "utilities/fault_injection_fs.h"
 
 namespace ROCKSDB_NAMESPACE {
 namespace {
 static std::shared_ptr<ROCKSDB_NAMESPACE::Env> env_guard;
-static std::shared_ptr<ROCKSDB_NAMESPACE::DbStressEnvWrapper> env_wrapper_guard;
-static std::shared_ptr<ROCKSDB_NAMESPACE::DbStressEnvWrapper>
-    dbsl_env_wrapper_guard;
-static std::shared_ptr<CompositeEnvWrapper> fault_env_guard;
+static std::shared_ptr<ROCKSDB_NAMESPACE::Env> legacy_env_wrapper_guard;
+// Raw pointers for signal-safe crash callback. Signal handlers can only
+// access file-static/global variables; can't capture StressTest instances.
+static std::vector<ROCKSDB_NAMESPACE::FaultInjectionTestFS*>
+    fault_fs_for_crash_flush;
+
+int ValidateNumDbsFlags() {
+  if (FLAGS_num_dbs < 1) {
+    fprintf(stderr, "Error: --num_dbs must be >= 1\n");
+    return 1;
+  }
+  if (FLAGS_num_dbs > 1) {
+    if (FLAGS_clear_column_family_one_in > 0) {
+      fprintf(stderr,
+              "Error: --num_dbs > 1 incompatible with "
+              "--clear_column_family_one_in\n");
+      return 1;
+    }
+    if (FLAGS_test_multi_ops_txns) {
+      fprintf(stderr,
+              "Error: --num_dbs > 1 incompatible with "
+              "--test_multi_ops_txns\n");
+      return 1;
+    }
+  }
+  return 0;
+}
+
+int DestroyAllDbs() {
+  bool all_ok = true;
+  const int num_dbs = FLAGS_num_dbs;
+  auto destroy_one = [&](const std::string& db_path) {
+    Status s = DbStressDestroyDb(db_path);
+    if (s.ok()) {
+      fprintf(stdout, "Successfully destroyed db at %s\n", db_path.c_str());
+    } else {
+      fprintf(stderr, "Failed to destroy db at %s: %s\n", db_path.c_str(),
+              s.ToString().c_str());
+      all_ok = false;
+    }
+  };
+  if (num_dbs == 1) {
+    destroy_one(FLAGS_db);
+  } else {
+    for (int i = 0; i < num_dbs; i++) {
+      destroy_one(FLAGS_db + "/db_" + std::to_string(i));
+    }
+    DestroyDir(raw_env, FLAGS_db);
+  }
+  return all_ok ? 0 : 1;
+}
+
+void RegisterCrashCallbacks(
+    const std::vector<std::unique_ptr<StressTest>>& stress_tests, int num_dbs) {
+  fault_fs_for_crash_flush.resize(num_dbs, nullptr);
+  bool any_fault_fs = false;
+  for (int i = 0; i < num_dbs; i++) {
+    fault_fs_for_crash_flush[i] =
+        stress_tests[i]->GetDbFaultInjectionFs().get();
+    if (fault_fs_for_crash_flush[i]) {
+      any_fault_fs = true;
+    }
+  }
+  if (any_fault_fs) {
+    port::RegisterCrashCallback([]() {
+      for (auto* fs : fault_fs_for_crash_flush) {
+        if (fs) {
+          fs->FlushRecentInjectedErrors();
+        }
+      }
+    });
+  }
+}
+
+int ReturnFlagValidationError(const char* message) {
+  std::cerr << "Error: " << message << '\n';
+  return 1;
+}
 }  // namespace
 
 KeyGenContext key_gen_ctx;
@@ -40,6 +119,7 @@ KeyGenContext key_gen_ctx;
 int db_stress_tool(int argc, char** argv) {
   SetUsageMessage(std::string("\nUSAGE:\n") + std::string(argv[0]) +
                   " [OPTIONS]...");
+  RegisterDbStressBdwFlagValidators();
   ParseCommandLineFlags(&argc, &argv, true);
 
   SanitizeDoubleParam(&FLAGS_bloom_bits);
@@ -51,18 +131,10 @@ int db_stress_tool(int argc, char** argv) {
     SetupSyncPointsToMockDirectIO();
   }
 #endif
-  if (FLAGS_statistics) {
-    dbstats = ROCKSDB_NAMESPACE::CreateDBStatistics();
-    if (FLAGS_test_secondary) {
-      dbstats_secondaries = ROCKSDB_NAMESPACE::CreateDBStatistics();
-    }
-  }
   compression_type_e = StringToCompressionType(FLAGS_compression_type.c_str());
   bottommost_compression_type_e =
       StringToCompressionType(FLAGS_bottommost_compression_type.c_str());
   checksum_type_e = StringToChecksumType(FLAGS_checksum_type.c_str());
-
-  Env* raw_env;
 
   int env_opts = !FLAGS_env_uri.empty() + !FLAGS_fs_uri.empty();
   if (env_opts > 1) {
@@ -77,45 +149,80 @@ int db_stress_tool(int argc, char** argv) {
             s.ToString().c_str());
     exit(1);
   }
-  dbsl_env_wrapper_guard = std::make_shared<DbStressEnvWrapper>(raw_env);
-  db_stress_listener_env = dbsl_env_wrapper_guard.get();
 
-  if (FLAGS_read_fault_one_in || FLAGS_sync_fault_injection ||
-      FLAGS_write_fault_one_in || FLAGS_open_metadata_write_fault_one_in ||
-      FLAGS_open_write_fault_one_in || FLAGS_open_read_fault_one_in) {
-    FaultInjectionTestFS* fs =
-        new FaultInjectionTestFS(raw_env->GetFileSystem());
-    fault_fs_guard.reset(fs);
-    if (FLAGS_write_fault_one_in) {
-      fault_fs_guard->SetFilesystemDirectWritable(false);
-    } else {
-      fault_fs_guard->SetFilesystemDirectWritable(true);
-    }
-    fault_env_guard =
-        std::make_shared<CompositeEnvWrapper>(raw_env, fault_fs_guard);
-    raw_env = fault_env_guard.get();
+  // Handle --destroy_db_and_exit early
+  if (FLAGS_destroy_db_and_exit) {
+    return DestroyAllDbs();
   }
 
-  env_wrapper_guard = std::make_shared<DbStressEnvWrapper>(raw_env);
-  db_stress_env = env_wrapper_guard.get();
+  // Handle --delete_dir_and_exit early, before other option validation
+  if (!FLAGS_delete_dir_and_exit.empty()) {
+    s = DestroyDir(raw_env, FLAGS_delete_dir_and_exit);
+    if (s.ok()) {
+      fprintf(stdout, "Successfully deleted directory %s\n",
+              FLAGS_delete_dir_and_exit.c_str());
+      return 0;
+    } else {
+      fprintf(stderr, "Failed to delete directory %s: %s\n",
+              FLAGS_delete_dir_and_exit.c_str(), s.ToString().c_str());
+      return 1;
+    }
+  }
 
-  if (FLAGS_write_fault_one_in) {
-    // In the write injection case, we need to use the FS interface and returns
-    // the IOStatus with different error and flags. Therefore,
-    // DbStressEnvWrapper cannot be used which will swallow the FS
-    // implementations. We should directly use the raw_env which is the
-    // CompositeEnvWrapper of env and fault_fs.
-    db_stress_env = raw_env;
+  {
+    int rc = ValidateNumDbsFlags();
+    if (rc != 0) {
+      return rc;
+    }
+  }
+
+  if (!FLAGS_verify_cpu_corruption_dir.empty()) {
+    // The full-keyspace read-back is only well-defined with a single writer,
+    // and injected I/O faults would taint it -- so require --threads=1 and all
+    // fault injection off (see the flag's comment).
+    if (FLAGS_threads != 1) {
+      fprintf(stderr,
+              "Error: --verify_cpu_corruption_dir requires --threads=1\n");
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
+    }
+    if (FLAGS_read_fault_one_in != 0 || FLAGS_write_fault_one_in != 0 ||
+        FLAGS_metadata_read_fault_one_in != 0 ||
+        FLAGS_metadata_write_fault_one_in != 0 ||
+        FLAGS_open_read_fault_one_in != 0 ||
+        FLAGS_open_write_fault_one_in != 0 ||
+        FLAGS_open_metadata_read_fault_one_in != 0 ||
+        FLAGS_open_metadata_write_fault_one_in != 0 ||
+        FLAGS_secondary_cache_fault_one_in != 0 || FLAGS_sync_fault_injection) {
+      fprintf(stderr,
+              "Error: --verify_cpu_corruption_dir requires all fault injection "
+              "off (every *_fault_one_in = 0 and sync_fault_injection = "
+              "false)\n");
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
+    }
+    // The read-back compares against the expected-state model, which only the
+    // default (state-tracked) stress test maintains. The
+    // batched/cf-consistency/ multi-ops-txns variants set
+    // IsStateTracked()=false, so every key would look absent -- reject them
+    // rather than report false losses.
+    if (FLAGS_test_batches_snapshots || FLAGS_test_cf_consistency ||
+        FLAGS_test_multi_ops_txns) {
+      fprintf(stderr,
+              "Error: --verify_cpu_corruption_dir requires the default "
+              "state-tracked stress test; it is incompatible with "
+              "--test_batches_snapshots, --test_cf_consistency, and "
+              "--test_multi_ops_txns\n");
+      exit(1);  // NOLINT(concurrency-mt-unsafe)
+    }
   }
 
   FLAGS_rep_factory = StringToRepFactory(FLAGS_memtablerep.c_str());
 
   // The number of background threads should be at least as much the
   // max number of concurrent compactions.
-  db_stress_env->SetBackgroundThreads(FLAGS_max_background_compactions,
-                                      ROCKSDB_NAMESPACE::Env::Priority::LOW);
-  db_stress_env->SetBackgroundThreads(FLAGS_num_bottom_pri_threads,
-                                      ROCKSDB_NAMESPACE::Env::Priority::BOTTOM);
+  raw_env->SetBackgroundThreads(FLAGS_max_background_compactions,
+                                ROCKSDB_NAMESPACE::Env::Priority::LOW);
+  raw_env->SetBackgroundThreads(FLAGS_num_bottom_pri_threads,
+                                ROCKSDB_NAMESPACE::Env::Priority::BOTTOM);
   if (FLAGS_prefixpercent > 0 && FLAGS_prefix_size < 0) {
     fprintf(stderr,
             "Error: prefixpercent is non-zero while prefix_size is "
@@ -184,6 +291,85 @@ int db_stress_tool(int argc, char** argv) {
         "Error: nooverwritepercent must not be 100 when using merge operands");
     exit(1);
   }
+  if (FLAGS_enable_blob_direct_write) {
+    // Blob direct write is intentionally validated as a reduced-scope stress
+    // feature. We allow the WAL-disabled crash-test profile, including
+    // wide-column PutEntity/GetEntity coverage, but reject best-efforts
+    // recovery, parallel memtable/write-queue variants, transactions, remote
+    // compaction, and APIs/features that depend on active-file snapshotting or
+    // unsupported blob option transitions.
+    if (!FLAGS_enable_blob_files) {
+      return ReturnFlagValidationError(
+          "enable_blob_direct_write requires enable_blob_files");
+    }
+    if (FLAGS_allow_concurrent_memtable_write) {
+      return ReturnFlagValidationError(
+          "blob direct write stress requires "
+          "allow_concurrent_memtable_write=0");
+    }
+    if (FLAGS_enable_pipelined_write) {
+      return ReturnFlagValidationError(
+          "blob direct write stress does not support "
+          "enable_pipelined_write");
+    }
+    if (FLAGS_unordered_write) {
+      return ReturnFlagValidationError(
+          "blob direct write stress does not support unordered_write");
+    }
+    if (FLAGS_two_write_queues) {
+      return ReturnFlagValidationError(
+          "blob direct write stress does not support two_write_queues");
+    }
+    if (FLAGS_use_blob_db) {
+      return ReturnFlagValidationError(
+          "blob direct write is only supported with integrated BlobDB");
+    }
+    if (FLAGS_use_merge || FLAGS_use_full_merge_v1) {
+      return ReturnFlagValidationError(
+          "blob direct write stress does not support merge");
+    }
+    if (FLAGS_experimental_mempurge_threshold > 0.0) {
+      return ReturnFlagValidationError(
+          "blob direct write stress does not support MemPurge");
+    }
+    if (FLAGS_user_timestamp_size > 0) {
+      return ReturnFlagValidationError(
+          "blob direct write stress does not support user-defined timestamps");
+    }
+    if (FLAGS_allow_setting_blob_options_dynamically ||
+        FLAGS_enable_blob_garbage_collection) {
+      return ReturnFlagValidationError(
+          "blob direct write stress does not support dynamic blob options or "
+          "blob GC");
+    }
+    if (FLAGS_best_efforts_recovery) {
+      return ReturnFlagValidationError(
+          "blob direct write stress supports disable_wal-based crash "
+          "testing, not best-efforts recovery");
+    }
+    if (FLAGS_remote_compaction_worker_threads > 0) {
+      return ReturnFlagValidationError(
+          "blob direct write stress does not support remote compaction");
+    }
+    if (FLAGS_use_txn || FLAGS_txn_write_policy != 0 ||
+        FLAGS_use_optimistic_txn || FLAGS_test_multi_ops_txns ||
+        FLAGS_commit_bypass_memtable_one_in > 0) {
+      return ReturnFlagValidationError(
+          "blob direct write stress does not support TransactionDB modes");
+    }
+    if (FLAGS_test_secondary || FLAGS_backup_one_in > 0 ||
+        FLAGS_checkpoint_one_in > 0 || FLAGS_get_live_files_apis_one_in > 0 ||
+        FLAGS_ingest_external_file_one_in > 0) {
+      return ReturnFlagValidationError(
+          "blob direct write stress does not support secondary, backup, "
+          "checkpoint, get_live_files, or ingest_external_file modes");
+    }
+    if (FLAGS_ingest_wbwi_one_in > 0) {
+      return ReturnFlagValidationError(
+          "blob direct write stress does not support "
+          "IngestWriteBatchWithIndex");
+    }
+  }
   if (FLAGS_ingest_external_file_one_in > 0 &&
       FLAGS_nooverwritepercent == 100) {
     fprintf(
@@ -198,6 +384,26 @@ int db_stress_tool(int argc, char** argv) {
   }
   if (FLAGS_test_cf_consistency && FLAGS_disable_wal) {
     FLAGS_atomic_flush = true;
+  }
+
+  // Trie UDI uses zero-copy pointers into block data, which is
+  // incompatible with mmap_read.
+  if (FLAGS_use_trie_index && FLAGS_mmap_read) {
+    fprintf(stderr,
+            "Error: use_trie_index is incompatible with mmap_read. "
+            "The trie index uses zero-copy pointers into block data "
+            "which is unsafe with mmap'd reads.\n");
+    exit(1);
+  }
+
+  // TrieIndexFactory requires plain BytewiseComparator, but timestamps use
+  // BytewiseComparator.u64ts.
+  if (FLAGS_use_trie_index && FLAGS_user_timestamp_size > 0) {
+    fprintf(stderr,
+            "Error: use_trie_index is incompatible with user-defined "
+            "timestamps. TrieIndexFactory requires BytewiseComparator "
+            "but timestamps use BytewiseComparator.u64ts.\n");
+    exit(1);
   }
 
   if (FLAGS_read_only) {
@@ -216,29 +422,81 @@ int db_stress_tool(int argc, char** argv) {
   // Choose a location for the test database if none given with --db=<path>
   if (FLAGS_db.empty()) {
     std::string default_db_path;
-    db_stress_env->GetTestDirectory(&default_db_path);
+    raw_env->GetTestDirectory(&default_db_path);
     default_db_path += "/dbstress";
     FLAGS_db = default_db_path;
   }
 
-  if ((FLAGS_test_secondary || FLAGS_continuous_verification_interval > 0) &&
-      FLAGS_secondaries_base.empty()) {
-    std::string default_secondaries_path;
-    db_stress_env->GetTestDirectory(&default_secondaries_path);
-    default_secondaries_path += "/dbstress_secondaries";
-    s = db_stress_env->CreateDirIfMissing(default_secondaries_path);
+  // For num_dbs=1: --db and --expected_values_dir are paths used as-is.
+  // For num_dbs>1: they are parent directories; C++ creates db_0/, db_1/, ...
+  // subdirs underneath. DB::Open(create_if_missing) creates each DB dir.
+  // Python (db_crashtest.py) also creates EV dirs; C++ creates them here as a
+  // fallback for direct CLI usage.
+  const int num_dbs = FLAGS_num_dbs;
+  if (num_dbs > 1) {
+    s = raw_env->CreateDirIfMissing(FLAGS_db);
     if (!s.ok()) {
-      fprintf(stderr, "Failed to create directory %s: %s\n",
-              default_secondaries_path.c_str(), s.ToString().c_str());
+      fprintf(stderr, "Failed to create directory %s: %s\n", FLAGS_db.c_str(),
+              s.ToString().c_str());
       exit(1);
     }
-    FLAGS_secondaries_base = default_secondaries_path;
+  }
+  std::vector<std::string> db_paths;
+  std::vector<std::string> ev_paths;
+  for (int i = 0; i < num_dbs; i++) {
+    std::string suffix = (num_dbs == 1) ? "" : "/db_" + std::to_string(i);
+    db_paths.push_back(FLAGS_db + suffix);
+    if (!FLAGS_expected_values_dir.empty()) {
+      std::string ep = FLAGS_expected_values_dir + suffix;
+      s = Env::Default()->CreateDirIfMissing(ep);
+      if (!s.ok()) {
+        fprintf(stderr, "Failed to create directory %s: %s\n", ep.c_str(),
+                s.ToString().c_str());
+        exit(1);
+      }
+      ev_paths.push_back(std::move(ep));
+    }
+  }
+  if (ev_paths.empty()) {
+    ev_paths.resize(num_dbs);
   }
 
-  if (FLAGS_best_efforts_recovery && !FLAGS_skip_verifydb &&
-      !FLAGS_disable_wal) {
+  // Secondary paths: C++ owns creation entirely.
+  std::vector<std::string> sec_paths;
+  if (FLAGS_test_secondary || FLAGS_continuous_verification_interval > 0) {
+    std::string sec_parent;
+    if (!FLAGS_secondaries_base.empty()) {
+      sec_parent = FLAGS_secondaries_base;
+    } else {
+      raw_env->GetTestDirectory(&sec_parent);
+      sec_parent += "/dbstress_secondaries";
+    }
+    s = raw_env->CreateDirIfMissing(sec_parent);
+    if (!s.ok()) {
+      fprintf(stderr, "Failed to create directory %s: %s\n", sec_parent.c_str(),
+              s.ToString().c_str());
+      exit(1);
+    }
+    for (int i = 0; i < num_dbs; i++) {
+      std::string suffix = (num_dbs == 1) ? "" : "/db_" + std::to_string(i);
+      std::string sec_path = sec_parent + suffix;
+      s = raw_env->CreateDirIfMissing(sec_path);
+      if (!s.ok()) {
+        fprintf(stderr, "Failed to create directory %s: %s\n", sec_path.c_str(),
+                s.ToString().c_str());
+        exit(1);
+      }
+      sec_paths.push_back(std::move(sec_path));
+    }
+  }
+  if (sec_paths.empty()) {
+    sec_paths.resize(num_dbs);
+  }
+
+  if (FLAGS_best_efforts_recovery &&
+      !(FLAGS_skip_verifydb && FLAGS_disable_wal)) {
     fprintf(stderr,
-            "With best-efforts recovery, either skip_verifydb or disable_wal "
+            "With best-efforts recovery, skip_verifydb and disable_wal "
             "should be set to true.\n");
     exit(1);
   }
@@ -255,18 +513,30 @@ int db_stress_tool(int argc, char** argv) {
       exit(1);
     }
   }
-  if (FLAGS_enable_compaction_filter &&
+  if ((FLAGS_enable_compaction_filter || FLAGS_inplace_update_support) &&
       (FLAGS_acquire_snapshot_one_in > 0 || FLAGS_compact_range_one_in > 0 ||
-       FLAGS_iterpercent > 0 || FLAGS_test_batches_snapshots ||
-       FLAGS_test_cf_consistency)) {
+       FLAGS_iterpercent > 0 || FLAGS_prefixpercent > 0 ||
+       FLAGS_test_batches_snapshots || FLAGS_test_cf_consistency ||
+       FLAGS_check_multiget_consistency ||
+       FLAGS_check_multiget_entity_consistency)) {
     fprintf(
         stderr,
         "Error: acquire_snapshot_one_in, compact_range_one_in, iterpercent, "
-        "test_batches_snapshots  must all be 0 when using compaction filter\n");
+        "prefixpercent, test_batches_snapshots, test_cf_consistency, "
+        "check_multiget_consistency, check_multiget_entity_consistency must "
+        "all be 0 when using compaction filter or inplace update support\n");
     exit(1);
   }
   if (FLAGS_test_multi_ops_txns) {
     CheckAndSetOptionsForMultiOpsTxnStressTest();
+  }
+
+  if (!FLAGS_use_txn && FLAGS_use_optimistic_txn) {
+    fprintf(
+        stderr,
+        "You cannot set use_optimistic_txn true while use_txn is false. Please "
+        "set use_txn true if you want to use OptimisticTransactionDB\n");
+    exit(1);
   }
 
   if (FLAGS_create_timestamped_snapshot_one_in > 0) {
@@ -286,8 +556,8 @@ int db_stress_tool(int argc, char** argv) {
     exit(1);
   }
 
-  if (FLAGS_use_txn && FLAGS_sync_fault_injection &&
-      FLAGS_txn_write_policy != 0) {
+  if (FLAGS_use_txn && !FLAGS_use_optimistic_txn &&
+      FLAGS_sync_fault_injection && FLAGS_txn_write_policy != 0) {
     fprintf(stderr,
             "For TransactionDB, correctness testing with unsync data loss is "
             "currently compatible with only write committed policy\n");
@@ -295,12 +565,11 @@ int db_stress_tool(int argc, char** argv) {
   }
 
   if (FLAGS_use_put_entity_one_in > 0 &&
-      (FLAGS_ingest_external_file_one_in > 0 || FLAGS_use_merge ||
-       FLAGS_use_full_merge_v1 || FLAGS_use_txn || FLAGS_test_multi_ops_txns ||
+      (FLAGS_use_full_merge_v1 || FLAGS_test_multi_ops_txns ||
        FLAGS_user_timestamp_size > 0)) {
     fprintf(stderr,
-            "PutEntity is currently incompatible with SstFileWriter, Merge,"
-            " transactions, and user-defined timestamps\n");
+            "Wide columns are incompatible with V1 Merge, the multi-op "
+            "transaction test, and user-defined timestamps\n");
     exit(1);
   }
 
@@ -341,24 +610,72 @@ int db_stress_tool(int argc, char** argv) {
     key_gen_ctx.weights.emplace_back(key_gen_ctx.window -
                                      keys_per_level * (levels - 1));
   }
-
-  std::unique_ptr<ROCKSDB_NAMESPACE::StressTest> stress;
-  if (FLAGS_test_cf_consistency) {
-    stress.reset(CreateCfConsistencyStressTest());
-  } else if (FLAGS_test_batches_snapshots) {
-    stress.reset(CreateBatchedOpsStressTest());
-  } else if (FLAGS_test_multi_ops_txns) {
-    stress.reset(CreateMultiOpsTxnsStressTest());
-  } else {
-    stress.reset(CreateNonBatchedOpsStressTest());
-  }
-  // Initialize the Zipfian pre-calculated array
+  // Initialize shared resources (hot-key generator, block cache, WBM,
+  // rate limiter) once so that all DB instances share them.
   InitializeHotKeyGenerator(FLAGS_hot_key_alpha);
-  if (RunStressTest(stress.get())) {
-    return 0;
-  } else {
-    return 1;
+  block_cache =
+      StressTest::NewCache(FLAGS_cache_size, FLAGS_cache_numshardbits);
+  if (FLAGS_use_write_buffer_manager) {
+    wbm = std::make_shared<WriteBufferManager>(FLAGS_db_write_buffer_size,
+                                               block_cache);
   }
+  if (FLAGS_rate_limiter_bytes_per_sec > 0) {
+    rate_limiter.reset(NewGenericRateLimiter(
+        FLAGS_rate_limiter_bytes_per_sec, 1000 /* refill_period_us */,
+        10 /* fairness */,
+        FLAGS_rate_limit_bg_reads ? RateLimiter::Mode::kReadsOnly
+                                  : RateLimiter::Mode::kWritesOnly));
+  }
+
+  // Phase 1: Create StressTest instances (one per DB).
+  std::vector<std::unique_ptr<StressTest>> stress_tests(num_dbs);
+  for (int i = 0; i < num_dbs; i++) {
+    if (FLAGS_test_cf_consistency) {
+      stress_tests[i].reset(CreateCfConsistencyStressTest(
+          i, db_paths[i], ev_paths[i], sec_paths[i]));
+    } else if (FLAGS_test_batches_snapshots) {
+      stress_tests[i].reset(CreateBatchedOpsStressTest(
+          i, db_paths[i], ev_paths[i], sec_paths[i]));
+    } else if (FLAGS_test_multi_ops_txns) {
+      stress_tests[i].reset(CreateMultiOpsTxnsStressTest(
+          i, db_paths[i], ev_paths[i], sec_paths[i]));
+    } else {
+      stress_tests[i].reset(CreateNonBatchedOpsStressTest(
+          i, db_paths[i], ev_paths[i], sec_paths[i]));
+    }
+  }
+
+  RegisterCrashCallbacks(stress_tests, num_dbs);
+
+  // Phase 2: Create SharedState for every DB before any worker thread starts.
+  std::vector<std::unique_ptr<SharedState>> shared_states(num_dbs);
+  for (int i = 0; i < num_dbs; i++) {
+    shared_states[i].reset(new SharedState(raw_env, stress_tests[i].get()));
+  }
+
+  // Phase 3: Launch each DB's stress test on its own thread.
+  std::vector<int> results(num_dbs, 0);
+  std::vector<std::thread> stress_test_runners;
+  stress_test_runners.reserve(num_dbs);
+  for (int i = 0; i < num_dbs; i++) {
+    stress_test_runners.emplace_back([i, &results, &shared_states]() {
+      results[i] = RunStressTest(shared_states[i].get()) ? 1 : 0;
+    });
+  }
+
+  // Phase 4: Wait for all DB threads, collect results, clean up.
+  bool all_passed = true;
+  for (int i = 0; i < num_dbs; i++) {
+    stress_test_runners[i].join();
+    if (!results[i]) {
+      all_passed = false;
+    }
+    stress_tests[i]->CleanUp();
+  }
+  for (auto& fs : fault_fs_for_crash_flush) {
+    fs = nullptr;
+  }
+  return all_passed ? 0 : 1;
 }
 
 }  // namespace ROCKSDB_NAMESPACE

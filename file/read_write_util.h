@@ -21,9 +21,21 @@ namespace ROCKSDB_NAMESPACE {
 // fname   : the file name.
 // result  : output arg. A WritableFile based on `fname` returned.
 // options : the Env Options.
-extern IOStatus NewWritableFile(FileSystem* fs, const std::string& fname,
-                                std::unique_ptr<FSWritableFile>* result,
-                                const FileOptions& options);
+IOStatus NewWritableFile(FileSystem* fs, const std::string& fname,
+                         std::unique_ptr<FSWritableFile>* result,
+                         const FileOptions& options);
+
+enum class FileSizeFallback {
+  kNotSupportedOnly,
+  kAnyOpenFileError,
+};
+
+using BeforePathFileSizeFallback = void (*)();
+
+IOStatus GetFileSizeFromOpenFileOrPath(
+    FSRandomAccessFile* file, FileSystem* fs, const std::string& fname,
+    uint64_t* file_size, IODebugContext* dbg, FileSizeFallback fallback,
+    BeforePathFileSizeFallback before_path_fallback = nullptr);
 
 #ifndef NDEBUG
 bool IsFileSectorAligned(const size_t off, size_t sector_size);

@@ -3,8 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-#ifndef ROCKSDB_LITE
-
 #include "env/fs_remap.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -76,6 +74,17 @@ IOStatus RemapFileSystem::NewWritableFile(
   }
   return FileSystemWrapper::NewWritableFile(status_and_enc_path.second, options,
                                             result, dbg);
+}
+
+IOStatus RemapFileSystem::ReopenWritableFile(
+    const std::string& fname, const FileOptions& options,
+    std::unique_ptr<FSWritableFile>* result, IODebugContext* dbg) {
+  auto status_and_enc_path = EncodePathWithNewBasename(fname);
+  if (!status_and_enc_path.first.ok()) {
+    return status_and_enc_path.first;
+  }
+  return FileSystemWrapper::ReopenWritableFile(status_and_enc_path.second,
+                                               options, result, dbg);
 }
 
 IOStatus RemapFileSystem::ReuseWritableFile(
@@ -300,6 +309,18 @@ IOStatus RemapFileSystem::LinkFile(const std::string& src,
                                      dbg);
 }
 
+IOStatus RemapFileSystem::SyncFile(const std::string& fname,
+                                   const FileOptions& file_opts,
+                                   const IOOptions& io_opts, bool use_fsync,
+                                   IODebugContext* dbg) {
+  auto status_and_enc_path = EncodePathWithNewBasename(fname);
+  if (!status_and_enc_path.first.ok()) {
+    return status_and_enc_path.first;
+  }
+  return FileSystemWrapper::SyncFile(status_and_enc_path.second, file_opts,
+                                     io_opts, use_fsync, dbg);
+}
+
 IOStatus RemapFileSystem::LockFile(const std::string& fname,
                                    const IOOptions& options, FileLock** lock,
                                    IODebugContext* dbg) {
@@ -339,5 +360,3 @@ IOStatus RemapFileSystem::GetAbsolutePath(const std::string& db_path,
 }
 
 }  // namespace ROCKSDB_NAMESPACE
-
-#endif  // ROCKSDB_LITE

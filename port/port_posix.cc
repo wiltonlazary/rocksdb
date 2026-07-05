@@ -11,20 +11,20 @@
 
 #include "port/port_posix.h"
 
-#include <assert.h>
+#include <cassert>
 #if defined(__i386__) || defined(__x86_64__)
 #include <cpuid.h>
 #endif
-#include <errno.h>
 #include <sched.h>
-#include <signal.h>
-#include <stdio.h>
-#include <string.h>
 #include <sys/resource.h>
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <csignal>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <string>
 
@@ -41,9 +41,9 @@ namespace ROCKSDB_NAMESPACE {
 // build environment then this happens automatically; otherwise it's up to the
 // consumer to define the identifier.
 #ifdef ROCKSDB_DEFAULT_TO_ADAPTIVE_MUTEX
-extern const bool kDefaultToAdaptiveMutex = true;
+const bool kDefaultToAdaptiveMutex = true;
 #else
-extern const bool kDefaultToAdaptiveMutex = false;
+const bool kDefaultToAdaptiveMutex = false;
 #endif
 
 namespace port {
@@ -100,7 +100,7 @@ bool Mutex::TryLock() {
   return ret;
 }
 
-void Mutex::AssertHeld() {
+void Mutex::AssertHeld() const {
 #ifndef NDEBUG
   assert(locked_);
 #endif
@@ -161,8 +161,32 @@ void RWMutex::ReadLock() {
   PthreadCall("read lock", pthread_rwlock_rdlock(&mu_));
 }
 
+bool RWMutex::TryReadLock() {
+  int result = pthread_rwlock_tryrdlock(&mu_);
+  if (result == 0) {
+    return true;
+  }
+  if (result == EBUSY) {
+    return false;
+  }
+  PthreadCall("try read lock", result);
+  return false;
+}
+
 void RWMutex::WriteLock() {
   PthreadCall("write lock", pthread_rwlock_wrlock(&mu_));
+}
+
+bool RWMutex::TryWriteLock() {
+  int result = pthread_rwlock_trywrlock(&mu_);
+  if (result == 0) {
+    return true;
+  }
+  if (result == EBUSY) {
+    return false;
+  }
+  PthreadCall("try write lock", result);
+  return false;
 }
 
 void RWMutex::ReadUnlock() {
@@ -208,6 +232,8 @@ void Crash(const std::string& srcfile, int srcline) {
   kill(getpid(), SIGTERM);
 }
 
+void ImmediateExit(int code) { _exit(code); }
+
 int GetMaxOpenFiles() {
 #if defined(RLIMIT_NOFILE)
   struct rlimit no_files_limit;
@@ -220,8 +246,9 @@ int GetMaxOpenFiles() {
     return std::numeric_limits<int>::max();
   }
   return static_cast<int>(no_files_limit.rlim_cur);
-#endif
+#else
   return -1;
+#endif
 }
 
 void* cacheline_aligned_alloc(size_t size) {

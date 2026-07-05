@@ -16,7 +16,7 @@ DEFINE_SYNC_AND_ASYNC(Status, Version::MultiGetFromSST)
 (const ReadOptions& read_options, MultiGetRange file_range, int hit_file_level,
  bool skip_filters, bool skip_range_deletions, FdWithKeyRange* f,
  std::unordered_map<uint64_t, BlobReadContexts>& blob_ctxs,
- Cache::Handle* table_handle, uint64_t& num_filter_read,
+ TableCache::TypedHandle* table_handle, uint64_t& num_filter_read,
  uint64_t& num_index_read, uint64_t& num_sst_read) {
   bool timer_enabled = GetPerfLevel() >= PerfLevel::kEnableTimeExceptForMutex &&
                        get_perf_context()->per_level_perf_context_enabled;
@@ -25,7 +25,7 @@ DEFINE_SYNC_AND_ASYNC(Status, Version::MultiGetFromSST)
   StopWatchNano timer(clock_, timer_enabled /* auto_start */);
   s = CO_AWAIT(table_cache_->MultiGet)(
       read_options, *internal_comparator(), *f->file_metadata, &file_range,
-      mutable_cf_options_.prefix_extractor,
+      mutable_cf_options_,
       cfd_->internal_stats()->GetFileReadHist(hit_file_level), skip_filters,
       skip_range_deletions, hit_file_level, table_handle);
   // TODO: examine the behavior for corrupted key
@@ -58,6 +58,11 @@ DEFINE_SYNC_AND_ASYNC(Status, Version::MultiGetFromSST)
 
     if (get_context.sample()) {
       sample_file_read_inc(f->file_metadata);
+      if (get_context.State() == GetContext::kNotFound ||
+          get_context.State() == GetContext::kMerge ||
+          get_context.State() == GetContext::kDeleted) {
+        sample_collapsible_entry_file_read_inc(f->file_metadata);
+      }
     }
     batch_size++;
     num_index_read += get_context.get_context_stats_.num_index_read;
@@ -101,23 +106,36 @@ DEFINE_SYNC_AND_ASYNC(Status, Version::MultiGetFromSST)
         file_range.MarkKeyDone(iter);
 
         if (iter->is_blob_index) {
+          BlobIndex blob_index;
+          Status tmp_s;
+
           if (iter->value) {
             TEST_SYNC_POINT_CALLBACK("Version::MultiGet::TamperWithBlobIndex",
                                      &(*iter));
 
-            const Slice& blob_index_slice = *(iter->value);
-            BlobIndex blob_index;
-            Status tmp_s = blob_index.DecodeFrom(blob_index_slice);
-            if (tmp_s.ok()) {
-              const uint64_t blob_file_num = blob_index.file_number();
-              blob_ctxs[blob_file_num].emplace_back(
-                  std::make_pair(blob_index, std::cref(*iter)));
-            } else {
-              *(iter->s) = tmp_s;
-            }
+            tmp_s = blob_index.DecodeFrom(*(iter->value));
+
+          } else {
+            assert(iter->columns);
+
+            tmp_s = blob_index.DecodeFrom(
+                WideColumnsHelper::GetDefaultColumn(iter->columns->columns()));
+          }
+
+          if (tmp_s.ok()) {
+            const uint64_t blob_file_num = blob_index.file_number();
+            blob_ctxs[blob_file_num].emplace_back(blob_index, &*iter);
+          } else {
+            *(iter->s) = tmp_s;
           }
         } else {
-          file_range.AddValueSize(iter->value->size());
+          if (iter->value) {
+            file_range.AddValueSize(iter->value->size());
+          } else {
+            assert(iter->columns);
+            file_range.AddValueSize(iter->columns->serialized_size());
+          }
+
           if (file_range.GetValueSize() > read_options.value_size_soft_limit) {
             s = Status::Aborted();
             break;
@@ -141,9 +159,8 @@ DEFINE_SYNC_AND_ASYNC(Status, Version::MultiGetFromSST)
             "ROCKSDB_NAMESPACE::blob_db::BlobDB instead.");
         file_range.MarkKeyDone(iter);
         continue;
-      case GetContext::kUnexpectedWideColumnEntity:
-        *status =
-            Status::NotSupported("Encountered unexpected wide-column entity");
+      case GetContext::kMergeOperatorFailed:
+        *status = Status::Corruption(Status::SubCode::kMergeOperatorFailed);
         file_range.MarkKeyDone(iter);
         continue;
     }

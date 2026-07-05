@@ -92,13 +92,37 @@ class SkipListRep : public MemTableRep {
     }
   }
 
+  Status GetAndValidate(const LookupKey& k, void* callback_args,
+                        bool (*callback_func)(void* arg, const char* entry),
+                        bool allow_data_in_errors, bool detect_key_out_of_order,
+                        const std::function<Status(const char*, bool)>&
+                            key_validation_callback) override {
+    SkipListRep::Iterator iter(&skip_list_);
+    Slice dummy_slice;
+    Status status = iter.SeekAndValidate(
+        dummy_slice, k.memtable_key().data(), allow_data_in_errors,
+        detect_key_out_of_order, key_validation_callback);
+    for (; iter.Valid() && status.ok() &&
+           callback_func(callback_args, iter.key());
+         status = iter.NextAndValidate(allow_data_in_errors)) {
+    }
+    return status;
+  }
+
+  Status MultiGet(size_t num_keys, const char* const* keys,
+                  void** callback_args,
+                  bool (*callback_func)(void* arg, const char* entry),
+                  bool allow_data_in_errors, bool detect_key_out_of_order,
+                  const std::function<Status(const char*, bool)>&
+                      key_validation_callback) override {
+    return skip_list_.MultiGet(num_keys, keys, callback_args, callback_func,
+                               allow_data_in_errors, detect_key_out_of_order,
+                               key_validation_callback);
+  }
+
   uint64_t ApproximateNumEntries(const Slice& start_ikey,
                                  const Slice& end_ikey) override {
-    std::string tmp;
-    uint64_t start_count =
-        skip_list_.EstimateCount(EncodeKey(&tmp, start_ikey));
-    uint64_t end_count = skip_list_.EstimateCount(EncodeKey(&tmp, end_ikey));
-    return (end_count >= start_count) ? (end_count - start_count) : 0;
+    return skip_list_.ApproximateNumEntries(start_ikey, end_ikey);
   }
 
   void UniqueRandomSample(const uint64_t num_entries,
@@ -161,7 +185,7 @@ class SkipListRep : public MemTableRep {
     }
   }
 
-  ~SkipListRep() override {}
+  ~SkipListRep() override = default;
 
   // Iteration over the contents of a skip list
   class Iterator : public MemTableRep::Iterator {
@@ -174,22 +198,31 @@ class SkipListRep : public MemTableRep {
         const InlineSkipList<const MemTableRep::KeyComparator&>* list)
         : iter_(list) {}
 
-    ~Iterator() override {}
+    ~Iterator() override = default;
 
     // Returns true iff the iterator is positioned at a valid node.
     bool Valid() const override { return iter_.Valid(); }
 
     // Returns the key at the current position.
     // REQUIRES: Valid()
-    const char* key() const override { return iter_.key(); }
+    const char* key() const override {
+      assert(Valid());
+      return iter_.key();
+    }
 
     // Advances to the next position.
     // REQUIRES: Valid()
-    void Next() override { iter_.Next(); }
+    void Next() override {
+      assert(Valid());
+      iter_.Next();
+    }
 
     // Advances to the previous position.
     // REQUIRES: Valid()
-    void Prev() override { iter_.Prev(); }
+    void Prev() override {
+      assert(Valid());
+      iter_.Prev();
+    }
 
     // Advance to the first entry with a key >= target
     void Seek(const Slice& user_key, const char* memtable_key) override {
@@ -219,6 +252,32 @@ class SkipListRep : public MemTableRep {
     // Final state of iterator is Valid() iff list is not empty.
     void SeekToLast() override { iter_.SeekToLast(); }
 
+    Status NextAndValidate(bool allow_data_in_errors) override {
+      assert(Valid());
+      return iter_.NextAndValidate(allow_data_in_errors);
+    }
+
+    Status SeekAndValidate(const Slice& user_key, const char* memtable_key,
+                           bool allow_data_in_errors,
+                           bool detect_key_out_of_order,
+                           const std::function<Status(const char*, bool)>&
+                               key_validation_callback) override {
+      if (memtable_key != nullptr) {
+        return iter_.SeekAndValidate(memtable_key, allow_data_in_errors,
+                                     detect_key_out_of_order,
+                                     key_validation_callback);
+      } else {
+        return iter_.SeekAndValidate(
+            EncodeKey(&tmp_, user_key), allow_data_in_errors,
+            detect_key_out_of_order, key_validation_callback);
+      }
+    }
+
+    Status PrevAndValidate(bool allow_data_in_error) override {
+      assert(Valid());
+      return iter_.PrevAndValidate(allow_data_in_error);
+    }
+
    protected:
     std::string tmp_;  // For passing to EncodeKey
   };
@@ -232,7 +291,7 @@ class SkipListRep : public MemTableRep {
     explicit LookaheadIterator(const SkipListRep& rep)
         : rep_(rep), iter_(&rep_.skip_list_), prev_(iter_) {}
 
-    ~LookaheadIterator() override {}
+    ~LookaheadIterator() override = default;
 
     bool Valid() const override { return iter_.Valid(); }
 
@@ -327,13 +386,11 @@ class SkipListRep : public MemTableRep {
     if (lookahead_ > 0) {
       void* mem =
           arena ? arena->AllocateAligned(sizeof(SkipListRep::LookaheadIterator))
-                :
-                operator new(sizeof(SkipListRep::LookaheadIterator));
+                : operator new(sizeof(SkipListRep::LookaheadIterator));
       return new (mem) SkipListRep::LookaheadIterator(*this);
     } else {
       void* mem = arena ? arena->AllocateAligned(sizeof(SkipListRep::Iterator))
-                        :
-                        operator new(sizeof(SkipListRep::Iterator));
+                        : operator new(sizeof(SkipListRep::Iterator));
       return new (mem) SkipListRep::Iterator(&skip_list_);
     }
   }
@@ -341,11 +398,9 @@ class SkipListRep : public MemTableRep {
 }  // namespace
 
 static std::unordered_map<std::string, OptionTypeInfo> skiplist_factory_info = {
-#ifndef ROCKSDB_LITE
     {"lookahead",
      {0, OptionType::kSizeT, OptionVerificationType::kNormal,
       OptionTypeFlags::kDontSerialize /*Since it is part of the ID*/}},
-#endif
 };
 
 SkipListFactory::SkipListFactory(size_t lookahead) : lookahead_(lookahead) {

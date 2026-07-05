@@ -3,7 +3,7 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-#if !defined(GFLAGS) || defined(ROCKSDB_LITE)
+#if !defined(GFLAGS)
 #include <cstdio>
 int main() {
   fprintf(stderr, "Please install gflags to run rocksdb tools\n");
@@ -14,6 +14,7 @@ int main() {
 int main() { return 0; }
 #else
 #include <semaphore.h>
+
 #include <atomic>
 #include <bitset>
 #include <chrono>
@@ -281,8 +282,9 @@ struct StatsThread {
       }
       auto now = std::chrono::steady_clock::now();
       double elapsed =
-          std::chrono::duration_cast<std::chrono::duration<double> >(
-              now - tlast).count();
+          std::chrono::duration_cast<std::chrono::duration<double> >(now -
+                                                                     tlast)
+              .count();
       uint64_t w = ::stats.written.load();
       uint64_t r = ::stats.read.load();
       fprintf(stderr,
@@ -342,19 +344,18 @@ int main(int argc, char** argv) {
 
   status = ROCKSDB_NAMESPACE::DestroyDB(path, options);
   assert(status.ok());
-  ROCKSDB_NAMESPACE::DB* db_raw;
-  status = ROCKSDB_NAMESPACE::DB::Open(options, path, &db_raw);
+  std::unique_ptr<ROCKSDB_NAMESPACE::DB> db;
+  status = ROCKSDB_NAMESPACE::DB::Open(options, path, &db);
   assert(status.ok());
-  std::unique_ptr<ROCKSDB_NAMESPACE::DB> db(db_raw);
 
   std::vector<ShardState> shard_states(FLAGS_shards + 1);
   std::deque<Reader> readers;
   while (static_cast<int>(readers.size()) < FLAGS_readers) {
-    readers.emplace_back(&shard_states, db_raw);
+    readers.emplace_back(&shard_states, db.get());
   }
   std::deque<Writer> writers;
   while (static_cast<int>(writers.size()) < FLAGS_writers) {
-    writers.emplace_back(&shard_states, db_raw);
+    writers.emplace_back(&shard_states, db.get());
   }
 
   // Each shard gets a random reader and random writer assigned to it
@@ -365,7 +366,7 @@ int main(int argc, char** argv) {
     shard_states[i].writer = &writers[writer_dist(rng)];
   }
 
-  StatsThread stats_thread(db_raw);
+  StatsThread stats_thread(db.get());
   for (Writer& w : writers) {
     w.start();
   }
@@ -373,4 +374,4 @@ int main(int argc, char** argv) {
   writers.clear();
   readers.clear();
 }
-#endif  // !defined(GFLAGS) || defined(ROCKSDB_LITE)
+#endif  // !defined(GFLAGS)

@@ -10,15 +10,19 @@
 #pragma once
 
 #include <array>
+#include <cassert>
 #include <cstdint>
+#include <functional>
+#include <optional>
 #include <string>
 
 #include "file/file_prefetch_buffer.h"
 #include "file/random_access_file_reader.h"
-#include "memory/memory_allocator.h"
+#include "memory/memory_allocator_impl.h"
 #include "options/cf_options.h"
 #include "port/malloc.h"
 #include "port/port.h"  // noexcept
+#include "rocksdb/cleanable.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
 #include "rocksdb/table.h"
@@ -29,10 +33,20 @@ namespace ROCKSDB_NAMESPACE {
 class RandomAccessFile;
 struct ReadOptions;
 
+using ReadScopedBlockBufferProviderRef =
+    std::optional<std::reference_wrapper<ReadScopedBlockBufferProvider>>;
+
 bool ShouldReportDetailedTime(Env* env, Statistics* stats);
 
 // the length of the magic number in bytes.
 constexpr uint32_t kMagicNumberLengthByte = 8;
+
+extern const uint64_t kBlockBasedTableMagicNumber;
+
+extern const uint64_t kLegacyPlainTableMagicNumber;
+extern const uint64_t kPlainTableMagicNumber;
+
+extern const uint64_t kCuckooTableMagicNumber;
 
 // BlockHandle is a pointer to the extent of a file that stores a data
 // block or a meta block.
@@ -47,7 +61,7 @@ class BlockHandle {
   uint64_t offset() const { return offset_; }
   void set_offset(uint64_t _offset) { offset_ = _offset; }
 
-  // The size of the stored block
+  // The size of the stored block, this size does not include the block trailer.
   uint64_t size() const { return size_; }
   void set_size(uint64_t _size) { size_ = _size; }
 
@@ -82,6 +96,16 @@ class BlockHandle {
   static const BlockHandle kNullBlockHandle;
 };
 
+struct EncodedBlockHandle {
+  explicit EncodedBlockHandle(const BlockHandle& h) {
+    auto end = h.EncodeTo(buffer.data());
+    size = end - buffer.data();
+  }
+  Slice AsSlice() const { return Slice(buffer.data(), size); }
+  std::array<char, BlockHandle::kMaxEncodedLength> buffer;
+  size_t size;
+};
+
 // Value in block-based table file index.
 //
 // The index entry for block n is: y -> h, [x],
@@ -111,34 +135,126 @@ struct IndexValue {
   std::string ToString(bool hex, bool have_first_key) const;
 };
 
-inline uint32_t GetCompressFormatForVersion(uint32_t format_version) {
-  // As of format_version 2, we encode compressed block with
-  // compress_format_version == 2. Before that, the version is 1.
-  // DO NOT CHANGE THIS FUNCTION, it affects disk format
-  return format_version >= 2 ? 2 : 1;
+// Given a file's base_context_checksum and an offset of a block within that
+// file, choose a 32-bit value that is as unique as possible. This value will
+// be added to the standard checksum to get a checksum "with context," or can
+// be subtracted to "remove" context. Returns zero (no modifier) if feature is
+// disabled with base_context_checksum == 0.
+inline uint32_t ChecksumModifierForContext(uint32_t base_context_checksum,
+                                           uint64_t offset) {
+  // To disable on base_context_checksum == 0, we could write
+  // `if (base_context_checksum == 0) return 0;` but benchmarking shows
+  // measurable performance penalty vs. this: compute the modifier
+  // unconditionally and use an "all or nothing" bit mask to enable
+  // or disable.
+  uint32_t all_or_nothing = uint32_t{0} - (base_context_checksum != 0);
+
+  // Desired properties:
+  // (call this function f(b, o) where b = base and o = offset)
+  // 1. Fast
+  // 2. f(b1, o) == f(b2, o) iff b1 == b2
+  //    (Perfectly preserve base entropy)
+  // 3. f(b, o1) == f(b, o2) only if o1 == o2 or |o1-o2| >= 4 billion
+  //    (Guaranteed uniqueness for nearby offsets)
+  // 3. f(b, o + j * 2**32) == f(b, o + k * 2**32) only if j == k
+  //    (Upper bits matter, and *aligned* misplacement fails check)
+  // 4. f(b1, o) == f(b2, o + x) then preferably not
+  //    f(b1, o + y) == f(b2, o + x + y)
+  //    (Avoid linearly correlated matches)
+  // 5. f(b, o) == 0 depends on both b and o
+  //    (No predictable overlap with non-context checksums)
+  uint32_t modifier =
+      base_context_checksum ^ (Lower32of64(offset) + Upper32of64(offset));
+
+  return modifier & all_or_nothing;
 }
 
-constexpr uint32_t kLatestFormatVersion = 5;
+constexpr uint32_t kLatestBbtFormatVersion = 7;
 
-inline bool IsSupportedFormatVersion(uint32_t version) {
-  return version <= kLatestFormatVersion;
+// Minimum format version supported for reading SST files in block-based format.
+//
+// When phasing out old format versions, first increase the write minimum,
+// then later (>= 6 mo) increase the read minimum when removing the
+// implementation for both read and write.
+constexpr uint32_t kMinSupportedBbtFormatVersionForRead = 2;
+
+// Minimum format version supported for writing new SST files in block-based
+// format. This should be >= kMinSupportedFormatVersionForRead.
+//
+// When phasing out old format versions, first increase the write minimum,
+// then later (>= 6 mo) increase the read minimum when removing the
+// implementation for both read and write.
+constexpr uint32_t kMinSupportedBbtFormatVersionForWrite = 2;
+static_assert(kMinSupportedBbtFormatVersionForWrite >=
+              kMinSupportedBbtFormatVersionForRead);
+
+inline bool IsSupportedFormatVersionForRead(uint64_t magic, uint32_t version) {
+  if (magic == kBlockBasedTableMagicNumber) {
+    return version >= kMinSupportedBbtFormatVersionForRead &&
+           version <= kLatestBbtFormatVersion;
+  } else if (magic == kPlainTableMagicNumber) {
+    return version == 0;
+  } else if (magic == kCuckooTableMagicNumber) {
+    return version == 1;
+  } else {
+    return false;
+  }
+}
+
+inline bool IsSupportedFormatVersionForWrite(uint64_t magic, uint32_t version) {
+  if (magic == kBlockBasedTableMagicNumber) {
+    return version >= kMinSupportedBbtFormatVersionForWrite &&
+           version <= kLatestBbtFormatVersion;
+  } else if (magic == kPlainTableMagicNumber) {
+    return version == 0;
+  } else if (magic == kCuckooTableMagicNumber) {
+    return version == 1;
+  } else {
+    return false;
+  }
+}
+
+// Same as having a unique id in footer.
+inline bool FormatVersionUsesContextChecksum(uint32_t version) {
+  return version >= 6;
+}
+
+inline bool FormatVersionUsesIndexHandleInFooter(uint32_t version) {
+  return version < 6;
+}
+
+inline bool FormatVersionUsesCompressionManagerName(uint32_t version) {
+  return version >= 7;
 }
 
 // Footer encapsulates the fixed information stored at the tail end of every
 // SST file. In general, it should only include things that cannot go
 // elsewhere under the metaindex block. For example, checksum_type is
 // required for verifying metaindex block checksum (when applicable), but
-// index block handle can easily go in metaindex block (possible future).
-// See also FooterBuilder below.
+// index block handle can easily go in metaindex block. See also FooterBuilder
+// below.
 class Footer {
  public:
   // Create empty. Populate using DecodeFrom.
   Footer() {}
 
+  void Reset() {
+    table_magic_number_ = kNullTableMagicNumber;
+    format_version_ = kInvalidFormatVersion;
+    base_context_checksum_ = 0;
+    metaindex_handle_ = BlockHandle::NullBlockHandle();
+    index_handle_ = BlockHandle::NullBlockHandle();
+    checksum_type_ = kInvalidChecksumType;
+    block_trailer_size_ = 0;
+  }
+
   // Deserialize a footer (populate fields) from `input` and check for various
   // corruptions. `input_offset` is the offset within the target file of
-  // `input` buffer (future use).
-  Status DecodeFrom(Slice input, uint64_t input_offset);
+  // `input` buffer, which is needed for verifying format_version >= 6 footer.
+  // If enforce_table_magic_number != 0, will return corruption if table magic
+  // number is not equal to enforce_table_magic_number.
+  Status DecodeFrom(Slice input, uint64_t input_offset,
+                    uint64_t enforce_table_magic_number = 0);
 
   // Table magic number identifies file as RocksDB SST file and which kind of
   // SST format is use.
@@ -149,13 +265,17 @@ class Footer {
   // BBTO::format_version.)
   uint32_t format_version() const { return format_version_; }
 
+  // See ChecksumModifierForContext()
+  uint32_t base_context_checksum() const { return base_context_checksum_; }
+
   // Block handle for metaindex block.
   const BlockHandle& metaindex_handle() const { return metaindex_handle_; }
 
   // Block handle for (top-level) index block.
+  // TODO? remove from this struct and only read on decode for legacy cases
   const BlockHandle& index_handle() const { return index_handle_; }
 
-  // Checksum type used in the file.
+  // Checksum type used in the file, including footer for format version >= 6.
   ChecksumType checksum_type() const {
     return static_cast<ChecksumType>(checksum_type_);
   }
@@ -195,6 +315,7 @@ class Footer {
 
   uint64_t table_magic_number_ = kNullTableMagicNumber;
   uint32_t format_version_ = kInvalidFormatVersion;
+  uint32_t base_context_checksum_ = 0;
   BlockHandle metaindex_handle_;
   BlockHandle index_handle_;
   int checksum_type_ = kInvalidChecksumType;
@@ -216,11 +337,16 @@ class FooterBuilder {
   // * footer_offset is the file offset where the footer will be written
   // (for future use).
   // * checksum_type is for formats using block checksums.
-  // * index_handle is optional for some kinds of SST files.
-  void Build(uint64_t table_magic_number, uint32_t format_version,
-             uint64_t footer_offset, ChecksumType checksum_type,
-             const BlockHandle& metaindex_handle,
-             const BlockHandle& index_handle = BlockHandle::NullBlockHandle());
+  // * index_handle is optional for some SST kinds and (for caller convenience)
+  // ignored when format_version >= 6. (Must be added to metaindex in that
+  // case.)
+  // * unique_id must be specified if format_vesion >= 6 and SST uses block
+  // checksums with context. Otherwise, auto-generated if format_vesion >= 6.
+  Status Build(uint64_t table_magic_number, uint32_t format_version,
+               uint64_t footer_offset, ChecksumType checksum_type,
+               const BlockHandle& metaindex_handle,
+               const BlockHandle& index_handle = BlockHandle::NullBlockHandle(),
+               uint32_t base_context_checksum = 0);
 
   // After Builder, get a Slice for the serialized Footer, backed by this
   // FooterBuilder.
@@ -234,13 +360,18 @@ class FooterBuilder {
   std::array<char, Footer::kMaxEncodedLength> data_;
 };
 
+// Set to true to allow unit testing of writing unsupported block-based table
+// format versions (to test read side)
+bool& TEST_AllowUnsupportedFormatVersion();
+
 // Read the footer from file
 // If enforce_table_magic_number != 0, ReadFooterFromFile() will return
 // corruption if table_magic number is not equal to enforce_table_magic_number
 Status ReadFooterFromFile(const IOOptions& opts, RandomAccessFileReader* file,
-                          FilePrefetchBuffer* prefetch_buffer,
+                          FileSystem& fs, FilePrefetchBuffer* prefetch_buffer,
                           uint64_t file_size, Footer* footer,
-                          uint64_t enforce_table_magic_number = 0);
+                          uint64_t enforce_table_magic_number = 0,
+                          Statistics* stats = nullptr);
 
 // Computes a checksum using the given ChecksumType. Sometimes we need to
 // include one more input byte logically at the end but not part of the main
@@ -273,19 +404,28 @@ uint32_t ComputeBuiltinChecksumWithLastByte(ChecksumType type, const char* data,
 // decompression function.
 // * "Parsed block" - an in-memory form of a block in block cache, as it is
 // used by the table reader. Different C++ types are used depending on the
-// block type (see block_like_traits.h). Only trivially parsable block types
+// block type (see block_cache.h). Only trivially parsable block types
 // use BlockContents as the parsed form.
 //
 struct BlockContents {
   // Points to block payload (without trailer)
   Slice data;
   CacheAllocationPtr allocation;
+  // Optional shared lifetime token for block bytes not owned through
+  // `allocation`, such as bytes backed by a read-scoped provider.
+  SharedCleanablePtr cleanup;
+  // Usable byte size of the provider/external backing allocation.
+  size_t backing_size = 0;
 
 #ifndef NDEBUG
   // Whether there is a known trailer after what is pointed to by `data`.
   // See BlockBasedTable::GetCompressionType.
   bool has_trailer = false;
 #endif  // NDEBUG
+
+  void AssertSingleOwner() const {
+    assert(allocation.get() == nullptr || cleanup.get() == nullptr);
+  }
 
   BlockContents() {}
 
@@ -303,10 +443,15 @@ struct BlockContents {
   }
 
   // Returns whether the object has ownership of the underlying data bytes.
-  bool own_bytes() const { return allocation.get() != nullptr; }
+  bool own_bytes() const {
+    AssertSingleOwner();
+    return allocation.get() != nullptr || cleanup.get() != nullptr;
+  }
 
   // The additional memory space taken by the block data.
   size_t usable_size() const {
+    AssertSingleOwner();
+    // FIXME: doesn't account for possible block trailer
     if (allocation.get() != nullptr) {
       auto allocator = allocation.get_deleter().allocator;
       if (allocator) {
@@ -317,12 +462,15 @@ struct BlockContents {
 #else
       return data.size();
 #endif  // ROCKSDB_MALLOC_USABLE_SIZE
+    } else if (cleanup.get() != nullptr) {
+      return backing_size;
     } else {
       return 0;  // no extra memory is occupied by the data
     }
   }
 
   size_t ApproximateMemoryUsage() const {
+    AssertSingleOwner();
     return usable_size() + sizeof(*this);
   }
 
@@ -331,9 +479,12 @@ struct BlockContents {
   BlockContents& operator=(BlockContents&& other) {
     data = std::move(other.data);
     allocation = std::move(other.allocation);
+    cleanup = std::move(other.cleanup);
+    backing_size = other.backing_size;
 #ifndef NDEBUG
     has_trailer = other.has_trailer;
 #endif  // NDEBUG
+    AssertSingleOwner();
     return *this;
   }
 };
@@ -341,21 +492,29 @@ struct BlockContents {
 // The `data` points to serialized block contents read in from file, which
 // must be compressed and include a trailer beyond `size`. A new buffer is
 // allocated with the given allocator (or default) and the uncompressed
-// contents are returned in `out_contents`.
-// format_version is as defined in include/rocksdb/table.h, which is
-// used to determine compression format version.
-Status UncompressSerializedBlock(const UncompressionInfo& info,
-                                 const char* data, size_t size,
-                                 BlockContents* out_contents,
-                                 uint32_t format_version,
-                                 const ImmutableOptions& ioptions,
-                                 MemoryAllocator* allocator = nullptr);
+// contents are returned in `out_contents`. Statistics updated.
+Status DecompressSerializedBlock(
+    const char* data, size_t size, CompressionType type,
+    Decompressor& decompressor, BlockContents* out_contents,
+    const ImmutableOptions& ioptions, MemoryAllocator* allocator = nullptr,
+    ReadScopedBlockBufferProviderRef block_buffer_provider = std::nullopt);
 
-// This is a variant of UncompressSerializedBlock that does not expect a
-// block trailer beyond `size`. (CompressionType is taken from `info`.)
-Status UncompressBlockData(const UncompressionInfo& info, const char* data,
-                           size_t size, BlockContents* out_contents,
-                           uint32_t format_version,
+Status DecompressSerializedBlock(
+    Decompressor::Args& args, Decompressor& decompressor,
+    BlockContents* out_contents, const ImmutableOptions& ioptions,
+    MemoryAllocator* allocator = nullptr,
+    ReadScopedBlockBufferProviderRef block_buffer_provider = std::nullopt);
+
+// This is a variant of DecompressSerializedBlock that does not expect a
+// block trailer beyond `size`. (CompressionType is passed in.)
+Status DecompressBlockData(
+    const char* data, size_t size, CompressionType type,
+    Decompressor& decompressor, BlockContents* out_contents,
+    const ImmutableOptions& ioptions, MemoryAllocator* allocator = nullptr,
+    Decompressor::ManagedWorkingArea* working_area = nullptr);
+
+Status DecompressBlockData(Decompressor::Args& args, Decompressor& decompressor,
+                           BlockContents* out_contents,
                            const ImmutableOptions& ioptions,
                            MemoryAllocator* allocator = nullptr);
 

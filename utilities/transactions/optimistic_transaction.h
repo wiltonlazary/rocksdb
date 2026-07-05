@@ -5,8 +5,6 @@
 
 #pragma once
 
-#ifndef ROCKSDB_LITE
-
 #include <stack>
 #include <string>
 #include <unordered_map>
@@ -97,5 +95,3 @@ class OptimisticTransactionCallback : public WriteCallback {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-
-#endif  // ROCKSDB_LITE

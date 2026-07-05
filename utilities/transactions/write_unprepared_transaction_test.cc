@@ -3,8 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-#ifndef ROCKSDB_LITE
-
 #include "utilities/transactions/transaction_test.h"
 #include "utilities/transactions/write_unprepared_txn.h"
 #include "utilities/transactions/write_unprepared_txn_db.h"
@@ -15,47 +13,60 @@ class WriteUnpreparedTransactionTestBase : public TransactionTestBase {
  public:
   WriteUnpreparedTransactionTestBase(bool use_stackable_db,
                                      bool two_write_queue,
-                                     TxnDBWritePolicy write_policy)
+                                     TxnDBWritePolicy write_policy,
+                                     bool use_per_key_point_lock_mgr,
+                                     int64_t deadlock_timeout_us)
       : TransactionTestBase(use_stackable_db, two_write_queue, write_policy,
-                            kOrderedWrite) {}
+                            kOrderedWrite, use_per_key_point_lock_mgr,
+                            deadlock_timeout_us) {}
 };
 
 class WriteUnpreparedTransactionTest
     : public WriteUnpreparedTransactionTestBase,
       virtual public ::testing::WithParamInterface<
-          std::tuple<bool, bool, TxnDBWritePolicy>> {
+          std::tuple<bool, bool, TxnDBWritePolicy, bool, int64_t>> {
  public:
   WriteUnpreparedTransactionTest()
-      : WriteUnpreparedTransactionTestBase(std::get<0>(GetParam()),
-                                           std::get<1>(GetParam()),
-                                           std::get<2>(GetParam())) {}
+      : WriteUnpreparedTransactionTestBase(
+            std::get<0>(GetParam()), std::get<1>(GetParam()),
+            std::get<2>(GetParam()), std::get<3>(GetParam()),
+            std::get<4>(GetParam())) {}
 };
 
 INSTANTIATE_TEST_CASE_P(
     WriteUnpreparedTransactionTest, WriteUnpreparedTransactionTest,
-    ::testing::Values(std::make_tuple(false, false, WRITE_UNPREPARED),
-                      std::make_tuple(false, true, WRITE_UNPREPARED)));
+    ::testing::Combine(::testing::Values(false), ::testing::Bool(),
+                       ::testing::Values(WRITE_UNPREPARED), ::testing::Bool(),
+                       ::testing::Values(0, 1000)));
 
-enum StressAction { NO_SNAPSHOT, RO_SNAPSHOT, REFRESH_SNAPSHOT };
-class WriteUnpreparedStressTest : public WriteUnpreparedTransactionTestBase,
-                                  virtual public ::testing::WithParamInterface<
-                                      std::tuple<bool, StressAction>> {
+enum SnapshotAction { NO_SNAPSHOT, RO_SNAPSHOT, REFRESH_SNAPSHOT };
+enum VerificationOperation { VERIFY_GET, VERIFY_NEXT, VERIFY_PREV };
+class WriteUnpreparedSnapshotTest
+    : public WriteUnpreparedTransactionTestBase,
+      virtual public ::testing::WithParamInterface<std::tuple<
+          bool, SnapshotAction, VerificationOperation, bool, int64_t>> {
  public:
-  WriteUnpreparedStressTest()
-      : WriteUnpreparedTransactionTestBase(false, std::get<0>(GetParam()),
-                                           WRITE_UNPREPARED),
-        action_(std::get<1>(GetParam())) {}
-  StressAction action_;
+  WriteUnpreparedSnapshotTest()
+      : WriteUnpreparedTransactionTestBase(
+            false, std::get<0>(GetParam()), WRITE_UNPREPARED,
+            std::get<3>(GetParam()), std::get<4>(GetParam())),
+        action_(std::get<1>(GetParam())),
+        verify_op_(std::get<2>(GetParam())) {}
+  SnapshotAction action_;
+  VerificationOperation verify_op_;
 };
 
+// Test parameters:
+// Param 0): use stackable db, parameterization hard coded to be overwritten to
+// false. Param 1): test mode for snapshot action Param 2): test mode for
+// verification operation
 INSTANTIATE_TEST_CASE_P(
-    WriteUnpreparedStressTest, WriteUnpreparedStressTest,
-    ::testing::Values(std::make_tuple(false, NO_SNAPSHOT),
-                      std::make_tuple(false, RO_SNAPSHOT),
-                      std::make_tuple(false, REFRESH_SNAPSHOT),
-                      std::make_tuple(true, NO_SNAPSHOT),
-                      std::make_tuple(true, RO_SNAPSHOT),
-                      std::make_tuple(true, REFRESH_SNAPSHOT)));
+    WriteUnpreparedSnapshotTest, WriteUnpreparedSnapshotTest,
+    ::testing::Combine(::testing::Bool(),
+                       ::testing::Values(NO_SNAPSHOT, RO_SNAPSHOT,
+                                         REFRESH_SNAPSHOT),
+                       ::testing::Values(VERIFY_GET, VERIFY_NEXT, VERIFY_PREV),
+                       ::testing::Bool(), ::testing::Values(0, 1000)));
 
 TEST_P(WriteUnpreparedTransactionTest, ReadYourOwnWrite) {
   // The following tests checks whether reading your own write for
@@ -136,42 +147,33 @@ TEST_P(WriteUnpreparedTransactionTest, ReadYourOwnWrite) {
   }
 }
 
-#if !defined(ROCKSDB_VALGRIND_RUN) || defined(ROCKSDB_FULL_VALGRIND_RUN)
-TEST_P(WriteUnpreparedStressTest, ReadYourOwnWriteStress) {
-  // This is a stress test where different threads are writing random keys, and
-  // then before committing or aborting the transaction, it validates to see
-  // that it can read the keys it wrote, and the keys it did not write respect
-  // the snapshot. To avoid row lock contention (and simply stressing the
-  // locking system), each thread is mostly only writing to its own set of keys.
+TEST_P(WriteUnpreparedSnapshotTest, ReadYourOwnWrite) {
+  // This test validates a transaction can read its writes and the correctness
+  // of its read with regard to a mocked snapshot functionality.
   const uint32_t kNumIter = 1000;
-  const uint32_t kNumThreads = 10;
   const uint32_t kNumKeys = 5;
 
   // Test with
   // 1. no snapshots set
   // 2. snapshot set on ReadOptions
   // 3. snapshot set, and refreshing after every write.
-  StressAction a = action_;
+  SnapshotAction snapshot_action = action_;
   WriteOptions write_options;
   txn_db_options.transaction_lock_timeout = -1;
   options.disable_auto_compactions = true;
   ASSERT_OK(ReOpen());
 
   std::vector<std::string> keys;
-  for (uint32_t k = 0; k < kNumKeys * kNumThreads; k++) {
+  for (uint32_t k = 0; k < kNumKeys; k++) {
     keys.push_back("k" + std::to_string(k));
   }
-  RandomShuffle(keys.begin(), keys.end());
 
   // This counter will act as a "sequence number" to help us validate
   // visibility logic with snapshots. If we had direct access to the seqno of
   // snapshots and key/values, then we should directly compare those instead.
   std::atomic<int64_t> counter(0);
 
-  std::function<void(uint32_t)> stress_thread = [&](int id) {
-    size_t tid = std::hash<std::thread::id>()(std::this_thread::get_id());
-    Random64 rnd(static_cast<uint32_t>(tid));
-
+  std::function<void()> check_correctness_wrt_snapshot = [&]() {
     Transaction* txn;
     TransactionOptions txn_options;
     // batch_size of 1 causes writes to DB for every marker.
@@ -179,114 +181,82 @@ TEST_P(WriteUnpreparedStressTest, ReadYourOwnWriteStress) {
     ReadOptions read_options;
 
     for (uint32_t i = 0; i < kNumIter; i++) {
-      std::set<std::string> owned_keys(keys.begin() + id * kNumKeys,
-                                       keys.begin() + (id + 1) * kNumKeys);
-      // Add unowned keys to make the workload more interesting, but this
-      // increases row lock contention, so just do it sometimes.
-      if (rnd.OneIn(2)) {
-        owned_keys.insert(keys[rnd.Uniform(kNumKeys * kNumThreads)]);
-      }
-
       txn = db->BeginTransaction(write_options, txn_options);
-      ASSERT_OK(txn->SetName(std::to_string(id)));
       txn->SetSnapshot();
-      if (a >= RO_SNAPSHOT) {
+      if (snapshot_action >= RO_SNAPSHOT) {
         read_options.snapshot = txn->GetSnapshot();
         ASSERT_TRUE(read_options.snapshot != nullptr);
       }
 
-      uint64_t buf[2];
-      buf[0] = id;
+      uint64_t buf[1];
 
       // When scanning through the database, make sure that all unprepared
-      // keys have value >= snapshot and all other keys have value < snapshot.
+      // keys have value >= snapshot.
       int64_t snapshot_num = counter.fetch_add(1);
 
       Status s;
-      for (const auto& key : owned_keys) {
-        buf[1] = counter.fetch_add(1);
+      for (const auto& key : keys) {
+        buf[0] = counter.fetch_add(1);
         s = txn->Put(key, Slice((const char*)buf, sizeof(buf)));
         if (!s.ok()) {
           break;
         }
-        if (a == REFRESH_SNAPSHOT) {
+        if (snapshot_action == REFRESH_SNAPSHOT) {
           txn->SetSnapshot();
           read_options.snapshot = txn->GetSnapshot();
           snapshot_num = counter.fetch_add(1);
         }
       }
 
-      // Failure is possible due to snapshot validation. In this case,
-      // rollback and move onto next iteration.
-      if (!s.ok()) {
-        ASSERT_TRUE(s.IsBusy());
-        ASSERT_OK(txn->Rollback());
-        delete txn;
-        continue;
-      }
+      ASSERT_OK(s);
 
-      auto verify_key = [&owned_keys, &a, &id, &snapshot_num](
-                            const std::string& key, const std::string& value) {
-        if (owned_keys.count(key) > 0) {
-          ASSERT_EQ(value.size(), 16);
+      auto verify_key = [&snapshot_action,
+                         &snapshot_num](const std::string& value) {
+        ASSERT_EQ(value.size(), 8);
 
-          // Since this key is part of owned_keys, then this key must be
-          // unprepared by this transaction identified by 'id'
-          ASSERT_EQ(((int64_t*)value.c_str())[0], id);
-          if (a == REFRESH_SNAPSHOT) {
-            // If refresh snapshot is true, then the snapshot is refreshed
-            // after every Put(), meaning that the current snapshot in
-            // snapshot_num must be greater than the "seqno" of any keys
-            // written by the current transaction.
-            ASSERT_LT(((int64_t*)value.c_str())[1], snapshot_num);
-          } else {
-            // If refresh snapshot is not on, then the snapshot was taken at
-            // the beginning of the transaction, meaning all writes must come
-            // after snapshot_num
-            ASSERT_GT(((int64_t*)value.c_str())[1], snapshot_num);
-          }
-        } else if (a >= RO_SNAPSHOT) {
-          // If this is not an unprepared key, just assert that the key
-          // "seqno" is smaller than the snapshot seqno.
-          ASSERT_EQ(value.size(), 16);
-          ASSERT_LT(((int64_t*)value.c_str())[1], snapshot_num);
+        if (snapshot_action == REFRESH_SNAPSHOT) {
+          // If refresh snapshot is true, then the snapshot is refreshed
+          // after every Put(), meaning that the current snapshot in
+          // snapshot_num must be greater than the "seqno" of any keys
+          // written by the current transaction.
+          ASSERT_LT(((int64_t*)value.c_str())[0], snapshot_num);
+        } else {
+          // If refresh snapshot is not on, then the snapshot was taken at
+          // the beginning of the transaction, meaning all writes must come
+          // after snapshot_num
+          ASSERT_GT(((int64_t*)value.c_str())[0], snapshot_num);
         }
       };
 
-      // Validate Get()/Next()/Prev(). Do only one of them to save time, and
-      // reduce lock contention.
-      switch (rnd.Uniform(3)) {
-        case 0:  // Validate Get()
+      // Validate one of Get()/Next()/Prev() depending on the verification
+      // operation to use.
+      switch (verify_op_) {
+        case VERIFY_GET:  // Validate Get()
         {
           for (const auto& key : keys) {
             std::string value;
-            s = txn->Get(read_options, Slice(key), &value);
-            if (!s.ok()) {
-              ASSERT_TRUE(s.IsNotFound());
-              ASSERT_EQ(owned_keys.count(key), 0);
-            } else {
-              verify_key(key, value);
-            }
+            ASSERT_OK(txn->Get(read_options, Slice(key), &value));
+            verify_key(value);
           }
           break;
         }
-        case 1:  // Validate Next()
+        case VERIFY_NEXT:  // Validate Next()
         {
           Iterator* iter = txn->GetIterator(read_options);
           ASSERT_OK(iter->status());
           for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
-            verify_key(iter->key().ToString(), iter->value().ToString());
+            verify_key(iter->value().ToString());
           }
           ASSERT_OK(iter->status());
           delete iter;
           break;
         }
-        case 2:  // Validate Prev()
+        case VERIFY_PREV:  // Validate Prev()
         {
           Iterator* iter = txn->GetIterator(read_options);
           ASSERT_OK(iter->status());
           for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
-            verify_key(iter->key().ToString(), iter->value().ToString());
+            verify_key(iter->value().ToString());
           }
           ASSERT_OK(iter->status());
           delete iter;
@@ -296,25 +266,13 @@ TEST_P(WriteUnpreparedStressTest, ReadYourOwnWriteStress) {
           FAIL();
       }
 
-      if (rnd.OneIn(2)) {
-        ASSERT_OK(txn->Commit());
-      } else {
-        ASSERT_OK(txn->Rollback());
-      }
+      ASSERT_OK(txn->Commit());
       delete txn;
     }
   };
 
-  std::vector<port::Thread> threads;
-  for (uint32_t i = 0; i < kNumThreads; i++) {
-    threads.emplace_back(stress_thread, i);
-  }
-
-  for (auto& t : threads) {
-    t.join();
-  }
+  check_correctness_wrt_snapshot();
 }
-#endif  // !defined(ROCKSDB_VALGRIND_RUN) || defined(ROCKSDB_FULL_VALGRIND_RUN)
 
 // This tests how write unprepared behaves during recovery when the DB crashes
 // after a transaction has either been unprepared or prepared, and tests if
@@ -770,6 +728,295 @@ TEST_P(WriteUnpreparedTransactionTest, UntrackedKeys) {
   delete txn;
 }
 
+namespace {
+std::vector<std::string> VerifyIterator(Iterator* iter, bool forward) {
+  std::vector<std::string> keys;
+  if (forward) {
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      keys.push_back(iter->key().ToString());
+    }
+  } else {
+    for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+      keys.push_back(iter->key().ToString());
+    }
+    std::reverse(keys.begin(), keys.end());
+  }
+  return keys;
+}
+}  // namespace
+
+// Multiple unprepared batches write to the memtable with different seqno
+// ranges tracked in unprep_seqs. Committed tombstones (c-g) exist, and the
+// transaction's own Delete("h") extends the run with an uncommitted entry.
+// Write-unprepared iterators widen their visible seqno to include own
+// unprepared writes, so synthesizing a range tombstone for a run containing
+// one of those deletes would insert it at a seqno that can cover uncommitted
+// entries. Verify insertion is blocked and data remains correct after commit.
+TEST_P(WriteUnpreparedTransactionTest, RangeTombstoneMultipleBatchesAndCommit) {
+  // Test two scenarios:
+  // 1) Txn Delete extends the END of a committed tombstone run.
+  // 2) Txn Delete in the MIDDLE of a committed tombstone run.
+  // Both should block insertion because the visible seqno is widened by the
+  // transaction's own unprepared writes.
+  for (bool middle_tombstone : {false, true}) {
+    SCOPED_TRACE(middle_tombstone ? "middle tombstone" : "end tombstone");
+    for (bool forward : {true, false}) {
+      SCOPED_TRACE(forward ? "forward" : "reverse");
+      options.min_tombstones_for_range_conversion = 4;
+      options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
+      ASSERT_OK(ReOpenNoDelete());
+
+      for (char c = 'a'; c <= 'j'; c++) {
+        ASSERT_OK(db->Put(WriteOptions(), std::string(1, c), "val"));
+      }
+      ASSERT_OK(db->Flush(FlushOptions()));
+
+      if (middle_tombstone) {
+        // Committed deletions c, d, f, g (with gap at e).
+        for (char c : {'c', 'd', 'f', 'g'}) {
+          ASSERT_OK(db->Delete(WriteOptions(), std::string(1, c)));
+        }
+      } else {
+        // Committed point deletions c-g (5 contiguous, above threshold).
+        for (char c = 'c'; c <= 'g'; c++) {
+          ASSERT_OK(db->Delete(WriteOptions(), std::string(1, c)));
+        }
+      }
+
+      TransactionOptions txn_options;
+      // flush_threshold=1 forces each write to create a separate unprepared
+      // batch in the memtable, each with its own seqno range in unprep_seqs.
+      txn_options.write_batch_flush_threshold = 1;
+      std::unique_ptr<Transaction> txn(
+          db->BeginTransaction(WriteOptions(), txn_options));
+      ASSERT_NE(txn, nullptr);
+
+      // Multiple unprepared batches.
+      ASSERT_OK(txn->Put("b", "txn_b"));  // batch 1, bounds start of run
+      if (middle_tombstone) {
+        // Txn Delete("e") fills the gap in the middle of committed deletes
+        // c, d, [e], f, g -- making a contiguous run of 5 that contains an
+        // uncommitted seqno in the middle.
+        ASSERT_OK(txn->Delete("e"));
+      } else {
+        // Txn Delete("h") extends the committed run [c, g] at the end.
+        ASSERT_OK(txn->Delete("h"));
+      }
+      ASSERT_OK(txn->Put("i", "txn_i"));
+      ASSERT_OK(txn->Put("z", "txn_z"));
+
+      // The txn Delete (whether at "e" or "h") is an own unprepared write.
+      // The iterator exposes it by widening its visible seqno, so a synthesized
+      // tombstone for the whole run must be discarded.
+      {
+        ReadOptions ro;
+        std::unique_ptr<Iterator> iter(txn->GetIterator(ro));
+        if (middle_tombstone) {
+          // c-g all deleted (c,d committed, e txn, f,g committed)
+          ASSERT_EQ(VerifyIterator(iter.get(), forward),
+                    (std::vector<std::string>{"a", "b", "h", "i", "j", "z"}));
+        } else {
+          // c-h all deleted (c-g committed, h txn)
+          ASSERT_EQ(VerifyIterator(iter.get(), forward),
+                    (std::vector<std::string>{"a", "b", "i", "j", "z"}));
+        }
+        ASSERT_OK(iter->status());
+      }
+      ASSERT_EQ(options.statistics->getTickerCount(
+                    READ_PATH_RANGE_TOMBSTONES_INSERTED),
+                0u);
+
+      ASSERT_OK(txn->Commit());
+
+      // Verify data correctness after commit.
+      std::string value;
+      ASSERT_OK(db->Get(ReadOptions(), "b", &value));
+      ASSERT_EQ(value, "txn_b");
+      char last_del = middle_tombstone ? 'g' : 'h';
+      for (char c = 'c'; c <= last_del; c++) {
+        ASSERT_TRUE(
+            db->Get(ReadOptions(), std::string(1, c), &value).IsNotFound());
+      }
+    }
+  }
+}
+
+// WriteUnprepared computes max_visible_seq as max(max_unprepared_seqno,
+// snapshot_seq). With a snapshot taken before deletions and multiple unprepared
+// batches after, the iterator's visible range extends beyond the snapshot to
+// include both committed deletes and own writes. The committed deletes are
+// still visible to the iterator, but a synthesized range tombstone must be
+// discarded because it would be inserted at the widened visible seqno rather
+// than the original snapshot seqno.
+TEST_P(WriteUnpreparedTransactionTest,
+       RangeTombstoneCalcMaxVisibleSeqExtendedVisibility) {
+  for (bool forward : {true, false}) {
+    SCOPED_TRACE(forward ? "forward" : "reverse");
+    options.min_tombstones_for_range_conversion = 4;
+    options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
+    ASSERT_OK(ReOpenNoDelete());
+
+    std::vector<std::pair<std::string, std::string>> inserted_ranges;
+    SyncPoint::GetInstance()->SetCallBack(
+        "MemTable::AddLogicallyRedundantRangeTombstone:AddRange",
+        [&](void* arg) {
+          auto* range = static_cast<std::pair<Slice, Slice>*>(arg);
+          inserted_ranges.emplace_back(range->first.ToString(),
+                                       range->second.ToString());
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    for (char c = 'a'; c <= 'j'; c++) {
+      ASSERT_OK(db->Put(WriteOptions(), std::string(1, c), "val"));
+    }
+    ASSERT_OK(db->Flush(FlushOptions()));
+
+    // Take a snapshot before the deletions.
+    const Snapshot* snap = db->GetSnapshot();
+
+    // Committed point deletions c-g (after the snapshot).
+    for (char c = 'c'; c <= 'g'; c++) {
+      ASSERT_OK(db->Delete(WriteOptions(), std::string(1, c)));
+    }
+
+    TransactionOptions txn_options;
+    txn_options.write_batch_flush_threshold = 1;
+    std::unique_ptr<Transaction> txn(
+        db->BeginTransaction(WriteOptions(), txn_options));
+    ASSERT_NE(txn, nullptr);
+    txn->SetSnapshot();
+
+    // Multiple unprepared writes -- these get seqnos beyond the snapshot.
+    // CalcMaxVisibleSeq returns max(last_unprep_seqno, snapshot_seq), so
+    // the committed deletions (seqno between snap and unprep) are visible.
+    ASSERT_OK(txn->Put("x", "txn_x"));
+    ASSERT_OK(txn->Put("y", "txn_y"));
+
+    {
+      ReadOptions ro;
+      ro.snapshot = txn->GetSnapshot();
+      std::unique_ptr<Iterator> iter(txn->GetIterator(ro));
+      // c-g deleted, own writes x,y visible: a, b, h, i, j, x, y
+      ASSERT_EQ(VerifyIterator(iter.get(), forward),
+                (std::vector<std::string>{"a", "b", "h", "i", "j", "x", "y"}));
+      ASSERT_OK(iter->status());
+    }
+    // The committed tombstones are visible to the iterator, but insertion is
+    // discarded because the iterator's visible seqno was widened by its own
+    // unprepared writes.
+    ASSERT_EQ(
+        options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+        0u);
+    ASSERT_EQ(options.statistics->getTickerCount(
+                  READ_PATH_RANGE_TOMBSTONES_DISCARDED),
+              1u);
+    ASSERT_EQ(inserted_ranges.size(), 0);
+
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+    ASSERT_OK(txn->Commit());
+    db->ReleaseSnapshot(snap);
+  }
+}
+
+// The transaction issues its own uncommitted contiguous Deletes (j-n) forming
+// a tombstone run visible to its iterator, alongside committed tombstones
+// (c-g). Because the iterator's visible seqno is widened to include those own
+// writes, both candidate synthesized tombstones are discarded. After rollback,
+// own Deletes and Puts are undone while committed deletes remain.
+TEST_P(WriteUnpreparedTransactionTest, RangeTombstoneOwnDeletionsAndRollback) {
+  for (bool forward : {true, false}) {
+    SCOPED_TRACE(forward ? "forward" : "reverse");
+    options.min_tombstones_for_range_conversion = 4;
+    options.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
+    ASSERT_OK(ReOpenNoDelete());
+
+    std::vector<std::pair<std::string, std::string>> inserted_ranges;
+    SyncPoint::GetInstance()->SetCallBack(
+        "MemTable::AddLogicallyRedundantRangeTombstone:AddRange",
+        [&](void* arg) {
+          auto* range = static_cast<std::pair<Slice, Slice>*>(arg);
+          inserted_ranges.emplace_back(range->first.ToString(),
+                                       range->second.ToString());
+        });
+    SyncPoint::GetInstance()->EnableProcessing();
+
+    for (char c = 'a'; c <= 'p'; c++) {
+      ASSERT_OK(db->Put(WriteOptions(), std::string(1, c), "val"));
+    }
+    ASSERT_OK(db->Flush(FlushOptions()));
+
+    // Committed point deletions c-g (5 contiguous, above threshold).
+    for (char c = 'c'; c <= 'g'; c++) {
+      ASSERT_OK(db->Delete(WriteOptions(), std::string(1, c)));
+    }
+
+    TransactionOptions txn_options;
+    txn_options.write_batch_flush_threshold = 1;
+    std::unique_ptr<Transaction> txn(
+        db->BeginTransaction(WriteOptions(), txn_options));
+    ASSERT_NE(txn, nullptr);
+
+    // Transaction's own contiguous deletions j-n (5 keys, above threshold).
+    // Each Delete creates a separate unprepared batch (flush_threshold=1).
+    // These are uncommitted but visible to the txn's iterator via
+    // IsVisibleFullCheck + unprep_seqs.
+    for (char c = 'j'; c <= 'n'; c++) {
+      ASSERT_OK(txn->Delete(std::string(1, c)));
+    }
+
+    // Transaction also writes Puts that will be rolled back.
+    ASSERT_OK(txn->Put("a", "txn_a"));
+    ASSERT_OK(txn->Put("p", "txn_p"));
+
+    // Iterator sees: committed deletes (c-g hidden), own deletes (j-n hidden),
+    // own Puts (a=txn_a, p=txn_p), and remaining committed keys (b, h, i, o).
+    {
+      ReadOptions ro;
+      std::unique_ptr<Iterator> iter(txn->GetIterator(ro));
+      ASSERT_EQ(VerifyIterator(iter.get(), forward),
+                (std::vector<std::string>{"a", "b", "h", "i", "o", "p"}));
+      ASSERT_OK(iter->status());
+    }
+    // Both visible tombstone runs are discarded because the iterator's visible
+    // seqno includes the transaction's own unprepared writes.
+    ASSERT_EQ(
+        options.statistics->getTickerCount(READ_PATH_RANGE_TOMBSTONES_INSERTED),
+        0u);
+    ASSERT_EQ(options.statistics->getTickerCount(
+                  READ_PATH_RANGE_TOMBSTONES_DISCARDED),
+              2u);
+    ASSERT_EQ(inserted_ranges.size(), 0);
+
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+
+    // Rollback -- own Deletes and Puts are undone.
+    ASSERT_OK(txn->Rollback());
+
+    // After rollback: committed deletes c-g remain, own deletes j-n are
+    // undone, own Puts a/p are undone.
+    {
+      ReadOptions ro;
+      std::unique_ptr<Iterator> iter(db->NewIterator(ro));
+      // c-g deleted (committed), j-n restored, a/p restored to originals
+      ASSERT_EQ(VerifyIterator(iter.get(), forward),
+                (std::vector<std::string>{"a", "b", "h", "i", "j", "k", "l",
+                                          "m", "n", "o", "p"}));
+      ASSERT_OK(iter->status());
+    }
+
+    // Verify rolled-back values are originals.
+    std::string value;
+    ASSERT_OK(db->Get(ReadOptions(), "a", &value));
+    ASSERT_EQ(value, "val");
+    ASSERT_OK(db->Get(ReadOptions(), "j", &value));
+    ASSERT_EQ(value, "val");
+    ASSERT_OK(db->Get(ReadOptions(), "p", &value));
+    ASSERT_EQ(value, "val");
+  }
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
@@ -777,14 +1024,3 @@ int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
-
-#else
-#include <stdio.h>
-
-int main(int /*argc*/, char** /*argv*/) {
-  fprintf(stderr,
-          "SKIPPED as Transactions are not supported in ROCKSDB_LITE\n");
-  return 0;
-}
-
-#endif  // ROCKSDB_LITE

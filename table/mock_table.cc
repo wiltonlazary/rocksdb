@@ -13,8 +13,7 @@
 #include "table/get_context.h"
 #include "util/coding.h"
 
-namespace ROCKSDB_NAMESPACE {
-namespace mock {
+namespace ROCKSDB_NAMESPACE::mock {
 
 KVVector MakeMockFile(std::initializer_list<KVPair> l) { return KVVector(l); }
 
@@ -25,43 +24,6 @@ void SortKVVector(KVVector* kv_vector, const Comparator* ucmp) {
               return icmp.Compare(a.first, b.first) < 0;
             });
 }
-
-class MockTableReader : public TableReader {
- public:
-  explicit MockTableReader(const KVVector& table) : table_(table) {}
-
-  InternalIterator* NewIterator(const ReadOptions&,
-                                const SliceTransform* prefix_extractor,
-                                Arena* arena, bool skip_filters,
-                                TableReaderCaller caller,
-                                size_t compaction_readahead_size = 0,
-                                bool allow_unprepared_value = false) override;
-
-  Status Get(const ReadOptions& readOptions, const Slice& key,
-             GetContext* get_context, const SliceTransform* prefix_extractor,
-             bool skip_filters = false) override;
-
-  uint64_t ApproximateOffsetOf(const Slice& /*key*/,
-                               TableReaderCaller /*caller*/) override {
-    return 0;
-  }
-
-  uint64_t ApproximateSize(const Slice& /*start*/, const Slice& /*end*/,
-                           TableReaderCaller /*caller*/) override {
-    return 0;
-  }
-
-  size_t ApproximateMemoryUsage() const override { return 0; }
-
-  void SetupForCompaction() override {}
-
-  std::shared_ptr<const TableProperties> GetTableProperties() const override;
-
-  ~MockTableReader() {}
-
- private:
-  const KVVector& table_;
-};
 
 class MockTableIterator : public InternalIterator {
  public:
@@ -132,7 +94,7 @@ class MockTableBuilder : public TableBuilder {
   }
 
   // REQUIRES: Either Finish() or Abandon() has been called.
-  ~MockTableBuilder() {}
+  ~MockTableBuilder() = default;
 
   // Add key,value to the table being constructed.
   // REQUIRES: key is after any previously added key according to comparator.
@@ -219,16 +181,17 @@ Status MockTableReader::Get(const ReadOptions&, const Slice& key,
     }
 
     bool dont_care __attribute__((__unused__));
-    if (!get_context->SaveValue(parsed_key, iter->value(), &dont_care)) {
+    Status read_status;
+    bool ret = get_context->SaveValue(parsed_key, iter->value(), &dont_care,
+                                      &read_status);
+    if (!read_status.ok()) {
+      return read_status;
+    }
+    if (!ret) {
       break;
     }
   }
   return Status::OK();
-}
-
-std::shared_ptr<const TableProperties> MockTableReader::GetTableProperties()
-    const {
-  return std::shared_ptr<const TableProperties>(new TableProperties());
 }
 
 MockTableFactory::MockTableFactory()
@@ -290,15 +253,14 @@ Status MockTableFactory::GetAndWriteNextID(WritableFileWriter* file,
   *next_id = next_id_.fetch_add(1);
   char buf[4];
   EncodeFixed32(buf, *next_id);
-  return file->Append(Slice(buf, 4));
+  return file->Append(IOOptions(), Slice(buf, 4));
 }
 
 Status MockTableFactory::GetIDFromFile(RandomAccessFileReader* file,
                                        uint32_t* id) const {
   char buf[4];
   Slice result;
-  Status s = file->Read(IOOptions(), 0, 4, &result, buf, nullptr,
-                        Env::IO_TOTAL /* rate_limiter_priority */);
+  Status s = file->Read(IOOptions(), 0, 4, &result, buf, nullptr);
   assert(result.size() == 4);
   *id = DecodeFixed32(buf);
   return s;
@@ -340,5 +302,4 @@ void MockTableFactory::AssertLatestFiles(
   }
 }
 
-}  // namespace mock
-}  // namespace ROCKSDB_NAMESPACE
+}  // namespace ROCKSDB_NAMESPACE::mock

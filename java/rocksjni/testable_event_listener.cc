@@ -78,9 +78,9 @@ static TableProperties newTablePropertiesForTest() {
  * Signature: (J)V
  */
 void Java_org_rocksdb_test_TestableEventListener_invokeAllCallbacks(
-    JNIEnv *, jclass, jlong jhandle) {
-  const auto &el =
-      *reinterpret_cast<std::shared_ptr<ROCKSDB_NAMESPACE::EventListener> *>(
+    JNIEnv*, jclass, jlong jhandle) {
+  const auto& el =
+      *reinterpret_cast<std::shared_ptr<ROCKSDB_NAMESPACE::EventListener>*>(
           jhandle);
 
   TableProperties table_properties = newTablePropertiesForTest();
@@ -127,7 +127,7 @@ void Java_org_rocksdb_test_TestableEventListener_invokeAllCallbacks(
   compaction_job_info.output_file_infos = {};
   compaction_job_info.table_properties = {
       {"tableProperties", std::shared_ptr<TableProperties>(
-                              &table_properties, [](TableProperties *) {})}};
+                              &table_properties, [](TableProperties*) {})}};
   compaction_job_info.compaction_reason = CompactionReason::kFlush;
   compaction_job_info.compression = CompressionType::kSnappyCompression;
 
@@ -201,7 +201,7 @@ void Java_org_rocksdb_test_TestableEventListener_invokeAllCallbacks(
       FileOperationInfo(FileOperationType::kRead, file_path, start_timestamp,
                         finish_timestamp, status);
   op_info.offset = UINT64_MAX;
-  op_info.length = SIZE_MAX;
+  op_info.length = 4096;
 
   el->OnFileReadFinish(op_info);
   el->OnFileWriteFinish(op_info);

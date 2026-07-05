@@ -4,8 +4,6 @@
 //  (found in the LICENSE.Apache file in the root directory).
 //
 
-#ifndef ROCKSDB_LITE
-
 #ifdef GFLAGS
 #ifdef NUMA
 #include <numa.h>
@@ -171,18 +169,26 @@ namespace ROCKSDB_NAMESPACE {
 const size_t kShadowValueSize = 10;
 
 std::map<std::string, int> taOptToIndex = {
-    {"get", 0},           {"put", 1},
-    {"delete", 2},        {"single_delete", 3},
-    {"range_delete", 4},  {"merge", 5},
-    {"iterator_Seek", 6}, {"iterator_SeekForPrev", 7},
-    {"multiget", 8}};
+    {"get", kGet},
+    {"put", kPut},
+    {"delete", kDelete},
+    {"single_delete", kSingleDelete},
+    {"range_delete", kRangeDelete},
+    {"merge", kMerge},
+    {"iterator_Seek", kIteratorSeek},
+    {"iterator_SeekForPrev", kIteratorSeekForPrev},
+    {"multiget", kMultiGet}};
 
 std::map<int, std::string> taIndexToOpt = {
-    {0, "get"},           {1, "put"},
-    {2, "delete"},        {3, "single_delete"},
-    {4, "range_delete"},  {5, "merge"},
-    {6, "iterator_Seek"}, {7, "iterator_SeekForPrev"},
-    {8, "multiget"}};
+    {kGet, "get"},
+    {kPut, "put"},
+    {kDelete, "delete"},
+    {kSingleDelete, "single_delete"},
+    {kRangeDelete, "range_delete"},
+    {kMerge, "merge"},
+    {kIteratorSeek, "iterator_Seek"},
+    {kIteratorSeekForPrev, "iterator_SeekForPrev"},
+    {kMultiGet, "multiget"}};
 
 namespace {
 
@@ -202,7 +208,7 @@ uint64_t MultiplyCheckOverflow(uint64_t op1, uint64_t op2) {
 AnalyzerOptions::AnalyzerOptions()
     : correlation_map(kTaTypeNum, std::vector<int>(kTaTypeNum, -1)) {}
 
-AnalyzerOptions::~AnalyzerOptions() {}
+AnalyzerOptions::~AnalyzerOptions() = default;
 
 void AnalyzerOptions::SparseCorrelationInput(const std::string& in_str) {
   std::string cur = in_str;
@@ -215,14 +221,14 @@ void AnalyzerOptions::SparseCorrelationInput(const std::string& in_str) {
       exit(1);
     }
     std::string opt1, opt2;
-    std::size_t split = cur.find_first_of(",");
+    std::size_t split = cur.find_first_of(',');
     if (split != std::string::npos) {
       opt1 = cur.substr(1, split - 1);
     } else {
       fprintf(stderr, "Invalid correlation input: %s\n", in_str.c_str());
       exit(1);
     }
-    std::size_t end = cur.find_first_of("]");
+    std::size_t end = cur.find_first_of(']');
     if (end != std::string::npos) {
       opt2 = cur.substr(split + 1, end - split - 1);
     } else {
@@ -233,8 +239,7 @@ void AnalyzerOptions::SparseCorrelationInput(const std::string& in_str) {
 
     if (taOptToIndex.find(opt1) != taOptToIndex.end() &&
         taOptToIndex.find(opt2) != taOptToIndex.end()) {
-      correlation_list.push_back(
-          std::make_pair(taOptToIndex[opt1], taOptToIndex[opt2]));
+      correlation_list.emplace_back(taOptToIndex[opt1], taOptToIndex[opt2]);
     } else {
       fprintf(stderr, "Invalid correlation input: %s\n", in_str.c_str());
       exit(1);
@@ -246,7 +251,6 @@ void AnalyzerOptions::SparseCorrelationInput(const std::string& in_str) {
     correlation_map[it.first][it.second] = sequence;
     sequence++;
   }
-  return;
 }
 
 // The trace statistic struct constructor
@@ -265,7 +269,7 @@ TraceStats::TraceStats() {
   a_ave_qps = 0.0;
 }
 
-TraceStats::~TraceStats() {}
+TraceStats::~TraceStats() = default;
 
 // The trace analyzer constructor
 TraceAnalyzer::TraceAnalyzer(std::string& trace_path, std::string& output_path,
@@ -296,66 +300,66 @@ TraceAnalyzer::TraceAnalyzer(std::string& trace_path, std::string& output_path,
   }
 
   ta_.resize(kTaTypeNum);
-  ta_[0].type_name = "get";
+  ta_[kGet].type_name = "get";
   if (FLAGS_analyze_get) {
-    ta_[0].enabled = true;
+    ta_[kGet].enabled = true;
   } else {
-    ta_[0].enabled = false;
+    ta_[kGet].enabled = false;
   }
-  ta_[1].type_name = "put";
+  ta_[kPut].type_name = "put";
   if (FLAGS_analyze_put) {
-    ta_[1].enabled = true;
+    ta_[kPut].enabled = true;
   } else {
-    ta_[1].enabled = false;
+    ta_[kPut].enabled = false;
   }
-  ta_[2].type_name = "delete";
+  ta_[kDelete].type_name = "delete";
   if (FLAGS_analyze_delete) {
-    ta_[2].enabled = true;
+    ta_[kDelete].enabled = true;
   } else {
-    ta_[2].enabled = false;
+    ta_[kDelete].enabled = false;
   }
-  ta_[3].type_name = "single_delete";
+  ta_[kSingleDelete].type_name = "single_delete";
   if (FLAGS_analyze_single_delete) {
-    ta_[3].enabled = true;
+    ta_[kSingleDelete].enabled = true;
   } else {
-    ta_[3].enabled = false;
+    ta_[kSingleDelete].enabled = false;
   }
-  ta_[4].type_name = "range_delete";
+  ta_[kRangeDelete].type_name = "range_delete";
   if (FLAGS_analyze_range_delete) {
-    ta_[4].enabled = true;
+    ta_[kRangeDelete].enabled = true;
   } else {
-    ta_[4].enabled = false;
+    ta_[kRangeDelete].enabled = false;
   }
-  ta_[5].type_name = "merge";
+  ta_[kMerge].type_name = "merge";
   if (FLAGS_analyze_merge) {
-    ta_[5].enabled = true;
+    ta_[kMerge].enabled = true;
   } else {
-    ta_[5].enabled = false;
+    ta_[kMerge].enabled = false;
   }
-  ta_[6].type_name = "iterator_Seek";
+  ta_[kIteratorSeek].type_name = "iterator_Seek";
   if (FLAGS_analyze_iterator) {
-    ta_[6].enabled = true;
+    ta_[kIteratorSeek].enabled = true;
   } else {
-    ta_[6].enabled = false;
+    ta_[kIteratorSeek].enabled = false;
   }
-  ta_[7].type_name = "iterator_SeekForPrev";
+  ta_[kIteratorSeekForPrev].type_name = "iterator_SeekForPrev";
   if (FLAGS_analyze_iterator) {
-    ta_[7].enabled = true;
+    ta_[kIteratorSeekForPrev].enabled = true;
   } else {
-    ta_[7].enabled = false;
+    ta_[kIteratorSeekForPrev].enabled = false;
   }
-  ta_[8].type_name = "multiget";
+  ta_[kMultiGet].type_name = "multiget";
   if (FLAGS_analyze_multiget) {
-    ta_[8].enabled = true;
+    ta_[kMultiGet].enabled = true;
   } else {
-    ta_[8].enabled = false;
+    ta_[kMultiGet].enabled = false;
   }
   for (int i = 0; i < kTaTypeNum; i++) {
     ta_[i].sample_count = 0;
   }
 }
 
-TraceAnalyzer::~TraceAnalyzer() {}
+TraceAnalyzer::~TraceAnalyzer() = default;
 
 // Prepare the processing
 // Initiate the global trace reader and writer here
@@ -1582,6 +1586,19 @@ Status TraceAnalyzer::PutCF(uint32_t column_family_id, const Slice& key,
                               column_family_id, key, value.size());
 }
 
+Status TraceAnalyzer::TimedPutCF(uint32_t column_family_id, const Slice& key,
+                                 const Slice& value,
+                                 uint64_t /*write_unix_time*/) {
+  return OutputAnalysisResult(TraceOperationType::kPut, write_batch_ts_,
+                              column_family_id, key, value.size());
+}
+
+Status TraceAnalyzer::PutEntityCF(uint32_t column_family_id, const Slice& key,
+                                  const Slice& value) {
+  return OutputAnalysisResult(TraceOperationType::kPutEntity, write_batch_ts_,
+                              column_family_id, key, value.size());
+}
+
 // Handle the Delete request in the write batch of the trace
 Status TraceAnalyzer::DeleteCF(uint32_t column_family_id, const Slice& key) {
   return OutputAnalysisResult(TraceOperationType::kDelete, write_batch_ts_,
@@ -1623,14 +1640,21 @@ Status TraceAnalyzer::OutputAnalysisResult(TraceOperationType op_type,
   Status s;
 
   if (FLAGS_convert_to_human_readable_trace && trace_sequence_f_) {
-    // DeleteRane only writes the begin_key.
-    size_t cnt =
-        op_type == TraceOperationType::kRangeDelete ? 1 : cf_ids.size();
-    for (size_t i = 0; i < cnt; i++) {
-      s = WriteTraceSequence(op_type, cf_ids[i], keys[i], value_sizes[i],
-                             timestamp);
+    if (op_type == TraceOperationType::kRangeDelete) {
+      assert(cf_ids.size() == 2);
+      assert(keys.size() == 2);
+      s = WriteRangeDeleteTraceSequence(cf_ids[0], keys[0], keys[1], timestamp);
       if (!s.ok()) {
         return Status::Corruption("Failed to write the trace sequence to file");
+      }
+    } else {
+      for (size_t i = 0; i < cf_ids.size(); i++) {
+        s = WriteTraceSequence(op_type, cf_ids[i], keys[i], value_sizes[i],
+                               timestamp);
+        if (!s.ok()) {
+          return Status::Corruption(
+              "Failed to write the trace sequence to file");
+        }
       }
     }
   }
@@ -1858,6 +1882,28 @@ Status TraceAnalyzer::WriteTraceSequence(const uint32_t& type,
   return trace_sequence_f_->Append(printout);
 }
 
+Status TraceAnalyzer::WriteRangeDeleteTraceSequence(const uint32_t& cf_id,
+                                                    const Slice& begin_key,
+                                                    const Slice& end_key,
+                                                    const uint64_t ts) {
+  int ret;
+  ret = snprintf(buffer_, sizeof(buffer_), "%u %u %zu %" PRIu64 "\n",
+                 TraceOperationType::kRangeDelete, cf_id,
+                 static_cast<size_t>(0), ts);
+  if (ret < 0) {
+    return Status::IOError("failed to format the output");
+  }
+  std::string printout(buffer_);
+  if (!FLAGS_no_key) {
+    const std::string begin_hex =
+        ROCKSDB_NAMESPACE::LDBCommand::StringToHex(begin_key.ToString());
+    const std::string end_hex =
+        ROCKSDB_NAMESPACE::LDBCommand::StringToHex(end_key.ToString());
+    printout = begin_hex + " " + end_hex + " " + printout;
+  }
+  return trace_sequence_f_->Append(printout);
+}
+
 // The entrance function of Trace_Analyzer
 int trace_analyzer_tool(int argc, char** argv) {
   std::string trace_path;
@@ -1922,4 +1968,3 @@ int trace_analyzer_tool(int argc, char** argv) {
 }  // namespace ROCKSDB_NAMESPACE
 
 #endif  // Endif of Gflag
-#endif  // RocksDB LITE

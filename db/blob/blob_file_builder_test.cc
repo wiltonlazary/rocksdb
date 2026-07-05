@@ -43,6 +43,7 @@ class BlobFileBuilderTest : public testing::Test {
     mock_env_.reset(MockEnv::Create(Env::Default()));
     fs_ = mock_env_->GetFileSystem().get();
     clock_ = mock_env_->GetSystemClock().get();
+    write_options_.rate_limiter_priority = Env::IO_HIGH;
   }
 
   void VerifyBlobFile(uint64_t blob_file_number,
@@ -113,6 +114,7 @@ class BlobFileBuilderTest : public testing::Test {
   FileSystem* fs_;
   SystemClock* clock_;
   FileOptions file_options_;
+  WriteOptions write_options_;
 };
 
 TEST_F(BlobFileBuilderTest, BuildAndCheckOneFile) {
@@ -136,7 +138,6 @@ TEST_F(BlobFileBuilderTest, BuildAndCheckOneFile) {
   constexpr int job_id = 1;
   constexpr uint32_t column_family_id = 123;
   constexpr char column_family_name[] = "foobar";
-  constexpr Env::IOPriority io_priority = Env::IO_HIGH;
   constexpr Env::WriteLifeTimeHint write_hint = Env::WLTH_MEDIUM;
 
   std::vector<std::string> blob_file_paths;
@@ -144,8 +145,8 @@ TEST_F(BlobFileBuilderTest, BuildAndCheckOneFile) {
 
   BlobFileBuilder builder(
       TestFileNumberGenerator(), fs_, &immutable_options, &mutable_cf_options,
-      &file_options_, "" /*db_id*/, "" /*db_session_id*/, job_id,
-      column_family_id, column_family_name, io_priority, write_hint,
+      &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
+      job_id, column_family_id, column_family_name, write_hint,
       nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
       BlobFileCreationReason::kFlush, &blob_file_paths, &blob_file_additions);
 
@@ -221,7 +222,6 @@ TEST_F(BlobFileBuilderTest, BuildAndCheckMultipleFiles) {
   constexpr int job_id = 1;
   constexpr uint32_t column_family_id = 123;
   constexpr char column_family_name[] = "foobar";
-  constexpr Env::IOPriority io_priority = Env::IO_HIGH;
   constexpr Env::WriteLifeTimeHint write_hint = Env::WLTH_MEDIUM;
 
   std::vector<std::string> blob_file_paths;
@@ -229,8 +229,8 @@ TEST_F(BlobFileBuilderTest, BuildAndCheckMultipleFiles) {
 
   BlobFileBuilder builder(
       TestFileNumberGenerator(), fs_, &immutable_options, &mutable_cf_options,
-      &file_options_, "" /*db_id*/, "" /*db_session_id*/, job_id,
-      column_family_id, column_family_name, io_priority, write_hint,
+      &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
+      job_id, column_family_id, column_family_name, write_hint,
       nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
       BlobFileCreationReason::kFlush, &blob_file_paths, &blob_file_additions);
 
@@ -309,7 +309,6 @@ TEST_F(BlobFileBuilderTest, InlinedValues) {
   constexpr int job_id = 1;
   constexpr uint32_t column_family_id = 123;
   constexpr char column_family_name[] = "foobar";
-  constexpr Env::IOPriority io_priority = Env::IO_HIGH;
   constexpr Env::WriteLifeTimeHint write_hint = Env::WLTH_MEDIUM;
 
   std::vector<std::string> blob_file_paths;
@@ -317,8 +316,8 @@ TEST_F(BlobFileBuilderTest, InlinedValues) {
 
   BlobFileBuilder builder(
       TestFileNumberGenerator(), fs_, &immutable_options, &mutable_cf_options,
-      &file_options_, "" /*db_id*/, "" /*db_session_id*/, job_id,
-      column_family_id, column_family_name, io_priority, write_hint,
+      &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
+      job_id, column_family_id, column_family_name, write_hint,
       nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
       BlobFileCreationReason::kFlush, &blob_file_paths, &blob_file_additions);
 
@@ -364,7 +363,6 @@ TEST_F(BlobFileBuilderTest, Compression) {
   constexpr int job_id = 1;
   constexpr uint32_t column_family_id = 123;
   constexpr char column_family_name[] = "foobar";
-  constexpr Env::IOPriority io_priority = Env::IO_HIGH;
   constexpr Env::WriteLifeTimeHint write_hint = Env::WLTH_MEDIUM;
 
   std::vector<std::string> blob_file_paths;
@@ -372,8 +370,8 @@ TEST_F(BlobFileBuilderTest, Compression) {
 
   BlobFileBuilder builder(
       TestFileNumberGenerator(), fs_, &immutable_options, &mutable_cf_options,
-      &file_options_, "" /*db_id*/, "" /*db_session_id*/, job_id,
-      column_family_id, column_family_name, io_priority, write_hint,
+      &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
+      job_id, column_family_id, column_family_name, write_hint,
       nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
       BlobFileCreationReason::kFlush, &blob_file_paths, &blob_file_additions);
 
@@ -405,23 +403,19 @@ TEST_F(BlobFileBuilderTest, Compression) {
   ASSERT_EQ(blob_file_addition.GetBlobFileNumber(), blob_file_number);
   ASSERT_EQ(blob_file_addition.GetTotalBlobCount(), 1);
 
-  CompressionOptions opts;
-  CompressionContext context(kSnappyCompression);
-  constexpr uint64_t sample_for_compression = 0;
-
-  CompressionInfo info(opts, context, CompressionDict::GetEmptyDict(),
-                       kSnappyCompression, sample_for_compression);
-
-  std::string compressed_value;
-  ASSERT_TRUE(Snappy_Compress(info, uncompressed_value.data(),
-                              uncompressed_value.size(), &compressed_value));
+  auto compressor =
+      GetBuiltinV2CompressionManager()->GetCompressor({}, kSnappyCompression);
+  GrowableBuffer compressed_value;
+  ASSERT_OK(LegacyForceBuiltinCompression(*compressor, /*working_area=*/nullptr,
+                                          uncompressed_value,
+                                          &compressed_value));
 
   ASSERT_EQ(blob_file_addition.GetTotalBlobBytes(),
             BlobLogRecord::kHeaderSize + key_size + compressed_value.size());
 
   // Verify the contents of the new blob file as well as the blob reference
   std::vector<std::pair<std::string, std::string>> expected_key_value_pairs{
-      {key, compressed_value}};
+      {key, compressed_value.AsSlice().ToString()}};
   std::vector<std::string> blob_indexes{blob_index};
 
   VerifyBlobFile(blob_file_number, blob_file_path, column_family_id,
@@ -448,7 +442,6 @@ TEST_F(BlobFileBuilderTest, CompressionError) {
   constexpr int job_id = 1;
   constexpr uint32_t column_family_id = 123;
   constexpr char column_family_name[] = "foobar";
-  constexpr Env::IOPriority io_priority = Env::IO_HIGH;
   constexpr Env::WriteLifeTimeHint write_hint = Env::WLTH_MEDIUM;
 
   std::vector<std::string> blob_file_paths;
@@ -456,16 +449,17 @@ TEST_F(BlobFileBuilderTest, CompressionError) {
 
   BlobFileBuilder builder(
       TestFileNumberGenerator(), fs_, &immutable_options, &mutable_cf_options,
-      &file_options_, "" /*db_id*/, "" /*db_session_id*/, job_id,
-      column_family_id, column_family_name, io_priority, write_hint,
+      &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
+      job_id, column_family_id, column_family_name, write_hint,
       nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
       BlobFileCreationReason::kFlush, &blob_file_paths, &blob_file_additions);
 
-  SyncPoint::GetInstance()->SetCallBack("CompressData:TamperWithReturnValue",
-                                        [](void* arg) {
-                                          bool* ret = static_cast<bool*>(arg);
-                                          *ret = false;
-                                        });
+  SyncPoint::GetInstance()->SetCallBack(
+      "LegacyForceBuiltinCompression:TamperWithStatus", [](void* arg) {
+        Status* ret = static_cast<Status*>(arg);
+        ASSERT_OK(*ret);
+        *ret = Status::Corruption("Tampered result");
+      });
   SyncPoint::GetInstance()->EnableProcessing();
 
   constexpr char key[] = "1";
@@ -473,7 +467,7 @@ TEST_F(BlobFileBuilderTest, CompressionError) {
 
   std::string blob_index;
 
-  ASSERT_TRUE(builder.Add(key, value, &blob_index).IsCorruption());
+  ASSERT_EQ(builder.Add(key, value, &blob_index).code(), Status::kCorruption);
 
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
@@ -528,7 +522,6 @@ TEST_F(BlobFileBuilderTest, Checksum) {
   constexpr int job_id = 1;
   constexpr uint32_t column_family_id = 123;
   constexpr char column_family_name[] = "foobar";
-  constexpr Env::IOPriority io_priority = Env::IO_HIGH;
   constexpr Env::WriteLifeTimeHint write_hint = Env::WLTH_MEDIUM;
 
   std::vector<std::string> blob_file_paths;
@@ -536,8 +529,8 @@ TEST_F(BlobFileBuilderTest, Checksum) {
 
   BlobFileBuilder builder(
       TestFileNumberGenerator(), fs_, &immutable_options, &mutable_cf_options,
-      &file_options_, "" /*db_id*/, "" /*db_session_id*/, job_id,
-      column_family_id, column_family_name, io_priority, write_hint,
+      &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
+      job_id, column_family_id, column_family_name, write_hint,
       nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
       BlobFileCreationReason::kFlush, &blob_file_paths, &blob_file_additions);
 
@@ -589,11 +582,13 @@ class BlobFileBuilderIOErrorTest
   BlobFileBuilderIOErrorTest() : sync_point_(GetParam()) {
     mock_env_.reset(MockEnv::Create(Env::Default()));
     fs_ = mock_env_->GetFileSystem().get();
+    write_options_.rate_limiter_priority = Env::IO_HIGH;
   }
 
   std::unique_ptr<Env> mock_env_;
   FileSystem* fs_;
   FileOptions file_options_;
+  WriteOptions write_options_;
   std::string sync_point_;
 };
 
@@ -626,7 +621,6 @@ TEST_P(BlobFileBuilderIOErrorTest, IOError) {
   constexpr int job_id = 1;
   constexpr uint32_t column_family_id = 123;
   constexpr char column_family_name[] = "foobar";
-  constexpr Env::IOPriority io_priority = Env::IO_HIGH;
   constexpr Env::WriteLifeTimeHint write_hint = Env::WLTH_MEDIUM;
 
   std::vector<std::string> blob_file_paths;
@@ -634,8 +628,8 @@ TEST_P(BlobFileBuilderIOErrorTest, IOError) {
 
   BlobFileBuilder builder(
       TestFileNumberGenerator(), fs_, &immutable_options, &mutable_cf_options,
-      &file_options_, "" /*db_id*/, "" /*db_session_id*/, job_id,
-      column_family_id, column_family_name, io_priority, write_hint,
+      &file_options_, &write_options_, "" /*db_id*/, "" /*db_session_id*/,
+      job_id, column_family_id, column_family_name, write_hint,
       nullptr /*IOTracer*/, nullptr /*BlobFileCompletionCallback*/,
       BlobFileCreationReason::kFlush, &blob_file_paths, &blob_file_additions);
 

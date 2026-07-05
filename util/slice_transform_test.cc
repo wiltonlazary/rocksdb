@@ -49,7 +49,7 @@ class SliceTransformDBTest : public testing::Test {
  private:
   std::string dbname_;
   Env* env_;
-  DB* db_;
+  std::unique_ptr<DB> db_;
 
  public:
   SliceTransformDBTest() : env_(Env::Default()), db_(nullptr) {
@@ -58,11 +58,11 @@ class SliceTransformDBTest : public testing::Test {
   }
 
   ~SliceTransformDBTest() override {
-    delete db_;
+    db_.reset();
     EXPECT_OK(DestroyDB(dbname_, last_options_));
   }
 
-  DB* db() { return db_; }
+  DB* db() { return db_.get(); }
 
   // Return the current option configuration.
   Options* GetOptions() { return &last_options_; }
@@ -74,14 +74,12 @@ class SliceTransformDBTest : public testing::Test {
   }
 
   void Destroy() {
-    delete db_;
-    db_ = nullptr;
+    db_.reset();
     ASSERT_OK(DestroyDB(dbname_, last_options_));
   }
 
   Status TryReopen() {
-    delete db_;
-    db_ = nullptr;
+    db_.reset();
     last_options_.create_if_missing = true;
 
     return DB::Open(last_options_, dbname_, &db_);
@@ -91,8 +89,8 @@ class SliceTransformDBTest : public testing::Test {
 };
 
 namespace {
-uint64_t TestGetTickerCount(const Options& options, Tickers ticker_type) {
-  return options.statistics->getTickerCount(ticker_type);
+uint64_t PopTicker(const Options& options, Tickers ticker_type) {
+  return options.statistics->getAndResetTickerCount(ticker_type);
 }
 }  // namespace
 
@@ -121,28 +119,33 @@ TEST_F(SliceTransformDBTest, CapPrefix) {
   ASSERT_OK(iter->status());
   ASSERT_TRUE(iter->Valid());
   ASSERT_EQ(iter->value().ToString(), "bar");
-  ASSERT_EQ(TestGetTickerCount(last_options_, BLOOM_FILTER_PREFIX_USEFUL), 0U);
+  EXPECT_EQ(PopTicker(last_options_, NON_LAST_LEVEL_SEEK_FILTER_MATCH), 1U);
+  EXPECT_EQ(PopTicker(last_options_, NON_LAST_LEVEL_SEEK_FILTERED), 0U);
 
   iter->Seek("foo2");
   ASSERT_OK(iter->status());
   ASSERT_TRUE(!iter->Valid());
-  ASSERT_EQ(TestGetTickerCount(last_options_, BLOOM_FILTER_PREFIX_USEFUL), 1U);
+  EXPECT_EQ(PopTicker(last_options_, NON_LAST_LEVEL_SEEK_FILTER_MATCH), 0U);
+  EXPECT_EQ(PopTicker(last_options_, NON_LAST_LEVEL_SEEK_FILTERED), 1U);
 
   iter->Seek("barbarbar");
   ASSERT_OK(iter->status());
   ASSERT_TRUE(iter->Valid());
   ASSERT_EQ(iter->value().ToString(), "foo");
-  ASSERT_EQ(TestGetTickerCount(last_options_, BLOOM_FILTER_PREFIX_USEFUL), 1U);
+  EXPECT_EQ(PopTicker(last_options_, NON_LAST_LEVEL_SEEK_FILTER_MATCH), 1U);
+  EXPECT_EQ(PopTicker(last_options_, NON_LAST_LEVEL_SEEK_FILTERED), 0U);
 
   iter->Seek("barfoofoo");
   ASSERT_OK(iter->status());
   ASSERT_TRUE(!iter->Valid());
-  ASSERT_EQ(TestGetTickerCount(last_options_, BLOOM_FILTER_PREFIX_USEFUL), 2U);
+  EXPECT_EQ(PopTicker(last_options_, NON_LAST_LEVEL_SEEK_FILTER_MATCH), 0U);
+  EXPECT_EQ(PopTicker(last_options_, NON_LAST_LEVEL_SEEK_FILTERED), 1U);
 
   iter->Seek("foobarbar");
   ASSERT_OK(iter->status());
   ASSERT_TRUE(!iter->Valid());
-  ASSERT_EQ(TestGetTickerCount(last_options_, BLOOM_FILTER_PREFIX_USEFUL), 3U);
+  EXPECT_EQ(PopTicker(last_options_, NON_LAST_LEVEL_SEEK_FILTER_MATCH), 0U);
+  EXPECT_EQ(PopTicker(last_options_, NON_LAST_LEVEL_SEEK_FILTERED), 1U);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

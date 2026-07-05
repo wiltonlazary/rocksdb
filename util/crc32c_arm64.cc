@@ -10,7 +10,7 @@
 #if defined(__linux__)
 #include <asm/hwcap.h>
 #endif
-#ifdef ROCKSDB_AUXV_GETAUXVAL_PRESENT
+#if defined(ROCKSDB_AUXV_GETAUXVAL_PRESENT)
 #include <sys/auxv.h>
 #endif
 #ifndef HWCAP_CRC32
@@ -22,6 +22,12 @@
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #endif
+#if defined(__OpenBSD__)
+#include <machine/armreg.h>
+#include <machine/cpu.h>
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#endif
 
 #ifdef HAVE_ARM64_CRYPTO
 /* unfolding to compute 8 * 3 = 24 bytes parallelly */
@@ -31,22 +37,22 @@
   crc0 = crc32c_u64(crc0, *(buf64 + (ITR)));
 
 /* unfolding to compute 24 * 7 = 168 bytes parallelly */
-#define CRC32C7X24BYTES(ITR)   \
-  do {                         \
-    CRC32C24BYTES((ITR)*7 + 0) \
-    CRC32C24BYTES((ITR)*7 + 1) \
-    CRC32C24BYTES((ITR)*7 + 2) \
-    CRC32C24BYTES((ITR)*7 + 3) \
-    CRC32C24BYTES((ITR)*7 + 4) \
-    CRC32C24BYTES((ITR)*7 + 5) \
-    CRC32C24BYTES((ITR)*7 + 6) \
+#define CRC32C7X24BYTES(ITR)     \
+  do {                           \
+    CRC32C24BYTES((ITR) * 7 + 0) \
+    CRC32C24BYTES((ITR) * 7 + 1) \
+    CRC32C24BYTES((ITR) * 7 + 2) \
+    CRC32C24BYTES((ITR) * 7 + 3) \
+    CRC32C24BYTES((ITR) * 7 + 4) \
+    CRC32C24BYTES((ITR) * 7 + 5) \
+    CRC32C24BYTES((ITR) * 7 + 6) \
   } while (0)
 #endif
 
 extern bool pmull_runtime_flag;
 
 uint32_t crc32c_runtime_check(void) {
-#if !defined(__APPLE__)
+#if defined(ROCKSDB_AUXV_GETAUXVAL_PRESENT) || defined(__FreeBSD__)
   uint64_t auxv = 0;
 #if defined(ROCKSDB_AUXV_GETAUXVAL_PRESENT)
   auxv = getauxval(AT_HWCAP);
@@ -54,16 +60,28 @@ uint32_t crc32c_runtime_check(void) {
   elf_aux_info(AT_HWCAP, &auxv, sizeof(auxv));
 #endif
   return (auxv & HWCAP_CRC32) != 0;
-#else
+#elif defined(__APPLE__)
   int r;
   size_t l = sizeof(r);
   if (sysctlbyname("hw.optional.armv8_crc32", &r, &l, NULL, 0) == -1) return 0;
   return r == 1;
+#elif defined(__OpenBSD__)
+  int r = 0;
+  const int isar0_mib[] = {CTL_MACHDEP, CPU_ID_AA64ISAR0};
+  uint64_t isar0;
+  size_t len = sizeof(isar0);
+
+  if (sysctl(isar0_mib, 2, &isar0, &len, NULL, 0) != -1) {
+    if (ID_AA64ISAR0_CRC32(isar0) >= ID_AA64ISAR0_CRC32_BASE) r = 1;
+  }
+  return r;
+#else
+  return 0;
 #endif
 }
 
 bool crc32c_pmull_runtime_check(void) {
-#if !defined(__APPLE__)
+#if defined(ROCKSDB_AUXV_GETAUXVAL_PRESENT) || defined(__FreeBSD__)
   uint64_t auxv = 0;
 #if defined(ROCKSDB_AUXV_GETAUXVAL_PRESENT)
   auxv = getauxval(AT_HWCAP);
@@ -71,8 +89,20 @@ bool crc32c_pmull_runtime_check(void) {
   elf_aux_info(AT_HWCAP, &auxv, sizeof(auxv));
 #endif
   return (auxv & HWCAP_PMULL) != 0;
-#else
+#elif defined(__APPLE__)
   return true;
+#elif defined(__OpenBSD__)
+  bool r = false;
+  const int isar0_mib[] = {CTL_MACHDEP, CPU_ID_AA64ISAR0};
+  uint64_t isar0;
+  size_t len = sizeof(isar0);
+
+  if (sysctl(isar0_mib, 2, &isar0, &len, NULL, 0) != -1) {
+    if (ID_AA64ISAR0_AES(isar0) >= ID_AA64ISAR0_AES_PMULL) r = true;
+  }
+  return r;
+#else
+  return false;
 #endif
 }
 
@@ -83,10 +113,9 @@ __attribute__((__no_sanitize__("alignment")))
 __attribute__((__no_sanitize_undefined__))
 #endif
 #endif
-uint32_t
-crc32c_arm64(uint32_t crc, unsigned char const *data, size_t len) {
-  const uint8_t *buf8;
-  const uint64_t *buf64 = (uint64_t *)data;
+uint32_t crc32c_arm64(uint32_t crc, unsigned char const* data, size_t len) {
+  const uint8_t* buf8;
+  const uint64_t* buf64 = (uint64_t*)data;
   int length = (int)len;
   crc ^= 0xffffffff;
 
@@ -118,7 +147,7 @@ crc32c_arm64(uint32_t crc, unsigned char const *data, size_t len) {
       uint32_t k0 = 0xe417f38a, k1 = 0x8f158014;
 
       /* Prefetch data for following block to avoid cache miss */
-      PREF1KL1((uint8_t *)buf64, 1024);
+      PREF1KL1((uint8_t*)buf64, 1024);
 
       /* First 8 byte for better pipelining */
       crc0 = crc32c_u64(crc, *buf64++);
@@ -154,22 +183,22 @@ crc32c_arm64(uint32_t crc, unsigned char const *data, size_t len) {
 #endif
   }  // if Pmull runtime check here
 
-  buf8 = (const uint8_t *)buf64;
+  buf8 = (const uint8_t*)buf64;
   while (length >= 8) {
-    crc = crc32c_u64(crc, *(const uint64_t *)buf8);
+    crc = crc32c_u64(crc, *(const uint64_t*)buf8);
     buf8 += 8;
     length -= 8;
   }
 
   /* The following is more efficient than the straight loop */
   if (length >= 4) {
-    crc = crc32c_u32(crc, *(const uint32_t *)buf8);
+    crc = crc32c_u32(crc, *(const uint32_t*)buf8);
     buf8 += 4;
     length -= 4;
   }
 
   if (length >= 2) {
-    crc = crc32c_u16(crc, *(const uint16_t *)buf8);
+    crc = crc32c_u16(crc, *(const uint16_t*)buf8);
     buf8 += 2;
     length -= 2;
   }

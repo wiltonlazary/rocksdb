@@ -4,7 +4,6 @@
 //  (found in the LICENSE.Apache file in the root directory).
 //
 
-#ifndef ROCKSDB_LITE
 #ifndef GFLAGS
 #include <cstdio>
 int main() {
@@ -51,8 +50,7 @@ class IOTracerParserTest : public testing::Test {
     if (db_ != nullptr) {
       Options options;
       options.env = env_;
-      delete db_;
-      db_ = nullptr;
+      db_.reset();
       EXPECT_OK(DestroyDB(dbname_, options));
     }
     EXPECT_OK(env_->DeleteDir(test_path_));
@@ -98,7 +96,7 @@ class IOTracerParserTest : public testing::Test {
     ASSERT_EQ(0, ROCKSDB_NAMESPACE::io_tracer_parser(argc, argv));
   }
 
-  DB* db_;
+  std::unique_ptr<DB> db_;
   Env* env_;
   EnvOptions env_options_;
   std::string trace_file_path_;
@@ -181,10 +179,3 @@ int main(int argc, char** argv) {
   return RUN_ALL_TESTS();
 }
 #endif  // GFLAGS
-#else
-#include <stdio.h>
-int main(int /*argc*/, char** /*argv*/) {
-  fprintf(stderr, "io_tracer_parser_test is not supported in ROCKSDB_LITE\n");
-  return 0;
-}
-#endif  // ROCKSDB_LITE

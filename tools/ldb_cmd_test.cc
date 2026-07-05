@@ -3,10 +3,11 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 //
-#ifndef ROCKSDB_LITE
 #include "rocksdb/utilities/ldb_cmd.h"
 
 #include <cinttypes>
+#include <iomanip>
+#include <memory>
 
 #include "db/db_test_util.h"
 #include "db/version_edit.h"
@@ -15,6 +16,7 @@
 #include "file/filename.h"
 #include "port/stack_trace.h"
 #include "rocksdb/advanced_options.h"
+#include "rocksdb/comparator.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/db.h"
 #include "rocksdb/file_checksum.h"
@@ -98,7 +100,7 @@ TEST_F(LdbCmdTest, MemEnv) {
   opts.env = env.get();
   opts.create_if_missing = true;
 
-  DB* db = nullptr;
+  std::unique_ptr<DB> db;
   std::string dbname = test::PerThreadDBPath(env.get(), "ldb_cmd_test");
   ASSERT_OK(DB::Open(opts, dbname, &db));
 
@@ -112,7 +114,7 @@ TEST_F(LdbCmdTest, MemEnv) {
   fopts.wait = true;
   ASSERT_OK(db->Flush(fopts));
 
-  delete db;
+  db.reset();
 
   char arg1[] = "./ldb";
   char arg2[1024];
@@ -186,7 +188,7 @@ class FileChecksumTestHelper {
  public:
   FileChecksumTestHelper(Options& options, DB* db, std::string db_name)
       : options_(options), db_(db), dbname_(db_name) {}
-  ~FileChecksumTestHelper() {}
+  ~FileChecksumTestHelper() = default;
 
   // Verify the checksum information in Manifest.
   Status VerifyChecksumInManifest(
@@ -207,8 +209,11 @@ class FileChecksumTestHelper {
     WriteController wc(options_.delayed_write_rate);
     WriteBufferManager wb(options_.db_write_buffer_size);
     ImmutableDBOptions immutable_db_options(options_);
-    VersionSet versions(dbname_, &immutable_db_options, sopt, tc.get(), &wb,
-                        &wc, nullptr, nullptr, "", "");
+    VersionSet versions(dbname_, &immutable_db_options,
+                        MutableDBOptions{options_}, sopt, tc.get(), &wb, &wc,
+                        nullptr, nullptr, "", "",
+                        options_.daily_offpeak_time_utc, nullptr,
+                        /*read_only=*/false);
     std::vector<std::string> cf_name_list;
     Status s;
     s = versions.ListColumnFamilies(&cf_name_list, dbname_,
@@ -233,8 +238,8 @@ class FileChecksumTestHelper {
       return Status::Corruption("The number of files does not match!");
     }
     for (size_t i = 0; i < live_files.size(); i++) {
-      std::string stored_checksum = "";
-      std::string stored_func_name = "";
+      std::string stored_checksum;
+      std::string stored_func_name;
       s = checksum_list->SearchOneFileChecksum(
           live_files[i].file_number, &stored_checksum, &stored_func_name);
       if (s.IsNotFound()) {
@@ -281,7 +286,7 @@ TEST_F(LdbCmdTest, DumpFileChecksumNoChecksum) {
   opts.env = env.get();
   opts.create_if_missing = true;
 
-  DB* db = nullptr;
+  std::unique_ptr<DB> db;
   std::string dbname = test::PerThreadDBPath(env.get(), "ldb_cmd_test");
   ASSERT_OK(DB::Open(opts, dbname, &db));
 
@@ -318,7 +323,7 @@ TEST_F(LdbCmdTest, DumpFileChecksumNoChecksum) {
   }
   ASSERT_OK(db->Flush(fopts));
   ASSERT_OK(db->Close());
-  delete db;
+  db.reset();
 
   char arg1[] = "./ldb";
   char arg2[1024];
@@ -333,7 +338,7 @@ TEST_F(LdbCmdTest, DumpFileChecksumNoChecksum) {
   ASSERT_OK(DB::Open(opts, dbname, &db));
 
   // Verify each sst file checksum value and checksum name
-  FileChecksumTestHelper fct_helper(opts, db, dbname);
+  FileChecksumTestHelper fct_helper(opts, db.get(), dbname);
   ASSERT_OK(fct_helper.VerifyEachFileChecksum());
 
   // Manually trigger compaction
@@ -346,11 +351,11 @@ TEST_F(LdbCmdTest, DumpFileChecksumNoChecksum) {
   CompactRangeOptions options;
   ASSERT_OK(db->CompactRange(options, &begin, &end));
   // Verify each sst file checksum after compaction
-  FileChecksumTestHelper fct_helper_ac(opts, db, dbname);
+  FileChecksumTestHelper fct_helper_ac(opts, db.get(), dbname);
   ASSERT_OK(fct_helper_ac.VerifyEachFileChecksum());
 
   ASSERT_OK(db->Close());
-  delete db;
+  db.reset();
 
   ASSERT_EQ(0,
             LDBCommandRunner::RunCommand(4, argv, opts, LDBOptions(), nullptr));
@@ -360,7 +365,7 @@ TEST_F(LdbCmdTest, DumpFileChecksumNoChecksum) {
   // Verify the checksum information in memory is the same as that in Manifest;
   std::vector<LiveFileMetaData> live_files;
   db->GetLiveFilesMetaData(&live_files);
-  delete db;
+  db.reset();
   ASSERT_OK(fct_helper_ac.VerifyChecksumInManifest(live_files));
 }
 
@@ -372,7 +377,7 @@ TEST_F(LdbCmdTest, BlobDBDumpFileChecksumNoChecksum) {
   opts.create_if_missing = true;
   opts.enable_blob_files = true;
 
-  DB* db = nullptr;
+  std::unique_ptr<DB> db;
   std::string dbname = test::PerThreadDBPath(env.get(), "ldb_cmd_test");
   ASSERT_OK(DB::Open(opts, dbname, &db));
 
@@ -409,7 +414,7 @@ TEST_F(LdbCmdTest, BlobDBDumpFileChecksumNoChecksum) {
   }
   ASSERT_OK(db->Flush(fopts));
   ASSERT_OK(db->Close());
-  delete db;
+  db.reset();
 
   char arg1[] = "./ldb";
   std::string arg2_str = "--db=" + dbname;
@@ -423,7 +428,7 @@ TEST_F(LdbCmdTest, BlobDBDumpFileChecksumNoChecksum) {
   ASSERT_OK(DB::Open(opts, dbname, &db));
 
   // Verify each sst and blob file checksum value and checksum name
-  FileChecksumTestHelper fct_helper(opts, db, dbname);
+  FileChecksumTestHelper fct_helper(opts, db.get(), dbname);
   ASSERT_OK(fct_helper.VerifyEachFileChecksum());
 
   // Manually trigger compaction
@@ -439,11 +444,11 @@ TEST_F(LdbCmdTest, BlobDBDumpFileChecksumNoChecksum) {
   CompactRangeOptions options;
   ASSERT_OK(db->CompactRange(options, &begin, &end));
   // Verify each sst file checksum after compaction
-  FileChecksumTestHelper fct_helper_ac(opts, db, dbname);
+  FileChecksumTestHelper fct_helper_ac(opts, db.get(), dbname);
   ASSERT_OK(fct_helper_ac.VerifyEachFileChecksum());
 
   ASSERT_OK(db->Close());
-  delete db;
+  db.reset();
 
   ASSERT_EQ(0,
             LDBCommandRunner::RunCommand(4, argv, opts, LDBOptions(), nullptr));
@@ -457,7 +462,7 @@ TEST_F(LdbCmdTest, DumpFileChecksumCRC32) {
   opts.create_if_missing = true;
   opts.file_checksum_gen_factory = GetFileChecksumGenCrc32cFactory();
 
-  DB* db = nullptr;
+  std::unique_ptr<DB> db;
   std::string dbname = test::PerThreadDBPath(env.get(), "ldb_cmd_test");
   ASSERT_OK(DB::Open(opts, dbname, &db));
 
@@ -494,7 +499,7 @@ TEST_F(LdbCmdTest, DumpFileChecksumCRC32) {
   }
   ASSERT_OK(db->Flush(fopts));
   ASSERT_OK(db->Close());
-  delete db;
+  db.reset();
 
   char arg1[] = "./ldb";
   char arg2[1024];
@@ -509,7 +514,7 @@ TEST_F(LdbCmdTest, DumpFileChecksumCRC32) {
   ASSERT_OK(DB::Open(opts, dbname, &db));
 
   // Verify each sst file checksum value and checksum name
-  FileChecksumTestHelper fct_helper(opts, db, dbname);
+  FileChecksumTestHelper fct_helper(opts, db.get(), dbname);
   ASSERT_OK(fct_helper.VerifyEachFileChecksum());
 
   // Manually trigger compaction
@@ -522,11 +527,11 @@ TEST_F(LdbCmdTest, DumpFileChecksumCRC32) {
   CompactRangeOptions options;
   ASSERT_OK(db->CompactRange(options, &begin, &end));
   // Verify each sst file checksum after compaction
-  FileChecksumTestHelper fct_helper_ac(opts, db, dbname);
+  FileChecksumTestHelper fct_helper_ac(opts, db.get(), dbname);
   ASSERT_OK(fct_helper_ac.VerifyEachFileChecksum());
 
   ASSERT_OK(db->Close());
-  delete db;
+  db.reset();
 
   ASSERT_EQ(0,
             LDBCommandRunner::RunCommand(4, argv, opts, LDBOptions(), nullptr));
@@ -539,7 +544,7 @@ TEST_F(LdbCmdTest, DumpFileChecksumCRC32) {
   ASSERT_OK(fct_helper_ac.VerifyChecksumInManifest(live_files));
 
   ASSERT_OK(db->Close());
-  delete db;
+  db.reset();
 }
 
 TEST_F(LdbCmdTest, BlobDBDumpFileChecksumCRC32) {
@@ -551,7 +556,7 @@ TEST_F(LdbCmdTest, BlobDBDumpFileChecksumCRC32) {
   opts.file_checksum_gen_factory = GetFileChecksumGenCrc32cFactory();
   opts.enable_blob_files = true;
 
-  DB* db = nullptr;
+  std::unique_ptr<DB> db;
   std::string dbname = test::PerThreadDBPath(env.get(), "ldb_cmd_test");
   ASSERT_OK(DB::Open(opts, dbname, &db));
 
@@ -588,7 +593,7 @@ TEST_F(LdbCmdTest, BlobDBDumpFileChecksumCRC32) {
   }
   ASSERT_OK(db->Flush(fopts));
   ASSERT_OK(db->Close());
-  delete db;
+  db.reset();
 
   char arg1[] = "./ldb";
   std::string arg2_str = "--db=" + dbname;
@@ -602,7 +607,7 @@ TEST_F(LdbCmdTest, BlobDBDumpFileChecksumCRC32) {
   ASSERT_OK(DB::Open(opts, dbname, &db));
 
   // Verify each sst and blob file checksum value and checksum name
-  FileChecksumTestHelper fct_helper(opts, db, dbname);
+  FileChecksumTestHelper fct_helper(opts, db.get(), dbname);
   ASSERT_OK(fct_helper.VerifyEachFileChecksum());
 
   // Manually trigger compaction
@@ -618,11 +623,11 @@ TEST_F(LdbCmdTest, BlobDBDumpFileChecksumCRC32) {
   CompactRangeOptions options;
   ASSERT_OK(db->CompactRange(options, &begin, &end));
   // Verify each sst file checksum after compaction
-  FileChecksumTestHelper fct_helper_ac(opts, db, dbname);
+  FileChecksumTestHelper fct_helper_ac(opts, db.get(), dbname);
   ASSERT_OK(fct_helper_ac.VerifyEachFileChecksum());
 
   ASSERT_OK(db->Close());
-  delete db;
+  db.reset();
 
   ASSERT_EQ(0,
             LDBCommandRunner::RunCommand(4, argv, opts, LDBOptions(), nullptr));
@@ -634,9 +639,9 @@ TEST_F(LdbCmdTest, OptionParsing) {
   opts.env = TryLoadCustomOrDefaultEnv();
   {
     std::vector<std::string> args;
-    args.push_back("scan");
-    args.push_back("--ttl");
-    args.push_back("--timestamp");
+    args.emplace_back("scan");
+    args.emplace_back("--ttl");
+    args.emplace_back("--timestamp");
     LDBCommand* command = ROCKSDB_NAMESPACE::LDBCommand::InitFromCmdLineArgs(
         args, opts, LDBOptions(), nullptr);
     const std::vector<std::string> flags = command->TEST_GetFlags();
@@ -648,9 +653,9 @@ TEST_F(LdbCmdTest, OptionParsing) {
   // test parsing options which contains equal sign in the option value
   {
     std::vector<std::string> args;
-    args.push_back("scan");
-    args.push_back("--db=/dev/shm/ldbtest/");
-    args.push_back(
+    args.emplace_back("scan");
+    args.emplace_back("--db=/dev/shm/ldbtest/");
+    args.emplace_back(
         "--from='abcd/efg/hijk/lmn/"
         "opq:__rst.uvw.xyz?a=3+4+bcd+efghi&jk=lm_no&pq=rst-0&uv=wx-8&yz=a&bcd_"
         "ef=gh.ijk'");
@@ -674,7 +679,7 @@ TEST_F(LdbCmdTest, ListFileTombstone) {
   opts.env = env.get();
   opts.create_if_missing = true;
 
-  DB* db = nullptr;
+  std::unique_ptr<DB> db;
   std::string dbname = test::PerThreadDBPath(env.get(), "ldb_cmd_test");
   ASSERT_OK(DB::Open(opts, dbname, &db));
 
@@ -690,7 +695,7 @@ TEST_F(LdbCmdTest, ListFileTombstone) {
   ASSERT_OK(db->DeleteRange(wopts, db->DefaultColumnFamily(), "bar", "foo2"));
   ASSERT_OK(db->Flush(fopts));
 
-  delete db;
+  db.reset();
 
   {
     char arg1[] = "./ldb";
@@ -701,7 +706,7 @@ TEST_F(LdbCmdTest, ListFileTombstone) {
 
     ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
         "ListFileRangeDeletesCommand::DoCommand:BeforePrint", [&](void* arg) {
-          std::string* out_str = reinterpret_cast<std::string*>(arg);
+          std::string* out_str = static_cast<std::string*>(arg);
 
           // Count number of tombstones printed
           int num_tb = 0;
@@ -734,7 +739,7 @@ TEST_F(LdbCmdTest, ListFileTombstone) {
 
     ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
         "ListFileRangeDeletesCommand::DoCommand:BeforePrint", [&](void* arg) {
-          std::string* out_str = reinterpret_cast<std::string*>(arg);
+          std::string* out_str = static_cast<std::string*>(arg);
 
           // Count number of tombstones printed
           int num_tb = 0;
@@ -767,7 +772,7 @@ TEST_F(LdbCmdTest, DisableConsistencyChecks) {
   std::string dbname = test::PerThreadDBPath(env.get(), "ldb_cmd_test");
 
   {
-    DB* db = nullptr;
+    std::unique_ptr<DB> db;
     ASSERT_OK(DB::Open(opts, dbname, &db));
 
     WriteOptions wopts;
@@ -781,8 +786,6 @@ TEST_F(LdbCmdTest, DisableConsistencyChecks) {
     ASSERT_OK(db->Put(wopts, "foo2", "3"));
     ASSERT_OK(db->Put(wopts, "bar2", "4"));
     ASSERT_OK(db->Flush(fopts));
-
-    delete db;
   }
 
   {
@@ -794,7 +797,7 @@ TEST_F(LdbCmdTest, DisableConsistencyChecks) {
 
     SyncPoint::GetInstance()->SetCallBack(
         "Version::PrepareAppend:forced_check", [&](void* arg) {
-          bool* forced = reinterpret_cast<bool*>(arg);
+          bool* forced = static_cast<bool*>(arg);
           ASSERT_TRUE(*forced);
         });
     SyncPoint::GetInstance()->EnableProcessing();
@@ -814,7 +817,7 @@ TEST_F(LdbCmdTest, DisableConsistencyChecks) {
 
     SyncPoint::GetInstance()->SetCallBack(
         "Version::PrepareAppend:forced_check", [&](void* arg) {
-          bool* forced = reinterpret_cast<bool*>(arg);
+          bool* forced = static_cast<bool*>(arg);
           ASSERT_TRUE(*forced);
         });
     SyncPoint::GetInstance()->EnableProcessing();
@@ -835,8 +838,7 @@ TEST_F(LdbCmdTest, DisableConsistencyChecks) {
 
     SyncPoint::GetInstance()->SetCallBack(
         "ColumnFamilyData::ColumnFamilyData", [&](void* arg) {
-          ColumnFamilyOptions* cfo =
-              reinterpret_cast<ColumnFamilyOptions*>(arg);
+          ColumnFamilyOptions* cfo = static_cast<ColumnFamilyOptions*>(arg);
           ASSERT_FALSE(cfo->force_consistency_checks);
         });
     SyncPoint::GetInstance()->EnableProcessing();
@@ -887,7 +889,7 @@ TEST_F(LdbCmdTest, LoadCFOptionsAndOverride) {
   opts.env = env.get();
   opts.create_if_missing = true;
 
-  DB* db = nullptr;
+  std::unique_ptr<DB> db;
   std::string dbname = test::PerThreadDBPath(env.get(), "ldb_cmd_test");
   ASSERT_OK(DestroyDB(dbname, opts));
   ASSERT_OK(DB::Open(opts, dbname, &db));
@@ -898,7 +900,7 @@ TEST_F(LdbCmdTest, LoadCFOptionsAndOverride) {
   ASSERT_OK(db->CreateColumnFamily(cf_opts, "cf1", &cf_handle));
 
   delete cf_handle;
-  delete db;
+  db.reset();
 
   char arg1[] = "./ldb";
   char arg2[1024];
@@ -930,7 +932,7 @@ TEST_F(LdbCmdTest, UnsafeRemoveSstFile) {
   opts.level0_file_num_compaction_trigger = 10;
   opts.create_if_missing = true;
 
-  DB* db = nullptr;
+  std::unique_ptr<DB> db;
   std::string dbname = test::PerThreadDBPath(Env::Default(), "ldb_cmd_test");
   ASSERT_OK(DestroyDB(dbname, opts));
   ASSERT_OK(DB::Open(opts, dbname, &db));
@@ -954,8 +956,7 @@ TEST_F(LdbCmdTest, UnsafeRemoveSstFile) {
   uint64_t to_remove = numbers[1];
 
   // Close for unsafe_remove_sst_file
-  delete db;
-  db = nullptr;
+  db.reset();
 
   char arg1[] = "./ldb";
   char arg2[1024];
@@ -1004,8 +1005,7 @@ TEST_F(LdbCmdTest, UnsafeRemoveSstFile) {
 
   // Close for unsafe_remove_sst_file
   delete cf_handle;
-  delete db;
-  db = nullptr;
+  db.reset();
 
   snprintf(arg4, sizeof(arg4), "%" PRIu64, to_remove);
   ASSERT_EQ(0,
@@ -1046,8 +1046,7 @@ TEST_F(LdbCmdTest, UnsafeRemoveSstFile) {
   for (auto& h : handles) {
     delete h;
   }
-  delete db;
-  db = nullptr;
+  db.reset();
 
   snprintf(arg4, sizeof(arg4), "%" PRIu64, to_remove);
   ASSERT_EQ(0,
@@ -1063,19 +1062,19 @@ TEST_F(LdbCmdTest, UnsafeRemoveSstFile) {
   for (auto& h : handles) {
     delete h;
   }
-  delete db;
+  db.reset();
 }
 
 TEST_F(LdbCmdTest, FileTemperatureUpdateManifest) {
   auto test_fs = std::make_shared<FileTemperatureTestFS>(FileSystem::Default());
   std::unique_ptr<Env> env(new CompositeEnvWrapper(Env::Default(), test_fs));
   Options opts;
-  opts.bottommost_temperature = Temperature::kWarm;
+  opts.last_level_temperature = Temperature::kWarm;
   opts.level0_file_num_compaction_trigger = 10;
   opts.create_if_missing = true;
   opts.env = env.get();
 
-  DB* db = nullptr;
+  std::unique_ptr<DB> db;
   std::string dbname = test::PerThreadDBPath(env.get(), "ldb_cmd_test");
   ASSERT_OK(DestroyDB(dbname, opts));
   ASSERT_OK(DB::Open(opts, dbname, &db));
@@ -1099,8 +1098,7 @@ TEST_F(LdbCmdTest, FileTemperatureUpdateManifest) {
   }
 
   // Close & reopen
-  delete db;
-  db = nullptr;
+  db.reset();
   test_fs->PopRequestedSstFileTemperatures();
   ASSERT_OK(DB::Open(opts, dbname, &db));
 
@@ -1119,8 +1117,7 @@ TEST_F(LdbCmdTest, FileTemperatureUpdateManifest) {
   }
 
   // Close for update_manifest
-  delete db;
-  db = nullptr;
+  db.reset();
 
   char arg1[] = "./ldb";
   char arg2[1024];
@@ -1148,7 +1145,7 @@ TEST_F(LdbCmdTest, FileTemperatureUpdateManifest) {
   for (auto& r : requests) {
     ASSERT_EQ(r.second, number_to_temp[r.first]);
   }
-  delete db;
+  db.reset();
 }
 
 TEST_F(LdbCmdTest, RenameDbAndLoadOptions) {
@@ -1207,6 +1204,51 @@ TEST_F(LdbCmdTest, RenameDbAndLoadOptions) {
   ASSERT_OK(DestroyDB(new_dbname, opts));
 }
 
+class MyComparator : public Comparator {
+ public:
+  int Compare(const Slice& a, const Slice& b) const override {
+    return a.compare(b);
+  }
+  void FindShortSuccessor(std::string* /*key*/) const override {}
+  void FindShortestSeparator(std::string* /*start*/,
+                             const Slice& /*limit*/) const override {}
+  const char* Name() const override { return "my_comparator"; }
+};
+
+TEST_F(LdbCmdTest, CustomComparator) {
+  Env* env = TryLoadCustomOrDefaultEnv();
+  MyComparator my_comparator;
+  Options opts;
+  opts.env = env;
+  opts.create_if_missing = true;
+  opts.create_missing_column_families = true;
+  opts.comparator = &my_comparator;
+
+  std::string dbname = test::PerThreadDBPath(env, "ldb_cmd_test");
+  std::unique_ptr<DB> db;
+
+  std::vector<ColumnFamilyDescriptor> cfds = {
+      {kDefaultColumnFamilyName, opts}, {"cf1", opts}, {"cf2", opts}};
+  std::vector<ColumnFamilyHandle*> handles;
+  ASSERT_OK(DestroyDB(dbname, opts));
+  ASSERT_OK(DB::Open(opts, dbname, cfds, &handles, &db));
+  ASSERT_OK(db->Put(WriteOptions(), "k1", "v1"));
+
+  for (auto& h : handles) {
+    ASSERT_OK(db->DestroyColumnFamilyHandle(h));
+  }
+  db.reset();
+
+  char arg1[] = "./ldb";
+  std::string arg2 = "--db=" + dbname;
+  char arg3[] = "get";
+  char arg4[] = "k1";
+  char* argv[] = {arg1, const_cast<char*>(arg2.c_str()), arg3, arg4};
+
+  ASSERT_EQ(0,
+            LDBCommandRunner::RunCommand(4, argv, opts, LDBOptions(), &cfds));
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
@@ -1215,12 +1257,3 @@ int main(int argc, char** argv) {
   RegisterCustomObjects(argc, argv);
   return RUN_ALL_TESTS();
 }
-#else
-#include <stdio.h>
-
-int main(int /*argc*/, char** /*argv*/) {
-  fprintf(stderr, "SKIPPED as LDBCommand is not supported in ROCKSDB_LITE\n");
-  return 0;
-}
-
-#endif  // ROCKSDB_LITE

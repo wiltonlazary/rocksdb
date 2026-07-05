@@ -4,7 +4,6 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #pragma once
-#ifndef ROCKSDB_LITE
 #include <stdint.h>
 
 #include <limits>
@@ -134,5 +133,3 @@ class CuckooTableBuilder : public TableBuilder {
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-
-#endif  // ROCKSDB_LITE

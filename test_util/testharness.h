@@ -51,6 +51,11 @@
     GTEST_SUCCESS_("BYPASSED: " m);     \
   } while (false) /* user ; */
 
+// Avoid "loss of precision" warnings when passing in 64-bit integers
+#define EXPECT_NEAR2(val1, val2, abs_error)                         \
+  EXPECT_NEAR(static_cast<double>(val1), static_cast<double>(val2), \
+              static_cast<double>(abs_error))
+
 #include <string>
 
 #include "port/stack_trace.h"
@@ -71,6 +76,12 @@ std::string PerThreadDBPath(std::string dir, std::string name);
 // same number on repeated invocations of this binary, but automated
 // runs may be able to vary the seed.
 int RandomSeed();
+
+// Returns true if the system has enough memory to run expensive
+// large-allocation tests (~128GB+ RAM or environment variable
+// ROCKSDB_BIGMEM_TESTS is set). There should generally be only one "big mem"
+// test per unit test file, to reduce OOM risks in parallel runs.
+bool HasBigMem();
 
 ::testing::AssertionResult AssertStatus(const char* s_expr, const Status& s);
 

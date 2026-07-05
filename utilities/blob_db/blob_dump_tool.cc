@@ -2,13 +2,11 @@
 //  This source code is licensed under both the GPLv2 (found in the
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
-#ifndef ROCKSDB_LITE
 
 #include "utilities/blob_db/blob_dump_tool.h"
 
-#include <stdio.h>
-
 #include <cinttypes>
+#include <cstdio>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -16,14 +14,14 @@
 #include "file/random_access_file_reader.h"
 #include "file/readahead_raf.h"
 #include "port/port.h"
+#include "rocksdb/advanced_compression.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/file_system.h"
 #include "table/format.h"
 #include "util/coding.h"
 #include "util/string_util.h"
 
-namespace ROCKSDB_NAMESPACE {
-namespace blob_db {
+namespace ROCKSDB_NAMESPACE::blob_db {
 
 BlobDumpTool::BlobDumpTool()
     : reader_(nullptr), buffer_(nullptr), buffer_size_(0) {}
@@ -103,8 +101,8 @@ Status BlobDumpTool::Read(uint64_t offset, size_t size, Slice* result) {
     }
     buffer_.reset(new char[buffer_size_]);
   }
-  Status s = reader_->Read(IOOptions(), offset, size, result, buffer_.get(),
-                           nullptr, Env::IO_TOTAL /* rate_limiter_priority */);
+  Status s =
+      reader_->Read(IOOptions(), offset, size, result, buffer_.get(), nullptr);
   if (!s.ok()) {
     return s;
   }
@@ -209,17 +207,26 @@ Status BlobDumpTool::DumpRecord(DisplayType show_key, DisplayType show_blob,
   std::string uncompressed_value;
   if (compression != kNoCompression &&
       (show_uncompressed_blob != DisplayType::kNone || show_summary)) {
-    BlockContents contents;
-    UncompressionContext context(compression);
-    UncompressionInfo info(context, UncompressionDict::GetEmptyDict(),
-                           compression);
-    s = UncompressBlockData(
-        info, slice.data() + key_size, static_cast<size_t>(value_size),
-        &contents, 2 /*compress_format_version*/, ImmutableOptions(Options()));
+    auto decompressor =
+        GetBuiltinV2CompressionManager()->GetDecompressorOptimizeFor(
+            compression);
+    if (!decompressor) {
+      return Status::NotSupported("Unsupported compression type");
+    }
+    Slice compressed_data(slice.data() + key_size,
+                          static_cast<size_t>(value_size));
+    Decompressor::Args args;
+    args.compression_type = compression;
+    args.compressed_data = compressed_data;
+    s = decompressor->ExtractUncompressedSize(args);
     if (!s.ok()) {
       return s;
     }
-    uncompressed_value = contents.data.ToString();
+    uncompressed_value.resize(args.uncompressed_size);
+    s = decompressor->DecompressBlock(args, uncompressed_value.data());
+    if (!s.ok()) {
+      return s;
+    }
   }
   if (show_key != DisplayType::kNone) {
     fprintf(stdout, "  key        : ");
@@ -276,7 +283,4 @@ std::string BlobDumpTool::GetString(std::pair<T, T> p) {
   return "(" + std::to_string(p.first) + ", " + std::to_string(p.second) + ")";
 }
 
-}  // namespace blob_db
-}  // namespace ROCKSDB_NAMESPACE
-
-#endif  // ROCKSDB_LITE
+}  // namespace ROCKSDB_NAMESPACE::blob_db

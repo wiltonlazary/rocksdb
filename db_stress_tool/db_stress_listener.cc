@@ -7,6 +7,7 @@
 
 #include <cstdint>
 
+#include "db_stress_tool/db_stress_test_base.h"
 #include "file/file_util.h"
 #include "rocksdb/file_system.h"
 #include "util/coding_lean.h"
@@ -14,12 +15,24 @@
 namespace ROCKSDB_NAMESPACE {
 
 #ifdef GFLAGS
-#ifndef ROCKSDB_LITE
 
-// TODO: consider using expected_values_dir instead, but this is more
-// convenient for now.
-UniqueIdVerifier::UniqueIdVerifier(const std::string& db_name, Env* env)
-    : path_(db_name + "/.unique_ids") {
+DbStressListener::DbStressListener(
+    const std::string& db_name, const std::vector<DbPath>& db_paths,
+    const std::vector<ColumnFamilyDescriptor>& column_families,
+    SharedState* shared)
+    : db_name_(db_name),
+      db_paths_(db_paths),
+      column_families_(column_families),
+      num_pending_file_creations_(0),
+      unique_ids_(shared->GetStressTest()->GetExpectedValuesDir().empty()
+                      ? db_name
+                      : shared->GetStressTest()->GetExpectedValuesDir()),
+      shared_(shared),
+      db_fault_injection_fs_(shared->GetStressTest()->GetDbFaultInjectionFs()) {
+}
+
+UniqueIdVerifier::UniqueIdVerifier(const std::string& dir)
+    : path_(dir + "/.unique_ids") {
   // We expect such a small number of files generated during this test
   // (thousands?), checking full 192-bit IDs for uniqueness is a very
   // weak check. For a stronger check, we pick a specific 64-bit
@@ -28,12 +41,15 @@ UniqueIdVerifier::UniqueIdVerifier(const std::string& db_name, Env* env)
   // very good probability for the quantities in this test.
   offset_ = Random::GetTLSInstance()->Uniform(17);  // 0 to 16
 
-  const std::shared_ptr<FileSystem> fs = env->GetFileSystem();
+  // Always use local (default) filesystem for this bookkeeping file,
+  // even when DB is on a remote/warm filesystem, to avoid issues with
+  // weaker durability guarantees on remote filesystems.
+  const std::shared_ptr<FileSystem> fs = Env::Default()->GetFileSystem();
   IOOptions opts;
 
-  Status st = fs->CreateDirIfMissing(db_name, opts, nullptr);
+  Status st = fs->CreateDirIfMissing(dir, opts, nullptr);
   if (!st.ok()) {
-    fprintf(stderr, "Failed to create directory %s: %s\n", db_name.c_str(),
+    fprintf(stderr, "Failed to create directory %s: %s\n", dir.c_str(),
             st.ToString().c_str());
     exit(1);
   }
@@ -68,7 +84,7 @@ UniqueIdVerifier::UniqueIdVerifier(const std::string& db_name, Env* env)
       std::string id(24U, '\0');
       Slice result;
       for (;;) {
-        s = reader->Read(id.size(), opts, &result, &id[0], /*dbg*/ nullptr);
+        s = reader->Read(id.size(), opts, &result, id.data(), /*dbg*/ nullptr);
         if (!s.ok()) {
           fprintf(stderr, "Error reading unique id file: %s\n",
                   s.ToString().c_str());
@@ -117,9 +133,9 @@ UniqueIdVerifier::UniqueIdVerifier(const std::string& db_name, Env* env)
       new WritableFileWriter(std::move(file_writer), path_, FileOptions()));
 
   if (size > 0) {
-    st = CopyFile(fs.get(), tmp_path, data_file_writer_, size,
-                  /*use_fsync*/ true, /*io_tracer*/ nullptr,
-                  /*temparature*/ Temperature::kHot);
+    st = CopyFile(fs.get(), tmp_path, Temperature::kUnknown, data_file_writer_,
+                  size,
+                  /*use_fsync*/ true, /*io_tracer*/ nullptr);
     if (!st.ok()) {
       fprintf(stderr, "Error copying contents of old unique id file: %s\n",
               st.ToString().c_str());
@@ -131,8 +147,13 @@ UniqueIdVerifier::UniqueIdVerifier(const std::string& db_name, Env* env)
 }
 
 UniqueIdVerifier::~UniqueIdVerifier() {
-  IOStatus s = data_file_writer_->Close();
+  ThreadStatus::OperationType cur_op_type =
+      ThreadStatusUtil::GetThreadOperation();
+  ThreadStatusUtil::SetThreadOperation(ThreadStatus::OperationType::OP_UNKNOWN);
+  IOStatus s;
+  s = data_file_writer_->Close(IOOptions());
   assert(s.ok());
+  ThreadStatusUtil::SetThreadOperation(cur_op_type);
 }
 
 void UniqueIdVerifier::VerifyNoWrite(const std::string& id) {
@@ -154,13 +175,14 @@ void UniqueIdVerifier::Verify(const std::string& id) {
   if (id_set_.size() >= 4294967) {
     return;
   }
-  IOStatus s = data_file_writer_->Append(Slice(id));
+  IOOptions opts;
+  IOStatus s = data_file_writer_->Append(opts, Slice(id));
   if (!s.ok()) {
     fprintf(stderr, "Error writing to unique id file: %s\n",
             s.ToString().c_str());
     assert(false);
   }
-  s = data_file_writer_->Flush();
+  s = data_file_writer_->Flush(opts);
   if (!s.ok()) {
     fprintf(stderr, "Error flushing unique id file: %s\n",
             s.ToString().c_str());
@@ -185,7 +207,6 @@ void DbStressListener::VerifyTableFileUniqueId(
   unique_ids_.Verify(id);
 }
 
-#endif  // !ROCKSDB_LITE
 #endif  // GFLAGS
 
 }  // namespace ROCKSDB_NAMESPACE

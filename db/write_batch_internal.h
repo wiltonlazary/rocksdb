@@ -77,7 +77,6 @@ struct WriteBatch::ProtectionInfo {
 // WriteBatch that we don't want in the public WriteBatch interface.
 class WriteBatchInternal {
  public:
-
   // WriteBatch header has an 8-byte sequence number followed by a 4-byte count.
   static constexpr size_t kHeader = 12;
 
@@ -88,8 +87,19 @@ class WriteBatchInternal {
   static Status Put(WriteBatch* batch, uint32_t column_family_id,
                     const SliceParts& key, const SliceParts& value);
 
+  static Status TimedPut(WriteBatch* batch, uint32_t column_family_id,
+                         const Slice& key, const Slice& value,
+                         uint64_t unix_write_time);
+
   static Status PutEntity(WriteBatch* batch, uint32_t column_family_id,
                           const Slice& key, const WideColumns& columns);
+
+  // Appends an already-serialized wide-column entity. This is used by
+  // WriteBatch handlers that need to preserve the original entity bytes
+  // without a deserialize/re-serialize round-trip.
+  static Status PutEntitySerialized(WriteBatch* batch,
+                                    uint32_t column_family_id, const Slice& key,
+                                    const Slice& entity);
 
   static Status Delete(WriteBatch* batch, uint32_t column_family_id,
                        const SliceParts& key);
@@ -118,6 +128,15 @@ class WriteBatchInternal {
 
   static Status PutBlobIndex(WriteBatch* batch, uint32_t column_family_id,
                              const Slice& key, const Slice& value);
+
+  static ValueType GetBeginPrepareType(bool write_after_commit,
+                                       bool unprepared_batch);
+
+  static Status InsertBeginPrepare(WriteBatch* batch,
+                                   const bool write_after_commit = true,
+                                   bool unprepared_batch = false);
+
+  static Status InsertEndPrepare(WriteBatch* batch, const Slice& xid);
 
   static Status MarkEndPrepare(WriteBatch* batch, const Slice& xid,
                                const bool write_after_commit = true,
@@ -149,13 +168,9 @@ class WriteBatchInternal {
   // This offset is only valid if the batch is not empty.
   static size_t GetFirstOffset(WriteBatch* batch);
 
-  static Slice Contents(const WriteBatch* batch) {
-    return Slice(batch->rep_);
-  }
+  static Slice Contents(const WriteBatch* batch) { return Slice(batch->rep_); }
 
-  static size_t ByteSize(const WriteBatch* batch) {
-    return batch->rep_.size();
-  }
+  static size_t ByteSize(const WriteBatch* batch) { return batch->rep_.size(); }
 
   static Status SetContents(WriteBatch* batch, const Slice& contents);
 
@@ -177,18 +192,19 @@ class WriteBatchInternal {
   // If flush_scheduler is non-null, it will be invoked if the memtable
   // should be flushed.
   //
-  // Under concurrent use, the caller is responsible for making sure that
-  // the memtables object itself is thread-local.
+  // This overload is for non-concurrent insertion only.
   static Status InsertInto(
       WriteThread::WriteGroup& write_group, SequenceNumber sequence,
       ColumnFamilyMemTables* memtables, FlushScheduler* flush_scheduler,
       TrimHistoryScheduler* trim_history_scheduler,
       bool ignore_missing_column_families = false, uint64_t log_number = 0,
-      DB* db = nullptr, bool concurrent_memtable_writes = false,
-      bool seq_per_batch = false, bool batch_per_txn = true);
+      DB* db = nullptr, bool seq_per_batch = false, bool batch_per_txn = true);
 
   // Convenience form of InsertInto when you have only one batch
   // next_seq returns the seq after last sequence number used in MemTable insert
+  //
+  // Under concurrent use, the caller is responsible for making sure that
+  // the memtables object itself is thread-local.
   static Status InsertInto(
       const WriteBatch* batch, ColumnFamilyMemTables* memtables,
       FlushScheduler* flush_scheduler,
@@ -228,6 +244,9 @@ class WriteBatchInternal {
   // state meant to be used only during recovery.
   static void SetAsLatestPersistentState(WriteBatch* b);
   static bool IsLatestPersistentState(const WriteBatch* b);
+
+  static void SetDefaultColumnFamilyTimestampSize(WriteBatch* wb,
+                                                  size_t default_cf_ts_sz);
 
   static std::tuple<Status, uint32_t, size_t> GetColumnFamilyIdAndTimestampSize(
       WriteBatch* b, ColumnFamilyHandle* column_family);

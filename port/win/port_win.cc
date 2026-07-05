@@ -36,7 +36,7 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-extern const bool kDefaultToAdaptiveMutex = false;
+const bool kDefaultToAdaptiveMutex = false;
 
 namespace port {
 
@@ -101,8 +101,9 @@ bool CondVar::TimedWait(uint64_t abs_time_us) {
   std::unique_lock<std::mutex> lk(mu_->getLock(), std::adopt_lock);
 
   // Work around https://github.com/microsoft/STL/issues/369
-#if defined(_MSC_VER) && \
-    (!defined(_MSVC_STL_UPDATE) || _MSVC_STL_UPDATE < 202008L)
+  // std::condition_variable_any::wait_for had a fix, but
+  // std::condition_variable still doesn't have a fix in STL yet
+#if defined(_MSC_VER)
   if (relTimeUs == std::chrono::microseconds::zero()) {
     lk.unlock();
     lk.lock();
@@ -265,6 +266,8 @@ void Crash(const std::string& srcfile, int srcline) {
   abort();
 }
 
+void ImmediateExit(int code) { _exit(code); }
+
 int GetMaxOpenFiles() { return -1; }
 
 // Assume 4KB page size
@@ -288,7 +291,8 @@ bool GenerateRfcUuid(std::string* output) {
     return false;
   }
 
-  // rpc_str is nul-terminated
+  // rpc_str is nul-terminated.
+  // reinterpret_cast for possible change between signed/unsigned char.
   *output = reinterpret_cast<char*>(rpc_str);
 
   status = RpcStringFreeA(&rpc_str);

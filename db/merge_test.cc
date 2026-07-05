@@ -3,13 +3,13 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 //
-#include <assert.h>
-
+#include <cassert>
 #include <iostream>
 #include <memory>
 
 #include "db/db_impl/db_impl.h"
 #include "db/dbformat.h"
+#include "db/merge_helper.h"
 #include "db/write_batch_internal.h"
 #include "port/stack_trace.h"
 #include "rocksdb/cache.h"
@@ -18,7 +18,9 @@
 #include "rocksdb/env.h"
 #include "rocksdb/merge_operator.h"
 #include "rocksdb/utilities/db_ttl.h"
+#include "rocksdb/wide_columns.h"
 #include "test_util/testharness.h"
+#include "util/cast_util.h"
 #include "util/coding.h"
 #include "utilities/merge_operators.h"
 
@@ -86,7 +88,9 @@ class EnvMergeTest : public EnvWrapper {
   static std::unique_ptr<EnvMergeTest> singleton_;
 
   static EnvMergeTest* GetInstance() {
-    if (nullptr == singleton_) singleton_.reset(new EnvMergeTest);
+    if (nullptr == singleton_) {
+      singleton_.reset(new EnvMergeTest);
+    }
     return singleton_.get();
   }
 };
@@ -94,9 +98,9 @@ class EnvMergeTest : public EnvWrapper {
 uint64_t EnvMergeTest::now_nanos_count_{0};
 std::unique_ptr<EnvMergeTest> EnvMergeTest::singleton_;
 
-std::shared_ptr<DB> OpenDb(const std::string& dbname, const bool ttl = false,
+std::unique_ptr<DB> OpenDb(const std::string& dbname, const bool ttl = false,
                            const size_t max_successive_merges = 0) {
-  DB* db;
+  std::unique_ptr<DB> db;
   Options options;
   options.create_if_missing = true;
   options.merge_operator = std::make_shared<CountMergeOperator>();
@@ -104,25 +108,19 @@ std::shared_ptr<DB> OpenDb(const std::string& dbname, const bool ttl = false,
   options.env = EnvMergeTest::GetInstance();
   EXPECT_OK(DestroyDB(dbname, Options()));
   Status s;
-// DBWithTTL is not supported in ROCKSDB_LITE
-#ifndef ROCKSDB_LITE
   if (ttl) {
     DBWithTTL* db_with_ttl;
     s = DBWithTTL::Open(options, dbname, &db_with_ttl);
-    db = db_with_ttl;
+    db.reset(db_with_ttl);
   } else {
     s = DB::Open(options, dbname, &db);
   }
-#else
-  assert(!ttl);
-  s = DB::Open(options, dbname, &db);
-#endif  // !ROCKSDB_LITE
   EXPECT_OK(s);
   assert(s.ok());
   // Allowed to call NowNanos during DB creation (in GenerateRawUniqueId() for
   // session ID)
   EnvMergeTest::now_nanos_count_ = 0;
-  return std::shared_ptr<DB>(db);
+  return db;
 }
 
 // Imagine we are maintaining a set of uint64 counters.
@@ -132,7 +130,7 @@ std::shared_ptr<DB> OpenDb(const std::string& dbname, const bool ttl = false,
 // This is a quick implementation without a Merge operation.
 class Counters {
  protected:
-  std::shared_ptr<DB> db_;
+  UnownedPtr<DB> db_;
 
   WriteOptions put_option_;
   ReadOptions get_option_;
@@ -141,7 +139,7 @@ class Counters {
   uint64_t default_;
 
  public:
-  explicit Counters(std::shared_ptr<DB> db, uint64_t defaultCount = 0)
+  explicit Counters(UnownedPtr<DB> db, uint64_t defaultCount = 0)
       : db_(db),
         put_option_(),
         get_option_(),
@@ -150,7 +148,7 @@ class Counters {
     assert(db_);
   }
 
-  virtual ~Counters() {}
+  virtual ~Counters() = default;
 
   // public interface of Counters.
   // All four functions return false
@@ -199,7 +197,7 @@ class Counters {
         std::cerr << "value corruption\n";
         return false;
       }
-      *value = DecodeFixed64(&str[0]);
+      *value = DecodeFixed64(str.data());
       return true;
     } else {
       std::cerr << s.ToString() << std::endl;
@@ -225,14 +223,18 @@ class Counters {
     uint64_t value = default_;
     int result = get(key, &value);
     assert(result);
-    if (result == 0) exit(1);  // Disable unused variable warning.
+    if (result == 0) {
+      exit(1);  // Disable unused variable warning.
+    }
     return value;
   }
 
   void assert_add(const std::string& key, uint64_t value) {
     int result = add(key, value);
     assert(result);
-    if (result == 0) exit(1);  // Disable unused variable warning.
+    if (result == 0) {
+      exit(1);  // Disable unused variable warning.
+    }
   }
 };
 
@@ -242,7 +244,7 @@ class MergeBasedCounters : public Counters {
   WriteOptions merge_option_;  // for merge
 
  public:
-  explicit MergeBasedCounters(std::shared_ptr<DB> db, uint64_t defaultCount = 0)
+  explicit MergeBasedCounters(UnownedPtr<DB> db, uint64_t defaultCount = 0)
       : Counters(db, defaultCount), merge_option_() {}
 
   // mapped to a rocksdb Merge operation
@@ -261,7 +263,7 @@ class MergeBasedCounters : public Counters {
   }
 };
 
-void dumpDb(DB* db) {
+void dumpDb(const std::unique_ptr<DB>& db) {
   auto it = std::unique_ptr<Iterator>(db->NewIterator(ReadOptions()));
   for (it->SeekToFirst(); it->Valid(); it->Next()) {
     // uint64_t value = DecodeFixed64(it->value().data());
@@ -270,7 +272,8 @@ void dumpDb(DB* db) {
   assert(it->status().ok());  // Check for any errors found during the scan
 }
 
-void testCounters(Counters& counters, DB* db, bool test_compaction) {
+void testCounters(Counters& counters, const std::unique_ptr<DB>& db,
+                  bool test_compaction) {
   FlushOptions o;
   o.wait = true;
 
@@ -320,7 +323,8 @@ void testCounters(Counters& counters, DB* db, bool test_compaction) {
   }
 }
 
-void testCountersWithFlushAndCompaction(Counters& counters, DB* db) {
+void testCountersWithFlushAndCompaction(Counters& counters,
+                                        const std::unique_ptr<DB>& db) {
   ASSERT_OK(db->Put({}, "1", "1"));
   ASSERT_OK(db->Flush(FlushOptions()));
 
@@ -354,7 +358,7 @@ void testCountersWithFlushAndCompaction(Counters& counters, DB* db) {
       });
   SyncPoint::GetInstance()->SetCallBack(
       "VersionSet::LogAndApply:WakeUpAndDone", [&](void* arg) {
-        auto* mutex = reinterpret_cast<InstrumentedMutex*>(arg);
+        auto* mutex = static_cast<InstrumentedMutex*>(arg);
         mutex->AssertHeld();
         int thread_id = get_thread_id();
         ASSERT_EQ(2, thread_id);
@@ -377,15 +381,23 @@ void testCountersWithFlushAndCompaction(Counters& counters, DB* db) {
       {"testCountersWithFlushAndCompaction:AfterGet",
        "testCountersWithFlushAndCompaction::bg_flush_thread:2"},
   });
+  // This test relies on old behavior of SetOptions writing to the
+  // manifest. Here we restore that old behavior for reproducer purposes.
+  // (Brief attempts to use an alternative to SetOptions failed.)
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SetOptions:dummy_edit", [&](void* arg) {
+        auto* dummy_edit = static_cast<VersionEdit*>(arg);
+        dummy_edit->Clear();
+      });
   SyncPoint::GetInstance()->EnableProcessing();
 
   port::Thread set_options_thread([&]() {
-    ASSERT_OK(reinterpret_cast<DBImpl*>(db)->SetOptions(
+    ASSERT_OK(static_cast_with_check<DBImpl>(db.get())->SetOptions(
         {{"disable_auto_compactions", "false"}}));
   });
   TEST_SYNC_POINT("testCountersWithCompactionAndFlush:BeforeCompact");
   port::Thread compact_thread([&]() {
-    ASSERT_OK(reinterpret_cast<DBImpl*>(db)->CompactRange(
+    ASSERT_OK(static_cast_with_check<DBImpl>(db.get())->CompactRange(
         CompactRangeOptions(), db->DefaultColumnFamily(), nullptr, nullptr));
   });
 
@@ -432,8 +444,8 @@ void testSuccessiveMerge(Counters& counters, size_t max_num_merges,
   }
 }
 
-void testPartialMerge(Counters* counters, DB* db, size_t max_merge,
-                      size_t min_merge, size_t count) {
+void testPartialMerge(Counters* counters, const std::unique_ptr<DB>& db,
+                      size_t max_merge, size_t min_merge, size_t count) {
   FlushOptions o;
   o.wait = true;
 
@@ -473,8 +485,8 @@ void testPartialMerge(Counters* counters, DB* db, size_t max_merge,
   ASSERT_EQ(EnvMergeTest::now_nanos_count_, 0U);
 }
 
-void testSingleBatchSuccessiveMerge(DB* db, size_t max_num_merges,
-                                    size_t num_merges) {
+void testSingleBatchSuccessiveMerge(const std::unique_ptr<DB>& db,
+                                    size_t max_num_merges, size_t num_merges) {
   ASSERT_GT(num_merges, max_num_merges);
 
   Slice key("BatchSuccessiveMerge");
@@ -501,7 +513,7 @@ void testSingleBatchSuccessiveMerge(DB* db, size_t max_num_merges,
   std::string get_value_str;
   ASSERT_OK(db->Get(ReadOptions(), key, &get_value_str));
   assert(get_value_str.size() == sizeof(uint64_t));
-  uint64_t get_value = DecodeFixed64(&get_value_str[0]);
+  uint64_t get_value = DecodeFixed64(get_value_str.data());
   ASSERT_EQ(get_value, num_merges * merge_value);
   ASSERT_EQ(num_merge_operator_calls,
             static_cast<size_t>((num_merges % (max_num_merges + 1))));
@@ -512,13 +524,13 @@ void runTest(const std::string& dbname, const bool use_ttl = false) {
     auto db = OpenDb(dbname, use_ttl);
 
     {
-      Counters counters(db, 0);
-      testCounters(counters, db.get(), true);
+      Counters counters(db.get(), 0);
+      testCounters(counters, db, true);
     }
 
     {
-      MergeBasedCounters counters(db, 0);
-      testCounters(counters, db.get(), use_compression);
+      MergeBasedCounters counters(db.get(), 0);
+      testCounters(counters, db, use_compression);
     }
   }
 
@@ -527,10 +539,10 @@ void runTest(const std::string& dbname, const bool use_ttl = false) {
   {
     size_t max_merge = 5;
     auto db = OpenDb(dbname, use_ttl, max_merge);
-    MergeBasedCounters counters(db, 0);
-    testCounters(counters, db.get(), use_compression);
+    MergeBasedCounters counters(db.get(), 0);
+    testCounters(counters, db, use_compression);
     testSuccessiveMerge(counters, max_merge, max_merge * 2);
-    testSingleBatchSuccessiveMerge(db.get(), 5, 7);
+    testSingleBatchSuccessiveMerge(db, 5, 7);
     ASSERT_OK(db->Close());
     ASSERT_OK(DestroyDB(dbname, Options()));
   }
@@ -541,16 +553,15 @@ void runTest(const std::string& dbname, const bool use_ttl = false) {
     uint32_t min_merge = 2;
     for (uint32_t count = min_merge - 1; count <= min_merge + 1; count++) {
       auto db = OpenDb(dbname, use_ttl, max_merge);
-      MergeBasedCounters counters(db, 0);
-      testPartialMerge(&counters, db.get(), max_merge, min_merge, count);
+      MergeBasedCounters counters(db.get(), 0);
+      testPartialMerge(&counters, db, max_merge, min_merge, count);
       ASSERT_OK(db->Close());
       ASSERT_OK(DestroyDB(dbname, Options()));
     }
     {
       auto db = OpenDb(dbname, use_ttl, max_merge);
-      MergeBasedCounters counters(db, 0);
-      testPartialMerge(&counters, db.get(), max_merge, min_merge,
-                       min_merge * 10);
+      MergeBasedCounters counters(db.get(), 0);
+      testPartialMerge(&counters, db, max_merge, min_merge, min_merge * 10);
       ASSERT_OK(db->Close());
       ASSERT_OK(DestroyDB(dbname, Options()));
     }
@@ -559,18 +570,18 @@ void runTest(const std::string& dbname, const bool use_ttl = false) {
   {
     {
       auto db = OpenDb(dbname);
-      MergeBasedCounters counters(db, 0);
+      MergeBasedCounters counters(db.get(), 0);
       counters.add("test-key", 1);
       counters.add("test-key", 1);
       counters.add("test-key", 1);
       ASSERT_OK(db->CompactRange(CompactRangeOptions(), nullptr, nullptr));
     }
 
-    DB* reopen_db;
+    std::unique_ptr<DB> reopen_db;
     ASSERT_OK(DB::Open(Options(), dbname, &reopen_db));
     std::string value;
     ASSERT_NOK(reopen_db->Get(ReadOptions(), "test-key", &value));
-    delete reopen_db;
+    reopen_db.reset();
     ASSERT_OK(DestroyDB(dbname, Options()));
   }
 
@@ -579,13 +590,13 @@ void runTest(const std::string& dbname, const bool use_ttl = false) {
     std::cout << "Test merge-operator not set after reopen (recovery case)\n";
     {
       auto db = OpenDb(dbname);
-      MergeBasedCounters counters(db, 0);
+      MergeBasedCounters counters(db.get(), 0);
       counters.add("test-key", 1);
       counters.add("test-key", 1);
       counters.add("test-key", 1);
     }
 
-    DB* reopen_db;
+    std::unique_ptr<DB> reopen_db;
     ASSERT_TRUE(DB::Open(Options(), dbname, &reopen_db).IsInvalidArgument());
   }
   */
@@ -595,7 +606,6 @@ TEST_F(MergeTest, MergeDbTest) {
   runTest(test::PerThreadDBPath("merge_testdb"));
 }
 
-#ifndef ROCKSDB_LITE
 TEST_F(MergeTest, MergeDbTtlTest) {
   runTest(test::PerThreadDBPath("merge_testdbttl"),
           true);  // Run test on TTL database
@@ -607,13 +617,336 @@ TEST_F(MergeTest, MergeWithCompactionAndFlush) {
   {
     auto db = OpenDb(dbname);
     {
-      MergeBasedCounters counters(db, 0);
-      testCountersWithFlushAndCompaction(counters, db.get());
+      MergeBasedCounters counters(db.get(), 0);
+      testCountersWithFlushAndCompaction(counters, db);
     }
   }
   ASSERT_OK(DestroyDB(dbname, Options()));
 }
-#endif  // !ROCKSDB_LITE
+
+TEST_F(MergeTest, FullMergeV3FallbackNewValue) {
+  // Test that the default FullMergeV3 implementation correctly handles the case
+  // when FullMergeV2 results in a new value.
+
+  const Slice key("foo");
+  const MergeOperator::MergeOperationInputV3::OperandList operands{
+      "first", "second", "third"};
+  constexpr Logger* logger = nullptr;
+
+  auto append_operator =
+      MergeOperators::CreateStringAppendOperator(std::string());
+
+  // No existing value
+  {
+    MergeOperator::MergeOperationInputV3::ExistingValue existing_value;
+    const MergeOperator::MergeOperationInputV3 merge_in(
+        key, std::move(existing_value), operands, logger);
+
+    MergeOperator::MergeOperationOutputV3 merge_out;
+
+    ASSERT_TRUE(append_operator->FullMergeV3(merge_in, &merge_out));
+
+    const auto& result = std::get<std::string>(merge_out.new_value);
+    ASSERT_EQ(result, operands[0].ToString() + operands[1].ToString() +
+                          operands[2].ToString());
+  }
+
+  // Plain existing value
+  {
+    const Slice plain("plain");
+    MergeOperator::MergeOperationInputV3::ExistingValue existing_value(plain);
+    const MergeOperator::MergeOperationInputV3 merge_in(
+        key, std::move(existing_value), operands, logger);
+
+    MergeOperator::MergeOperationOutputV3 merge_out;
+
+    ASSERT_TRUE(append_operator->FullMergeV3(merge_in, &merge_out));
+
+    const auto& result = std::get<std::string>(merge_out.new_value);
+    ASSERT_EQ(result, plain.ToString() + operands[0].ToString() +
+                          operands[1].ToString() + operands[2].ToString());
+  }
+
+  // Wide-column existing value with default column
+  {
+    const WideColumns entity{
+        {kDefaultWideColumnName, "default"}, {"one", "1"}, {"two", "2"}};
+    MergeOperator::MergeOperationInputV3::ExistingValue existing_value(entity);
+    const MergeOperator::MergeOperationInputV3 merge_in(
+        key, std::move(existing_value), operands, logger);
+
+    MergeOperator::MergeOperationOutputV3 merge_out;
+
+    ASSERT_TRUE(append_operator->FullMergeV3(merge_in, &merge_out));
+
+    const auto& result =
+        std::get<MergeOperator::MergeOperationOutputV3::NewColumns>(
+            merge_out.new_value);
+    ASSERT_EQ(result.size(), entity.size());
+    ASSERT_EQ(result[0].first, entity[0].name());
+    ASSERT_EQ(result[0].second,
+              entity[0].value().ToString() + operands[0].ToString() +
+                  operands[1].ToString() + operands[2].ToString());
+    ASSERT_EQ(result[1].first, entity[1].name());
+    ASSERT_EQ(result[1].second, entity[1].value());
+    ASSERT_EQ(result[2].first, entity[2].name());
+    ASSERT_EQ(result[2].second, entity[2].value());
+  }
+
+  // Wide-column existing value without default column
+  {
+    const WideColumns entity{{"one", "1"}, {"two", "2"}};
+    MergeOperator::MergeOperationInputV3::ExistingValue existing_value(entity);
+    const MergeOperator::MergeOperationInputV3 merge_in(
+        key, std::move(existing_value), operands, logger);
+
+    MergeOperator::MergeOperationOutputV3 merge_out;
+
+    ASSERT_TRUE(append_operator->FullMergeV3(merge_in, &merge_out));
+
+    const auto& result =
+        std::get<MergeOperator::MergeOperationOutputV3::NewColumns>(
+            merge_out.new_value);
+    ASSERT_EQ(result.size(), entity.size() + 1);
+    ASSERT_EQ(result[0].first, kDefaultWideColumnName);
+    ASSERT_EQ(result[0].second, operands[0].ToString() +
+                                    operands[1].ToString() +
+                                    operands[2].ToString());
+    ASSERT_EQ(result[1].first, entity[0].name());
+    ASSERT_EQ(result[1].second, entity[0].value());
+    ASSERT_EQ(result[2].first, entity[1].name());
+    ASSERT_EQ(result[2].second, entity[1].value());
+  }
+}
+
+TEST_F(MergeTest, FullMergeV3FallbackExistingOperand) {
+  // Test that the default FullMergeV3 implementation correctly handles the case
+  // when FullMergeV2 results in an existing operand.
+
+  const Slice key("foo");
+  const MergeOperator::MergeOperationInputV3::OperandList operands{
+      "first", "second", "third"};
+  constexpr Logger* logger = nullptr;
+
+  auto put_operator = MergeOperators::CreatePutOperator();
+
+  // No existing value
+  {
+    MergeOperator::MergeOperationInputV3::ExistingValue existing_value;
+    const MergeOperator::MergeOperationInputV3 merge_in(
+        key, std::move(existing_value), operands, logger);
+
+    MergeOperator::MergeOperationOutputV3 merge_out;
+
+    ASSERT_TRUE(put_operator->FullMergeV3(merge_in, &merge_out));
+
+    const auto& result = std::get<Slice>(merge_out.new_value);
+    ASSERT_EQ(result.data(), operands.back().data());
+    ASSERT_EQ(result.size(), operands.back().size());
+  }
+
+  // Plain existing value
+  {
+    const Slice plain("plain");
+    MergeOperator::MergeOperationInputV3::ExistingValue existing_value(plain);
+    const MergeOperator::MergeOperationInputV3 merge_in(
+        key, std::move(existing_value), operands, logger);
+
+    MergeOperator::MergeOperationOutputV3 merge_out;
+
+    ASSERT_TRUE(put_operator->FullMergeV3(merge_in, &merge_out));
+
+    const auto& result = std::get<Slice>(merge_out.new_value);
+    ASSERT_EQ(result.data(), operands.back().data());
+    ASSERT_EQ(result.size(), operands.back().size());
+  }
+
+  // Wide-column existing value with default column
+  {
+    const WideColumns entity{
+        {kDefaultWideColumnName, "default"}, {"one", "1"}, {"two", "2"}};
+    MergeOperator::MergeOperationInputV3::ExistingValue existing_value(entity);
+    const MergeOperator::MergeOperationInputV3 merge_in(
+        key, std::move(existing_value), operands, logger);
+
+    MergeOperator::MergeOperationOutputV3 merge_out;
+
+    ASSERT_TRUE(put_operator->FullMergeV3(merge_in, &merge_out));
+
+    const auto& result =
+        std::get<MergeOperator::MergeOperationOutputV3::NewColumns>(
+            merge_out.new_value);
+    ASSERT_EQ(result.size(), entity.size());
+    ASSERT_EQ(result[0].first, entity[0].name());
+    ASSERT_EQ(result[0].second, operands.back());
+    ASSERT_EQ(result[1].first, entity[1].name());
+    ASSERT_EQ(result[1].second, entity[1].value());
+    ASSERT_EQ(result[2].first, entity[2].name());
+    ASSERT_EQ(result[2].second, entity[2].value());
+  }
+
+  // Wide-column existing value without default column
+  {
+    const WideColumns entity{{"one", "1"}, {"two", "2"}};
+    MergeOperator::MergeOperationInputV3::ExistingValue existing_value(entity);
+    const MergeOperator::MergeOperationInputV3 merge_in(
+        key, std::move(existing_value), operands, logger);
+
+    MergeOperator::MergeOperationOutputV3 merge_out;
+
+    ASSERT_TRUE(put_operator->FullMergeV3(merge_in, &merge_out));
+
+    const auto& result =
+        std::get<MergeOperator::MergeOperationOutputV3::NewColumns>(
+            merge_out.new_value);
+    ASSERT_EQ(result.size(), entity.size() + 1);
+    ASSERT_EQ(result[0].first, kDefaultWideColumnName);
+    ASSERT_EQ(result[0].second, operands.back());
+    ASSERT_EQ(result[1].first, entity[0].name());
+    ASSERT_EQ(result[1].second, entity[0].value());
+    ASSERT_EQ(result[2].first, entity[1].name());
+    ASSERT_EQ(result[2].second, entity[1].value());
+  }
+}
+
+TEST_F(MergeTest, FullMergeV3FallbackFailure) {
+  // Test that the default FullMergeV3 implementation correctly handles the case
+  // when FullMergeV2 fails.
+
+  const Slice key("foo");
+  const MergeOperator::MergeOperationInputV3::OperandList operands{
+      "first", "second", "third"};
+  constexpr Logger* logger = nullptr;
+
+  class FailMergeOperator : public MergeOperator {
+   public:
+    bool FullMergeV2(const MergeOperationInput& /* merge_in */,
+                     MergeOperationOutput* merge_out) const override {
+      assert(merge_out);
+      merge_out->op_failure_scope = OpFailureScope::kMustMerge;
+
+      return false;
+    }
+
+    const char* Name() const override { return "FailMergeOperator"; }
+  };
+
+  FailMergeOperator fail_operator;
+
+  // No existing value
+  {
+    MergeOperator::MergeOperationInputV3::ExistingValue existing_value;
+    const MergeOperator::MergeOperationInputV3 merge_in(
+        key, std::move(existing_value), operands, logger);
+
+    MergeOperator::MergeOperationOutputV3 merge_out;
+
+    ASSERT_FALSE(fail_operator.FullMergeV3(merge_in, &merge_out));
+    ASSERT_EQ(merge_out.op_failure_scope,
+              MergeOperator::OpFailureScope::kMustMerge);
+  }
+
+  // Plain existing value
+  {
+    const Slice plain("plain");
+    MergeOperator::MergeOperationInputV3::ExistingValue existing_value(plain);
+    const MergeOperator::MergeOperationInputV3 merge_in(
+        key, std::move(existing_value), operands, logger);
+
+    MergeOperator::MergeOperationOutputV3 merge_out;
+
+    ASSERT_FALSE(fail_operator.FullMergeV3(merge_in, &merge_out));
+    ASSERT_EQ(merge_out.op_failure_scope,
+              MergeOperator::OpFailureScope::kMustMerge);
+  }
+
+  // Wide-column existing value with default column
+  {
+    const WideColumns entity{
+        {kDefaultWideColumnName, "default"}, {"one", "1"}, {"two", "2"}};
+    MergeOperator::MergeOperationInputV3::ExistingValue existing_value(entity);
+    const MergeOperator::MergeOperationInputV3 merge_in(
+        key, std::move(existing_value), operands, logger);
+
+    MergeOperator::MergeOperationOutputV3 merge_out;
+
+    ASSERT_FALSE(fail_operator.FullMergeV3(merge_in, &merge_out));
+    ASSERT_EQ(merge_out.op_failure_scope,
+              MergeOperator::OpFailureScope::kMustMerge);
+  }
+
+  // Wide-column existing value without default column
+  {
+    const WideColumns entity{{"one", "1"}, {"two", "2"}};
+    MergeOperator::MergeOperationInputV3::ExistingValue existing_value(entity);
+    const MergeOperator::MergeOperationInputV3 merge_in(
+        key, std::move(existing_value), operands, logger);
+
+    MergeOperator::MergeOperationOutputV3 merge_out;
+
+    ASSERT_FALSE(fail_operator.FullMergeV3(merge_in, &merge_out));
+    ASSERT_EQ(merge_out.op_failure_scope,
+              MergeOperator::OpFailureScope::kMustMerge);
+  }
+}
+
+// Uses anonymous mmap (lazy-zeroed) so the large operands don't consume
+// physical memory -- only the merge result does (~4GB peak).
+TEST_F(MergeTest, LargeMergeResultRejected) {
+  if (!test::HasBigMem()) {
+    ROCKSDB_GTEST_BYPASS("insufficient memory for reliable continuous testing");
+    return;
+  }
+
+  // A merge operator that produces a result > 4GB by concatenating operands
+  class ConcatOperator : public MergeOperator {
+   public:
+    bool FullMergeV2(const MergeOperationInput& merge_in,
+                     MergeOperationOutput* merge_out) const override {
+      merge_out->new_value.clear();
+      if (merge_in.existing_value) {
+        merge_out->new_value.append(merge_in.existing_value->data(),
+                                    merge_in.existing_value->size());
+      }
+      for (const auto& op : merge_in.operand_list) {
+        merge_out->new_value.append(op.data(), op.size());
+      }
+      return true;
+    }
+    const char* Name() const override { return "ConcatOperator"; }
+  };
+
+  // Use TimedFullMerge directly - two operands that sum to > 4GB
+  constexpr size_t kHalfSize =
+      (size_t{std::numeric_limits<uint32_t>::max()} + 1) / 2;
+  MemMapping mm1 = MemMapping::AllocateLazyZeroed(kHalfSize);
+  ASSERT_NE(nullptr, mm1.Get());
+  MemMapping mm2 = MemMapping::AllocateLazyZeroed(kHalfSize);
+  ASSERT_NE(nullptr, mm2.Get());
+  std::vector<Slice> operands{mm1.AsSlice(), mm2.AsSlice()};
+  std::string result;
+  Slice result_operand;
+  ValueType result_type;
+
+  ConcatOperator concat_op;
+  Status s = MergeHelper::TimedFullMerge(
+      &concat_op, "key", MergeHelper::kNoBaseValue, operands, nullptr, nullptr,
+      SystemClock::Default().get(), false, nullptr, &result, &result_operand,
+      &result_type);
+  ASSERT_TRUE(s.IsCorruption());
+  ASSERT_TRUE(s.ToString().find("4GB") != std::string::npos);
+
+  // Control: just under 4GB should be accepted
+  result.clear();
+  result.shrink_to_fit();
+  operands = {mm1.AsSlice(), Slice(mm2.AsSlice().data(), kHalfSize - 1)};
+  s = MergeHelper::TimedFullMerge(&concat_op, "key", MergeHelper::kNoBaseValue,
+                                  operands, nullptr, nullptr,
+                                  SystemClock::Default().get(), false, nullptr,
+                                  &result, &result_operand, &result_type);
+  ASSERT_OK(s);
+  ASSERT_EQ(result.size(), size_t{std::numeric_limits<uint32_t>::max()});
+}
 
 }  // namespace ROCKSDB_NAMESPACE
 

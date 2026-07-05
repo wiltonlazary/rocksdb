@@ -11,15 +11,15 @@ public interface MutableColumnFamilyOptionsInterface<
   /**
    * Amount of data to build up in memory (backed by an unsorted log
    * on disk) before converting to a sorted on-disk file.
-   *
+   * <p>
    * Larger values increase performance, especially during bulk loads.
    * Up to {@code max_write_buffer_number} write buffers may be held in memory
    * at the same time, so you may wish to adjust this parameter
    * to control memory usage.
-   *
+   * <p>
    * Also, a larger write buffer will result in a longer recovery time
    * the next time the database is opened.
-   *
+   * <p>
    * Default: 64MB
    * @param writeBufferSize the size of write buffer.
    * @return the instance of the current object.
@@ -56,7 +56,7 @@ public interface MutableColumnFamilyOptionsInterface<
   /**
    * Number of files to trigger level-0 compaction. A value &lt; 0 means that
    * level-0 compaction will not be triggered by number of files at all.
-   *
+   * <p>
    * Default: 4
    *
    * @param level0FileNumCompactionTrigger The number of files to trigger
@@ -68,7 +68,7 @@ public interface MutableColumnFamilyOptionsInterface<
   /**
    * Number of files to trigger level-0 compaction. A value &lt; 0 means that
    * level-0 compaction will not be triggered by number of files at all.
-   *
+   * <p>
    * Default: 4
    *
    * @return The number of files to trigger
@@ -109,7 +109,7 @@ public interface MutableColumnFamilyOptionsInterface<
    * @param maxBytesForLevelBase maximum bytes for level base.
    *
    * @return the reference to the current option.
-   *
+   * <p>
    * See {@link AdvancedMutableColumnFamilyOptionsInterface#setMaxBytesForLevelMultiplier(double)}
    */
   T setMaxBytesForLevelBase(
@@ -127,7 +127,7 @@ public interface MutableColumnFamilyOptionsInterface<
    *
    * @return the upper-bound of the total size of level-1 files
    *     in bytes.
-   *
+   * <p>
    * See {@link AdvancedMutableColumnFamilyOptionsInterface#maxBytesForLevelMultiplier()}
    */
   long maxBytesForLevelBase();
@@ -135,8 +135,9 @@ public interface MutableColumnFamilyOptionsInterface<
   /**
    * Compress blocks using the specified compression algorithm.  This
    * parameter can be changed dynamically.
-   *
-   * Default: SNAPPY_COMPRESSION, which gives lightweight but fast compression.
+   * <p>
+   * Default: LZ4_COMPRESSION if available, otherwise SNAPPY_COMPRESSION if
+   * available, otherwise NO_COMPRESSION.
    *
    * @param compressionType Compression Type.
    * @return the reference to the current option.
@@ -147,8 +148,9 @@ public interface MutableColumnFamilyOptionsInterface<
   /**
    * Compress blocks using the specified compression algorithm.  This
    * parameter can be changed dynamically.
-   *
-   * Default: SNAPPY_COMPRESSION, which gives lightweight but fast compression.
+   * <p>
+   * Default: LZ4_COMPRESSION if available, otherwise SNAPPY_COMPRESSION if
+   * available, otherwise NO_COMPRESSION.
    *
    * @return Compression type.
    */

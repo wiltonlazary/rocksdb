@@ -24,7 +24,7 @@
 #include "db/write_batch_internal.h"
 #include "env/mock_env.h"
 #include "file/filename.h"
-#include "monitoring/statistics.h"
+#include "monitoring/statistics_impl.h"
 #include "monitoring/thread_status_util.h"
 #include "port/stack_trace.h"
 #include "rocksdb/cache.h"
@@ -46,7 +46,6 @@
 #include "table/block_based/block_based_table_factory.h"
 #include "table/mock_table.h"
 #include "table/plain/plain_table_factory.h"
-#include "table/scoped_arena_iterator.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
@@ -54,12 +53,11 @@
 #include "util/compression.h"
 #include "util/hash.h"
 #include "util/mutexlock.h"
-#include "util/rate_limiter.h"
+#include "util/rate_limiter_impl.h"
 #include "util/string_util.h"
 #include "utilities/merge_operators.h"
 
 #if !defined(IOS_CROSS_COMPILE)
-#ifndef ROCKSDB_LITE
 namespace ROCKSDB_NAMESPACE {
 
 static std::string RandomString(Random* rnd, int len, double ratio) {
@@ -84,7 +82,7 @@ class CompactionJobStatsTest : public testing::Test,
   std::string dbname_;
   std::string alternative_wal_dir_;
   Env* env_;
-  DB* db_;
+  std::unique_ptr<DB> db_;
   std::vector<ColumnFamilyHandle*> handles_;
   uint32_t max_subcompactions_;
 
@@ -125,14 +123,14 @@ class CompactionJobStatsTest : public testing::Test,
   static void SetUpTestCase() {}
   static void TearDownTestCase() {}
 
-  DBImpl* dbfull() { return static_cast_with_check<DBImpl>(db_); }
+  DBImpl* dbfull() { return static_cast_with_check<DBImpl>(db_.get()); }
 
   void CreateColumnFamilies(const std::vector<std::string>& cfs,
                             const Options& options) {
     ColumnFamilyOptions cf_opts(options);
     size_t cfi = handles_.size();
     handles_.resize(cfi + cfs.size());
-    for (auto cf : cfs) {
+    for (const auto& cf : cfs) {
       ASSERT_OK(db_->CreateColumnFamily(cf_opts, cf, &handles_[cfi++]));
     }
   }
@@ -161,10 +159,11 @@ class CompactionJobStatsTest : public testing::Test,
     EXPECT_EQ(cfs.size(), options.size());
     std::vector<ColumnFamilyDescriptor> column_families;
     for (size_t i = 0; i < cfs.size(); ++i) {
-      column_families.push_back(ColumnFamilyDescriptor(cfs[i], options[i]));
+      column_families.emplace_back(cfs[i], options[i]);
     }
     DBOptions db_opts = DBOptions(options[0]);
-    return DB::Open(db_opts, dbname_, column_families, &handles_, &db_);
+    auto s = DB::Open(db_opts, dbname_, column_families, &handles_, &db_);
+    return s;
   }
 
   Status TryReopenWithColumnFamilies(const std::vector<std::string>& cfs,
@@ -181,8 +180,7 @@ class CompactionJobStatsTest : public testing::Test,
       delete h;
     }
     handles_.clear();
-    delete db_;
-    db_ = nullptr;
+    db_.reset();
   }
 
   void DestroyAndReopen(const Options& options) {
@@ -617,6 +615,7 @@ TEST_P(CompactionJobStatsTest, CompactionJobStatsTest) {
   // via AddExpectedStats().
   auto* stats_checker = new CompactionJobStatsChecker();
   Options options;
+  options.level_compaction_dynamic_level_bytes = false;
   options.listeners.emplace_back(stats_checker);
   options.create_if_missing = true;
   // just enough setting to hold off auto-compaction.
@@ -744,7 +743,7 @@ TEST_P(CompactionJobStatsTest, CompactionJobStatsTest) {
     }
 
     ASSERT_OK(Flush(1));
-    ASSERT_OK(static_cast_with_check<DBImpl>(db_)->TEST_WaitForCompact());
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
 
     stats_checker->set_verify_next_comp_io_stats(true);
     std::atomic<bool> first_prepare_write(true);
@@ -816,6 +815,7 @@ TEST_P(CompactionJobStatsTest, DeletionStatsTest) {
   // what we expect.
   auto* stats_checker = new CompactionJobDeletionStatsChecker();
   Options options;
+  options.level_compaction_dynamic_level_bytes = false;
   options.listeners.emplace_back(stats_checker);
   options.create_if_missing = true;
   options.level0_file_num_compaction_trigger = kTestScale + 1;
@@ -944,7 +944,7 @@ TEST_P(CompactionJobStatsTest, UniversalCompactionTest) {
        start_key += key_base) {
     MakeTableWithKeyValues(&rnd, start_key, start_key + key_base - 1, kKeySize,
                            kValueSize, key_interval, compression_ratio, 1);
-    ASSERT_OK(static_cast_with_check<DBImpl>(db_)->TEST_WaitForCompact());
+    ASSERT_OK(dbfull()->TEST_WaitForCompact());
   }
   ASSERT_EQ(stats_checker->NumberOfUnverifiedStats(), 0U);
 }
@@ -958,16 +958,6 @@ int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
-
-#else
-#include <stdio.h>
-
-int main(int /*argc*/, char** /*argv*/) {
-  fprintf(stderr, "SKIPPED, not supported in ROCKSDB_LITE\n");
-  return 0;
-}
-
-#endif  // !ROCKSDB_LITE
 
 #else
 
